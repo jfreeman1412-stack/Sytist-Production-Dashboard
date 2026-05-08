@@ -1,0 +1,20 @@
+{
+  "name": "sytist-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sytist Production Dashboard — order processing pipeline for Sportsline Photography",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "install-all": "npm install && npm install --prefix server && npm install --prefix client",
+    "dev": "concurrently -n server,client -c blue,green \"npm run dev --prefix server\" \"npm start --prefix client\"",
+    "server": "npm run dev --prefix server",
+    "client": "npm start --prefix client",
+    "build": "npm run build --prefix client",
+    "start": "npm start --prefix server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}

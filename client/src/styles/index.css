@@ -1,0 +1,85 @@
+/* Phase 0 placeholder styles. Replaced with real design system in Phase 3. */
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen,
+    Ubuntu, Cantarell, sans-serif;
+  background: #f5f6fb;
+  color: #0f1d3f;
+}
+
+.app {
+  min-height: 100vh;
+}
+
+.app-header {
+  background: linear-gradient(135deg, #0a4bd8, #2872ff);
+  color: white;
+  padding: 24px 32px;
+  border-bottom: 1px solid #e4e4e4;
+}
+
+.app-header h1 {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 600;
+}
+
+.app-header .subtitle {
+  margin: 4px 0 0;
+  opacity: 0.85;
+  font-size: 14px;
+}
+
+.app-main {
+  max-width: 800px;
+  margin: 32px auto;
+  padding: 0 32px;
+}
+
+.status-card,
+.next-steps {
+  background: white;
+  border: 1px solid #cfd7e8;
+  border-radius: 8px;
+  padding: 24px;
+  margin-bottom: 24px;
+}
+
+.status-card h2,
+.next-steps h2 {
+  margin: 0 0 12px;
+  font-size: 16px;
+  color: #0f1d3f;
+}
+
+.status-card pre {
+  background: #f5f7ff;
+  border: 1px solid #cfd7e8;
+  border-radius: 4px;
+  padding: 12px;
+  font-size: 12px;
+  overflow-x: auto;
+}
+
+.status-error {
+  color: #dc3a3a;
+}
+
+.status-ok p {
+  margin: 0 0 12px;
+  color: #1f7a3a;
+  font-weight: 500;
+}
+
+code {
+  background: #f5f7ff;
+  border: 1px solid #cfd7e8;
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-size: 12px;
+}

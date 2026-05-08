@@ -1,0 +1,67 @@
+# Dependencies
+node_modules/
+*/node_modules/
+
+# Build outputs
+client/build/
+build/
+dist/
+
+# Environment files (never commit)
+.env
+*.env
+!.env.example
+server/.env
+client/.env
+
+# Local SQLite databases (own dashboard storage)
+server/config/*.db
+server/config/*.db-shm
+server/config/*.db-wal
+server/config/*.sqlite
+server/config/*.sqlite3
+
+# Local config that isn't committed
+server/config/app-settings.json
+server/config/folder-sort.json
+server/config/imposition-layouts.json
+server/config/packaging-config.json
+server/config/path-overrides.json
+server/config/size-mappings.json
+server/config/specialty-products.json
+server/config/template-mappings.json
+server/config/sytist-status-map.json
+server/config/filename-config.json
+
+# Uploaded assets (user content, not source)
+server/assets/overlays/*
+server/assets/logos/*
+server/assets/fonts/*
+!server/assets/overlays/.gitkeep
+!server/assets/logos/.gitkeep
+!server/assets/fonts/.gitkeep
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+logs/
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+
+# IDE
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Misc
+.cache/
+*.tmp
+*.temp

@@ -1,0 +1,23 @@
+{
+  "name": "sytist-dashboard-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Express server for Sytist Production Dashboard",
+  "main": "index.js",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "sytist-dashboard": "file:.."
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  }
+}
