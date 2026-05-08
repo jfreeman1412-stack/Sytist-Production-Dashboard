@@ -1,11 +1,9 @@
 // Sytist MySQL data layer.
 //
-// Phase 2a: connection pool + health check only. Phase 2b adds the real query
-// methods (orders, status list, gallery hierarchy). Phase 2c adds writes
-// (status updates back to ms_orders.order_open_status).
-//
-// Uses mysql2/promise — async/await friendly, with a connection pool so we
-// don't open/close a connection per request.
+// Phase 2a: connection pool + healthCheck.
+// Phase 2b Step 1: simple lookup queries — order statuses + galleries.
+// Phase 2b Step 2/3 (next): order list + order detail.
+// Phase 2c (later): updateOrderStatus.
 
 const mysql = require('mysql2/promise');
 
@@ -15,11 +13,6 @@ class SytistDbService {
     this._lastError = null;
   }
 
-  /**
-   * Initialize the connection pool. Idempotent — safe to call multiple times.
-   * Reads config from process.env. Caller decides when to call this; we don't
-   * auto-init in the constructor because env may not be loaded yet.
-   */
   init() {
     if (this.pool) return this.pool;
 
@@ -29,24 +22,13 @@ class SytistDbService {
       user: process.env.SYTIST_DB_USER,
       password: process.env.SYTIST_DB_PASSWORD,
       database: process.env.SYTIST_DB_NAME,
-
-      // Pool sizing — generous for a single-user dev tool, conservative
-      // enough not to stress the droplet. Tune in prod.
       connectionLimit: 5,
       queueLimit: 0,
       waitForConnections: true,
-
-      // Sytist's tables are mixed utf8mb3/utf8mb4. utf8mb4 is the safe
-      // superset for the connection.
       charset: 'utf8mb4',
-
-      // Reasonable timeouts. The droplet should respond quickly; if it's
-      // slow, we want to know rather than hang.
       connectTimeout: 10_000,
-
-      // Sytist uses old-style date defaults like '0000-00-00'. mysql2 by
-      // default returns Date objects; configure to return strings so we can
-      // detect/handle these zero-dates without timezone surprises.
+      // Sytist tables use '0000-00-00' default dates; return strings so we
+      // can detect/handle these without timezone surprises.
       dateStrings: true,
     };
 
@@ -70,11 +52,7 @@ class SytistDbService {
   }
 
   /**
-   * Quick connectivity check. Returns { ok: true, ... } or throws.
-   *
-   * Runs `SELECT 1 AS ok` and a couple of identity queries (DB name + version)
-   * so we surface useful diagnostics if a connection works but something else
-   * is off (e.g., wrong database selected).
+   * Quick connectivity check.
    */
   async healthCheck() {
     const pool = this.getPool();
@@ -97,8 +75,6 @@ class SytistDbService {
       };
     } catch (err) {
       this._lastError = err;
-      // Re-throw a redacted version (avoid leaking the password if it appears
-      // in some driver error messages).
       const safeMsg = String(err.message || err)
         .replace(/password=[^&\s]+/gi, 'password=***')
         .replace(/PASSWORD\s*=\s*'[^']*'/gi, "PASSWORD='***'");
@@ -108,9 +84,146 @@ class SytistDbService {
     }
   }
 
+  // ─── Lookup queries ────────────────────────────────────
+
   /**
-   * Close the pool. Used in tests and during graceful shutdown.
+   * Returns all rows from ms_order_status.
+   *
+   * Actual columns (verified via DESCRIBE):
+   *   status_id, status_name, status_descr, status_show_order
+   *
+   * Sorted by status_show_order (Sytist's own display order), then name.
+   * Status 0 ("Queue") has no row — render it client-side when needed.
    */
+  async getOrderStatuses() {
+    const pool = this.getPool();
+    const [rows] = await pool.query(
+      `SELECT status_id, status_name, status_descr, status_show_order
+       FROM ms_order_status
+       ORDER BY status_show_order, status_name`
+    );
+
+    return rows.map((r) => ({
+      id: r.status_id,
+      name: r.status_name,
+      description: r.status_descr || '',
+      showOrder: r.status_show_order,
+    }));
+  }
+
+  /**
+   * Returns the gallery hierarchy for filter UI.
+   *
+   * Scope: galleries (ms_calendar rows) that have at least one order in the
+   * last `monthsBack` months (default 18). Each gallery includes its category
+   * name and any sub-galleries (teams) that also have order activity.
+   *
+   * Defaulting to 18 months captures all currently-relevant galleries without
+   * dragging in years of stale data. Use { monthsBack: 0 } for unfiltered.
+   *
+   * Shape:
+   *   [
+   *     {
+   *       galleryId: 12345,
+   *       galleryName: "2026 PACT Trap Photo Day",
+   *       categoryId: 678,
+   *       categoryName: "PACT Charter School",
+   *       orderCount: 14,
+   *       lastOrderDate: "2026-05-08",
+   *       subGalleries: [
+   *         { subId: 99001, subName: "Pact Trap", orderCount: 8, lastOrderDate: "..." },
+   *         ...
+   *       ]
+   *     },
+   *     ...
+   *   ]
+   */
+  async getGalleryHierarchy({ monthsBack = 18 } = {}) {
+    const pool = this.getPool();
+
+    const dateFilter =
+      monthsBack > 0
+        ? `AND o.order_date >= DATE_SUB(NOW(), INTERVAL ? MONTH)`
+        : '';
+    const dateParams = monthsBack > 0 ? [monthsBack] : [];
+
+    // 1. Galleries with order activity, with their category info.
+    //
+    //    Joins ms_calendar.date_id ← ms_cart.cart_pic_date_id ← ms_orders.order_id.
+    //    Restricted to order_status=0 (Open) and order_payment_status='Completed'
+    //    so we don't count trashed/archived/unpaid orders.
+    const [galleries] = await pool.query(
+      `
+      SELECT
+        cal.date_id        AS galleryId,
+        cal.date_title     AS galleryName,
+        cat.cat_id         AS categoryId,
+        cat.cat_name       AS categoryName,
+        COUNT(DISTINCT o.order_id) AS orderCount,
+        MAX(o.order_date)  AS lastOrderDate
+      FROM ms_calendar cal
+      LEFT JOIN ms_blog_categories cat ON cat.cat_id = cal.date_cat
+      INNER JOIN ms_cart c   ON c.cart_pic_date_id = cal.date_id
+      INNER JOIN ms_orders o ON o.order_id = c.cart_order
+      WHERE o.order_status = 0
+        AND o.order_payment_status = 'Completed'
+        ${dateFilter}
+      GROUP BY cal.date_id, cal.date_title, cat.cat_id, cat.cat_name
+      ORDER BY MAX(o.order_date) DESC
+      `,
+      dateParams
+    );
+
+    if (galleries.length === 0) return [];
+
+    // 2. Sub-galleries for those gallery IDs, also restricted to ones with
+    //    order activity.
+    const galleryIds = galleries.map((g) => g.galleryId);
+    const [subRows] = await pool.query(
+      `
+      SELECT
+        sub.sub_id          AS subId,
+        sub.sub_date_id     AS galleryId,
+        sub.sub_name        AS subName,
+        COUNT(DISTINCT o.order_id) AS orderCount,
+        MAX(o.order_date)   AS lastOrderDate
+      FROM ms_sub_galleries sub
+      INNER JOIN ms_cart c   ON c.cart_sub_gal_id = sub.sub_id
+      INNER JOIN ms_orders o ON o.order_id = c.cart_order
+      WHERE sub.sub_date_id IN (?)
+        AND o.order_status = 0
+        AND o.order_payment_status = 'Completed'
+        ${dateFilter}
+      GROUP BY sub.sub_id, sub.sub_date_id, sub.sub_name
+      ORDER BY sub.sub_name
+      `,
+      [galleryIds, ...dateParams]
+    );
+
+    // Bucket subs by gallery for quick lookup.
+    const subsByGallery = new Map();
+    for (const s of subRows) {
+      const list = subsByGallery.get(s.galleryId) || [];
+      list.push({
+        subId: s.subId,
+        subName: s.subName,
+        orderCount: Number(s.orderCount),
+        lastOrderDate: s.lastOrderDate,
+      });
+      subsByGallery.set(s.galleryId, list);
+    }
+
+    return galleries.map((g) => ({
+      galleryId: g.galleryId,
+      galleryName: g.galleryName,
+      categoryId: g.categoryId,
+      categoryName: g.categoryName,
+      orderCount: Number(g.orderCount),
+      lastOrderDate: g.lastOrderDate,
+      subGalleries: subsByGallery.get(g.galleryId) || [],
+    }));
+  }
+
   async close() {
     if (this.pool) {
       await this.pool.end();
