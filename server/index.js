@@ -1,7 +1,7 @@
 // Sytist Production Dashboard — server entry point
 //
-// Phase 1: auth wired in. Database initialized at startup, expired sessions
-// cleaned every hour, optional initial admin user created if env vars set.
+// Phase 1: auth wired in.
+// Phase 2a: Sytist MySQL data layer (connectivity health check).
 
 require('dotenv').config();
 
@@ -10,25 +10,34 @@ const cors = require('cors');
 
 const databaseService = require('./services/database');
 const authService = require('./services/authService');
+const sytistDb = require('./services/sytistDbService');
+
 const authRoutes = require('./routes/auth');
+const sytistRoutes = require('./routes/sytist');
 
 const PORT = process.env.PORT || 3011;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
-// ─── Initialize database ───────────────────────────────────
+// ─── Initialize local SQLite ───────────────────────────────
 databaseService.init();
 
+// ─── Initialize Sytist MySQL pool ──────────────────────────
+// The pool is lazy — connections are created on first use. Calling init() now
+// just validates env vars are present so we fail fast at startup if not.
+try {
+  sytistDb.init();
+} catch (err) {
+  console.warn(`[startup] Sytist DB pool not initialized: ${err.message}`);
+  console.warn('[startup] /api/sytist/* endpoints will fail until SYTIST_DB_* env vars are set.');
+}
+
 // ─── Initial admin bootstrap ───────────────────────────────
-// If no users exist yet AND env vars are set, create one. Useful for first-run
-// convenience without baking creds into source.
 async function bootstrapInitialAdmin() {
   const username = process.env.INITIAL_ADMIN_USERNAME;
   const password = process.env.INITIAL_ADMIN_PASSWORD;
   if (!username || !password) return;
 
-  if (authService.hasAnyUsers()) {
-    return; // someone exists already, skip
-  }
+  if (authService.hasAnyUsers()) return;
 
   try {
     const user = await authService.createUser(
@@ -47,7 +56,6 @@ async function bootstrapInitialAdmin() {
 bootstrapInitialAdmin();
 
 // ─── Periodic session cleanup ──────────────────────────────
-// Once an hour, drop sessions whose expires_at has passed.
 setInterval(() => {
   authService.cleanupExpiredSessions();
 }, 60 * 60 * 1000);
@@ -71,13 +79,14 @@ app.get('/api/health', (req, res) => {
     ok: true,
     service: 'sytist-dashboard',
     version: '0.1.0',
-    phase: 1,
+    phase: '2a',
     env: NODE_ENV,
     timestamp: new Date().toISOString(),
   });
 });
 
 app.use('/api/auth', authRoutes);
+app.use('/api/sytist', sytistRoutes);
 
 // 404 catch-all for /api/*
 app.use('/api', (req, res) => {
@@ -91,13 +100,16 @@ app.listen(PORT, () => {
   console.log(`[sytist-dashboard] health: http://localhost:${PORT}/api/health`);
 });
 
-// Graceful shutdown — close DB cleanly.
-process.on('SIGINT', () => {
+// ─── Graceful shutdown ─────────────────────────────────────
+async function shutdown() {
   console.log('\n[sytist-dashboard] shutting down…');
+  try {
+    await sytistDb.close();
+  } catch (err) {
+    console.error('[shutdown] Error closing Sytist pool:', err.message);
+  }
   databaseService.close();
   process.exit(0);
-});
-process.on('SIGTERM', () => {
-  databaseService.close();
-  process.exit(0);
-});
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);

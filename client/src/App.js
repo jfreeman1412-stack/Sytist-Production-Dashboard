@@ -5,8 +5,15 @@ import LoginPage from './pages/LoginPage';
 function App() {
   const [user, setUser] = useState(null);
   const [checkingSession, setCheckingSession] = useState(true);
+
+  // Server (dashboard backend) health
   const [health, setHealth] = useState(null);
   const [healthError, setHealthError] = useState(null);
+
+  // Sytist MySQL health
+  const [sytistHealth, setSytistHealth] = useState(null);
+  const [sytistError, setSytistError] = useState(null);
+  const [checkingSytist, setCheckingSytist] = useState(false);
 
   // On mount, see if a previously-stored session is still valid.
   useEffect(() => {
@@ -27,9 +34,10 @@ function App() {
     };
   }, []);
 
-  // Once logged in, ping health to confirm everything's wired.
+  // Once logged in, ping health endpoints.
   useEffect(() => {
     if (!user) return;
+
     fetch('/api/health')
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -37,6 +45,13 @@ function App() {
       })
       .then(setHealth)
       .catch((err) => setHealthError(err.message));
+
+    setCheckingSytist(true);
+    api
+      .get('/api/sytist/health')
+      .then(setSytistHealth)
+      .catch((err) => setSytistError(err.message))
+      .finally(() => setCheckingSytist(false));
   }, [user]);
 
   if (checkingSession) {
@@ -66,6 +81,22 @@ function App() {
     setUser(null);
     setHealth(null);
     setHealthError(null);
+    setSytistHealth(null);
+    setSytistError(null);
+  };
+
+  const recheckSytist = async () => {
+    setSytistError(null);
+    setSytistHealth(null);
+    setCheckingSytist(true);
+    try {
+      const result = await api.get('/api/sytist/health');
+      setSytistHealth(result);
+    } catch (err) {
+      setSytistError(err.message);
+    } finally {
+      setCheckingSytist(false);
+    }
   };
 
   return (
@@ -91,7 +122,7 @@ function App() {
             Sytist Production Dashboard
           </div>
           <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-            Phase 1 — auth
+            Phase 2a — Sytist DB connectivity
           </div>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
@@ -133,11 +164,11 @@ function App() {
           <p style={{ fontSize: 13, color: 'var(--text-secondary)', margin: 0 }}>
             You are signed in as{' '}
             <strong>{user.displayName || user.username}</strong> with role{' '}
-            <strong>{user.role}</strong>. Your session will remain active for
-            24 hours.
+            <strong>{user.role}</strong>.
           </p>
         </section>
 
+        {/* Dashboard backend health */}
         <section
           style={{
             background: 'var(--bg-card)',
@@ -147,7 +178,9 @@ function App() {
             marginBottom: 24,
           }}
         >
-          <h2 style={{ fontSize: 16, margin: '0 0 12px' }}>Server connection</h2>
+          <h2 style={{ fontSize: 16, margin: '0 0 12px' }}>
+            Dashboard server
+          </h2>
           {!health && !healthError && (
             <p style={{ fontSize: 13, color: 'var(--text-muted)' }}>Checking…</p>
           )}
@@ -165,7 +198,7 @@ function App() {
                   margin: '0 0 12px',
                 }}
               >
-                ✅ Connected to server
+                ✅ Connected to dashboard server
               </p>
               <pre
                 style={{
@@ -186,6 +219,91 @@ function App() {
           )}
         </section>
 
+        {/* Sytist MySQL health */}
+        <section
+          style={{
+            background: 'var(--bg-card)',
+            border: '1px solid var(--border-color)',
+            borderRadius: 'var(--radius-lg)',
+            padding: 24,
+            marginBottom: 24,
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              marginBottom: 12,
+            }}
+          >
+            <h2 style={{ fontSize: 16, margin: 0 }}>Sytist database</h2>
+            <button
+              className="btn btn-secondary"
+              onClick={recheckSytist}
+              disabled={checkingSytist}
+              style={{ padding: '6px 12px', fontSize: 12 }}
+            >
+              {checkingSytist ? 'Checking…' : 'Re-check'}
+            </button>
+          </div>
+
+          {checkingSytist && !sytistHealth && !sytistError && (
+            <p style={{ fontSize: 13, color: 'var(--text-muted)' }}>Checking…</p>
+          )}
+          {sytistError && (
+            <>
+              <p style={{ fontSize: 13, color: 'var(--error)', margin: '0 0 12px' }}>
+                ❌ Cannot reach Sytist database
+              </p>
+              <pre
+                style={{
+                  background: 'var(--bg-input)',
+                  border: '1px solid var(--border-color)',
+                  borderRadius: 'var(--radius-sm)',
+                  padding: 12,
+                  fontSize: 12,
+                  fontFamily: 'var(--font-mono)',
+                  color: 'var(--error)',
+                  overflowX: 'auto',
+                  margin: 0,
+                  whiteSpace: 'pre-wrap',
+                }}
+              >
+                {sytistError}
+              </pre>
+            </>
+          )}
+          {sytistHealth && (
+            <>
+              <p
+                style={{
+                  fontSize: 13,
+                  color: 'var(--success)',
+                  margin: '0 0 12px',
+                }}
+              >
+                ✅ Connected to Sytist database ({sytistHealth.elapsedMs}ms)
+              </p>
+              <pre
+                style={{
+                  background: 'var(--bg-input)',
+                  border: '1px solid var(--border-color)',
+                  borderRadius: 'var(--radius-sm)',
+                  padding: 12,
+                  fontSize: 12,
+                  fontFamily: 'var(--font-mono)',
+                  color: 'var(--text-secondary)',
+                  overflowX: 'auto',
+                  margin: 0,
+                }}
+              >
+                {JSON.stringify(sytistHealth, null, 2)}
+              </pre>
+            </>
+          )}
+        </section>
+
         <section
           style={{
             background: 'var(--bg-card)',
@@ -196,8 +314,9 @@ function App() {
         >
           <h2 style={{ fontSize: 16, margin: '0 0 12px' }}>Next</h2>
           <p style={{ fontSize: 13, color: 'var(--text-secondary)', margin: 0 }}>
-            Phase 2 connects to the Sytist MySQL database and starts pulling
-            real order data. See <code>SPEC.md</code> for the full roadmap.
+            Phase 2b adds the order queries — fetching orders, assembling the
+            canonical shape, and a test endpoint to inspect real Sytist data.
+            See <code>SPEC.md</code> for details.
           </p>
         </section>
       </main>
