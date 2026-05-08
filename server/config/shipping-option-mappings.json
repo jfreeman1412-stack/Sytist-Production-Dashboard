@@ -1,0 +1,14 @@
+{
+  "_comment": "Maps order_shipping_option strings to workflow buckets. Edit this when you add new shipping options in Sytist. Anything not listed here falls back to the numeric rule based on order_shipping cost (> 1.01 = home, = 1.00 = managers, <= 0.99 = league). Orders that hit the fallback are flagged as 'uncategorized' so the UI can show a warning badge.",
+  "ship_to_home": [
+    "USPS-Ship to Home",
+    "Ship to Your Home"
+  ],
+  "ship_to_managers": [
+    "Discounted Group Shipping",
+    "Photo Day shipping $1.00"
+  ],
+  "ship_to_league": [
+    "Free Shipping to League Representative"
+  ]
+}
