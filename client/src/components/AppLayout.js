@@ -3,6 +3,12 @@ import { Routes, Route, NavLink, Navigate } from 'react-router-dom';
 import HomePage from '../pages/HomePage';
 import OrdersListPage from '../pages/OrdersListPage';
 import OrderDetailPage from '../pages/OrderDetailPage';
+import SettingsLayout from '../pages/settings/SettingsLayout';
+import PathsSettings from '../pages/settings/PathsSettings';
+import FolderSortSettings from '../pages/settings/FolderSortSettings';
+import DarkroomSettings from '../pages/settings/DarkroomSettings';
+import SlipSettings from '../pages/settings/SlipSettings';
+import ImpositionSettings from '../pages/settings/ImpositionSettings';
 
 /**
  * App shell shown to authenticated users.
@@ -10,7 +16,7 @@ import OrderDetailPage from '../pages/OrderDetailPage';
  * Header: brand + nav links + user identity / logout.
  * Main:   the matched route's page.
  *
- * Phase 3a: just routing scaffolding. Pages are mostly empty.
+ * Phase 4.5: adds /settings sub-routes (admin-gated inside SettingsLayout).
  */
 export default function AppLayout({ user, onLogout }) {
   return (
@@ -37,6 +43,18 @@ export default function AppLayout({ user, onLogout }) {
           <Route path="/" element={<HomePage />} />
           <Route path="/orders" element={<OrdersListPage />} />
           <Route path="/orders/:orderId" element={<OrderDetailPage />} />
+
+          {/* Settings: nested routes inside SettingsLayout (sidebar + outlet).
+              Default redirect → /settings/paths. */}
+          <Route path="/settings" element={<SettingsLayout user={user} />}>
+            <Route index element={<Navigate to="paths" replace />} />
+            <Route path="paths" element={<PathsSettings />} />
+            <Route path="folder-sort" element={<FolderSortSettings />} />
+            <Route path="darkroom" element={<DarkroomSettings />} />
+            <Route path="slip" element={<SlipSettings />} />
+            <Route path="imposition" element={<ImpositionSettings />} />
+          </Route>
+
           {/* Unknown paths fall back to home. Could be a 404 page later. */}
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
@@ -84,6 +102,11 @@ function Header({ user, onLogout }) {
           <NavLink to="/orders" style={navLinkStyle}>
             Orders
           </NavLink>
+          {user.role === 'admin' && (
+            <NavLink to="/settings" style={navLinkStyle}>
+              Settings
+            </NavLink>
+          )}
         </nav>
       </div>
 

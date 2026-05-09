@@ -8,6 +8,9 @@ const sytistDb = require('../services/sytistDbService');
 const pathsService = require('../services/pathsService');
 const folderSortService = require('../services/folderSortService');
 const darkroomService = require('../services/darkroomService');
+const packingSlipService = require('../services/packingSlipService');
+const teamDividerService = require('../services/teamDividerService');
+const impositionService = require('../services/impositionService');
 const { requireAuth, requireRole } = require('../middleware/auth');
 
 router.use(requireAuth);
@@ -353,6 +356,76 @@ router.get('/paths/config', async (req, res) => {
 });
 
 /**
+ * GET /api/sytist/paths/config/full
+ *
+ * Returns the full paths config (templates for ALL modes, not just the
+ * active one). Used by the Settings UI so operators can edit test +
+ * production templates side by side.
+ */
+router.get('/paths/config/full', async (req, res) => {
+  try {
+    res.json(pathsService.describeFull());
+  } catch (err) {
+    console.error('[sytist/paths/config/full]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * PUT /api/sytist/paths/mode
+ * Body: { mode: 'test' | 'production' }
+ *
+ * Switches the active path mode. Admin only — this is the safety switch
+ * that determines whether files land in the test sandbox or on the live
+ * Z: share.
+ */
+router.put(
+  '/paths/mode',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const { mode } = req.body || {};
+      if (!mode) {
+        return res.status(400).json({ error: 'mode is required' });
+      }
+      const updated = pathsService.setMode(mode);
+      res.json({ success: true, mode: updated });
+    } catch (err) {
+      console.error('[sytist/paths/mode]', err);
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+/**
+ * PUT /api/sytist/paths/templates/:mode/:outputType
+ * Body: { template: '...' }
+ *
+ * Updates a single template under a specific mode. Admin only.
+ */
+router.put(
+  '/paths/templates/:mode/:outputType',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const { template } = req.body || {};
+      if (typeof template !== 'string') {
+        return res.status(400).json({ error: 'template is required (string)' });
+      }
+      const updated = pathsService.setTemplate(
+        req.params.mode,
+        req.params.outputType,
+        template
+      );
+      res.json({ success: true, template: updated });
+    } catch (err) {
+      console.error('[sytist/paths/templates]', err);
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+/**
  * PUT /api/sytist/paths/folder-sort
  * Body: { sortLevels: ["gallery", "sub_gallery"] }
  *
@@ -637,5 +710,677 @@ router.put(
     }
   }
 );
+
+// ─── Phase 4.3: packing slip + team divider ───────────────
+//
+// Preview-by-default endpoints. The streaming preview routes return
+// image/jpeg directly so the operator can open them in a new tab without
+// any file landing on disk. The /save variants write to the test sandbox
+// (same downloadBase tree the .txt would land in) so operators can sanity
+// check what the actual file would look like in a folder.
+//
+// As with darkroom, neither writeSlipFile() nor writeDividerFile() is
+// called from any "production write" route in 4.3. Phase 4.6 will
+// orchestrate the real writes.
+
+/**
+ * GET /api/sytist/slip/preview/:orderId
+ *
+ * Streams a freshly-rendered slip JPG back as image/jpeg. Open in a new
+ * tab to view, or right-click → save-as to grab a copy.
+ *
+ * Query params:
+ *   teamSubGalleryId — when given, the slip only shows items belonging
+ *                       to that sub-gallery (per-team chunk preview for
+ *                       non-home siblings).
+ */
+router.get('/slip/preview/:orderId', async (req, res) => {
+  try {
+    const order = await sytistDb.getOrderById(req.params.orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    const sortLevels = await folderSortService.getSortLevels();
+    const sortSegments = folderSortService.buildOrderPathSync(order, sortLevels);
+
+    let teamScope = null;
+    if (req.query.teamSubGalleryId) {
+      const id = parseInt(req.query.teamSubGalleryId, 10);
+      if (!Number.isNaN(id)) {
+        const matching = (order.lineItems || []).find((li) => li.subGalleryId === id);
+        teamScope = {
+          subGalleryId: id,
+          subGalleryName: matching ? matching.subGalleryName : '',
+        };
+      }
+    }
+
+    const result = await packingSlipService.buildSlipBuffer(order, {
+      sortSegments,
+      teamScope,
+    });
+
+    res.set('Content-Type', 'image/jpeg');
+    res.set('Content-Length', String(result.buffer.length));
+    res.set('X-Slip-Filename', result.filename);
+    res.set('X-Slip-Skipped-Count', String(result.meta.skippedCount));
+    res.set('X-Slip-Warning-Count', String(result.warnings.length));
+    res.set('Cache-Control', 'no-store');
+    res.send(result.buffer);
+  } catch (err) {
+    console.error('[sytist/slip/preview]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/sytist/slip/preview/:orderId/save
+ *
+ * Renders the slip and writes it under the test sandbox with a "_preview"
+ * suffix (so it doesn't clobber a future production slip). Returns the
+ * full path + meta so the UI can show "saved to X".
+ *
+ * Path mode is enforced — refuse to save when path-overrides.json mode is
+ * "production", since this endpoint is explicitly for previewing.
+ */
+router.post('/slip/preview/:orderId/save', async (req, res) => {
+  try {
+    if (pathsService.getMode() === 'production') {
+      return res.status(403).json({
+        error:
+          'Path mode is "production"; preview/save is sandbox-only. Switch path-overrides.json to mode "test" first.',
+      });
+    }
+
+    const order = await sytistDb.getOrderById(req.params.orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    const sortLevels = await folderSortService.getSortLevels();
+    const sortSegments = folderSortService.buildOrderPathSync(order, sortLevels);
+
+    let teamScope = null;
+    if (req.body && req.body.teamSubGalleryId) {
+      const id = parseInt(req.body.teamSubGalleryId, 10);
+      if (!Number.isNaN(id)) {
+        const matching = (order.lineItems || []).find((li) => li.subGalleryId === id);
+        teamScope = {
+          subGalleryId: id,
+          subGalleryName: matching ? matching.subGalleryName : '',
+        };
+      }
+    }
+
+    const built = await packingSlipService.buildSlipBuffer(order, {
+      sortSegments,
+      teamScope,
+      filenameSuffix: '_preview',
+    });
+    const written = await packingSlipService.writeSlipFile(built);
+
+    res.json({
+      success: true,
+      filePath: written.filePath,
+      filename: written.filename,
+      meta: built.meta,
+      warnings: built.warnings,
+      skippedItems: built.skippedItems,
+    });
+  } catch (err) {
+    console.error('[sytist/slip/preview/save]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/sytist/slip/preview/:orderId/info
+ *
+ * Returns the slip preview metadata (filename, target path, warnings,
+ * skipped items) WITHOUT the JPG buffer. Used by the order-detail UI to
+ * show a summary block alongside the inline image preview without
+ * double-rendering the slip.
+ */
+router.get('/slip/preview/:orderId/info', async (req, res) => {
+  try {
+    const order = await sytistDb.getOrderById(req.params.orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    const sortLevels = await folderSortService.getSortLevels();
+    const sortSegments = folderSortService.buildOrderPathSync(order, sortLevels);
+
+    let teamScope = null;
+    if (req.query.teamSubGalleryId) {
+      const id = parseInt(req.query.teamSubGalleryId, 10);
+      if (!Number.isNaN(id)) {
+        const matching = (order.lineItems || []).find((li) => li.subGalleryId === id);
+        teamScope = {
+          subGalleryId: id,
+          subGalleryName: matching ? matching.subGalleryName : '',
+        };
+      }
+    }
+
+    const built = await packingSlipService.buildSlipBuffer(order, {
+      sortSegments,
+      teamScope,
+    });
+
+    // Return metadata only (omit buffer)
+    res.json({
+      filename: built.filename,
+      filePath: built.filePath,
+      targetDir: built.targetDir,
+      printedItems: built.printedItems,
+      skippedItems: built.skippedItems,
+      warnings: built.warnings,
+      meta: built.meta,
+    });
+  } catch (err) {
+    console.error('[sytist/slip/preview/info]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/sytist/slip/config
+ * GET /api/sytist/slip/config (PUT, admin) — update studio info / colors
+ */
+router.get('/slip/config', async (req, res) => {
+  try {
+    const cfg = await packingSlipService.getSlipConfig();
+    res.json(cfg);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.put('/slip/config', requireRole('admin'), async (req, res) => {
+  try {
+    const updated = await packingSlipService.updateSlipConfig(req.body || {});
+    res.json({ success: true, config: updated });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ─── Team divider ─────────────────────────────────────────
+
+/**
+ * GET /api/sytist/divider/preview
+ *
+ * Renders a divider JPG and streams it as image/jpeg. Standalone — no
+ * order required. The preview UI uses this to show what a divider sheet
+ * for a given team would look like.
+ *
+ * Query params:
+ *   teamName       — required
+ *   galleryName    — optional, italic line at bottom
+ *   itemCount      — optional, joins the sub-line
+ *   customerCount  — optional, joins the sub-line
+ */
+router.get('/divider/preview', async (req, res) => {
+  try {
+    const teamName = (req.query.teamName || '').toString().trim();
+    if (!teamName) {
+      return res.status(400).json({ error: 'teamName is required' });
+    }
+
+    const built = await teamDividerService.buildDividerBuffer(teamName, {
+      galleryName: req.query.galleryName,
+      itemCount:
+        req.query.itemCount != null ? parseInt(req.query.itemCount, 10) : undefined,
+      customerCount:
+        req.query.customerCount != null
+          ? parseInt(req.query.customerCount, 10)
+          : undefined,
+    });
+
+    res.set('Content-Type', 'image/jpeg');
+    res.set('Content-Length', String(built.buffer.length));
+    res.set('X-Divider-Filename', built.filename);
+    res.set('Cache-Control', 'no-store');
+    res.send(built.buffer);
+  } catch (err) {
+    console.error('[sytist/divider/preview]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/sytist/divider/preview/save
+ * Body: { teamName, galleryName?, itemCount?, customerCount?, orderId? }
+ *
+ * Renders a divider and writes it to the test sandbox. When `orderId` is
+ * provided, the divider is filed alongside that order's other artifacts;
+ * otherwise it's filed under today's date partition.
+ *
+ * As with slip/save, refuses to write when mode === 'production'.
+ */
+router.post('/divider/preview/save', async (req, res) => {
+  try {
+    if (pathsService.getMode() === 'production') {
+      return res.status(403).json({
+        error:
+          'Path mode is "production"; preview/save is sandbox-only. Switch path-overrides.json to mode "test" first.',
+      });
+    }
+
+    const body = req.body || {};
+    const teamName = (body.teamName || '').toString().trim();
+    if (!teamName) {
+      return res.status(400).json({ error: 'teamName is required' });
+    }
+
+    let orderForPath = null;
+    let sortSegments = [];
+    if (body.orderId) {
+      const order = await sytistDb.getOrderById(body.orderId);
+      if (!order) {
+        return res.status(404).json({ error: `Order ${body.orderId} not found` });
+      }
+      orderForPath = order;
+      const sortLevels = await folderSortService.getSortLevels();
+      sortSegments = folderSortService.buildOrderPathSync(order, sortLevels);
+    } else {
+      // Synthetic "order" giving a path resolver enough to land under today's date.
+      orderForPath = {
+        orderId: 'standalone',
+        orderDate: new Date().toISOString().replace('T', ' ').slice(0, 19),
+        galleryName: body.galleryName || '',
+        subGalleryName: teamName,
+        shipping: {},
+      };
+    }
+
+    const built = await teamDividerService.buildDividerBuffer(teamName, {
+      galleryName: body.galleryName,
+      itemCount: body.itemCount != null ? parseInt(body.itemCount, 10) : undefined,
+      customerCount:
+        body.customerCount != null ? parseInt(body.customerCount, 10) : undefined,
+      order: orderForPath,
+      sortSegments,
+      filenameSuffix: '_preview',
+    });
+
+    const written = await teamDividerService.writeDividerFile(built);
+    res.json({
+      success: true,
+      filePath: written.filePath,
+      filename: written.filename,
+      meta: built.meta,
+    });
+  } catch (err) {
+    console.error('[sytist/divider/preview/save]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Phase 4.4: imposition ────────────────────────────────
+//
+// Preview-by-default endpoints. The /preview route streams the imposed
+// sheet back as image/jpeg directly. /preview/info returns metadata
+// only (which layout matched, warnings, mapping fallback flags, etc.)
+// for the UI to render alongside the inline image. /preview/save writes
+// to the test sandbox so operators can verify a real file looks right.
+//
+// CRUD endpoints for layouts and mappings round out the API surface so
+// the future settings UI can edit imposition configuration without code
+// changes.
+//
+// composeSheetInPlace() (the photo-day-equivalent destructive overwrite)
+// is NOT wired to any endpoint here. Phase 4.6 calls it after downloading
+// pic_full from S3 to its target path.
+
+/**
+ * GET /api/sytist/imposition/preview/:orderId/:cartId
+ *
+ * Looks up the line item by cart ID, fetches its pic_full from S3, runs
+ * imposition, and streams the result as image/jpeg. Auto-detects
+ * orientation from the source image.
+ *
+ * Query params:
+ *   orientation — override auto-detection ('vertical' | 'horizontal')
+ */
+router.get('/imposition/preview/:orderId/:cartId', async (req, res) => {
+  try {
+    const order = await sytistDb.getOrderById(req.params.orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    const cartId = parseInt(req.params.cartId, 10);
+    const lineItem = (order.lineItems || []).find((li) => li.cartId === cartId);
+    if (!lineItem) {
+      return res.status(404).json({ error: `Line item ${cartId} not found in order` });
+    }
+    if (!lineItem.photo || !lineItem.photo.fullUrl) {
+      return res.status(400).json({
+        error: `Line item ${cartId} has no photo URL to impose`,
+      });
+    }
+
+    const orientation =
+      req.query.orientation && ['vertical', 'horizontal'].includes(req.query.orientation)
+        ? req.query.orientation
+        : null;
+
+    const ctx = impositionService.buildContext(order, lineItem);
+    const result = await impositionService.composeFromUrl(
+      lineItem.photo.fullUrl,
+      lineItem.sku,
+      ctx,
+      orientation
+    );
+
+    if (!result.imposed) {
+      return res.status(404).json({ error: result.reason });
+    }
+
+    res.set('Content-Type', 'image/jpeg');
+    res.set('Content-Length', String(result.buffer.length));
+    res.set('X-Imposition-Layout', result.layout.name);
+    res.set('X-Imposition-Orientation', result.orientation || 'unknown');
+    res.set('X-Imposition-Warning-Count', String(result.warnings.length));
+    res.set('Cache-Control', 'no-store');
+    res.send(result.buffer);
+  } catch (err) {
+    console.error('[sytist/imposition/preview]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/sytist/imposition/preview/:orderId/:cartId/info
+ *
+ * Returns metadata about what layout would match the line item — without
+ * fetching/rendering the image. Used by the UI to show layout name,
+ * warnings, and mapping info ahead of (or instead of) loading the
+ * rendered preview image.
+ *
+ * For real metadata we still need to detect orientation, which means
+ * fetching the source image. To keep info cheap, we pass through the
+ * orientation query param if given, and only auto-detect when missing.
+ */
+router.get('/imposition/preview/:orderId/:cartId/info', async (req, res) => {
+  try {
+    const order = await sytistDb.getOrderById(req.params.orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    const cartId = parseInt(req.params.cartId, 10);
+    const lineItem = (order.lineItems || []).find((li) => li.cartId === cartId);
+    if (!lineItem) {
+      return res.status(404).json({ error: `Line item ${cartId} not found in order` });
+    }
+
+    const requestedOrientation =
+      req.query.orientation && ['vertical', 'horizontal'].includes(req.query.orientation)
+        ? req.query.orientation
+        : null;
+
+    // Try the requested orientation first; if absent, look up by SKU only
+    // and report which mapping we'd land on.
+    const sku = String(lineItem.sku || '');
+    const rule = await impositionService.findRule(sku, requestedOrientation);
+
+    if (!rule) {
+      return res.json({
+        cartId,
+        sku,
+        productName: lineItem.productName,
+        hasRule: false,
+        reason: `No imposition rule for SKU "${sku}"`,
+        availableMappings: (await impositionService.getMappings()).filter(
+          (m) => m.externalId === sku
+        ),
+      });
+    }
+
+    res.json({
+      cartId,
+      sku,
+      productName: lineItem.productName,
+      subGalleryName: lineItem.subGalleryName || '',
+      hasRule: true,
+      requestedOrientation,
+      layout: {
+        id: rule.id,
+        name: rule.name,
+        cols: rule.cols,
+        rows: rule.rows,
+        itemWidth: rule.itemWidth,
+        itemHeight: rule.itemHeight,
+        sheetWidth: rule.sheetWidth,
+        sheetHeight: rule.sheetHeight,
+        dpi: rule.dpi,
+        textOverlayCount: (rule.textOverlays || []).length,
+      },
+      mapping: {
+        externalId: rule.__mapping.externalId,
+        orientation: rule.__mapping.orientation || null,
+      },
+      mappingFellBack: !!rule.__mappingFellBack,
+      photo: {
+        hasFullUrl: !!lineItem.photo?.fullUrl,
+        thumbUrl: lineItem.photo?.thumbUrl || null,
+      },
+    });
+  } catch (err) {
+    console.error('[sytist/imposition/preview/info]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/sytist/imposition/preview/:orderId/:cartId/save
+ *
+ * Renders an imposed sheet and writes it to the test sandbox. Refuses
+ * when path mode is "production" (preview/save is sandbox-only).
+ */
+router.post('/imposition/preview/:orderId/:cartId/save', async (req, res) => {
+  try {
+    if (pathsService.getMode() === 'production') {
+      return res.status(403).json({
+        error:
+          'Path mode is "production"; preview/save is sandbox-only. Switch path-overrides.json to mode "test" first.',
+      });
+    }
+
+    const order = await sytistDb.getOrderById(req.params.orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    const cartId = parseInt(req.params.cartId, 10);
+    const lineItem = (order.lineItems || []).find((li) => li.cartId === cartId);
+    if (!lineItem) {
+      return res.status(404).json({ error: `Line item ${cartId} not found in order` });
+    }
+    if (!lineItem.photo || !lineItem.photo.fullUrl) {
+      return res.status(400).json({
+        error: `Line item ${cartId} has no photo URL to impose`,
+      });
+    }
+
+    const orientation =
+      (req.body && req.body.orientation) ||
+      (req.query.orientation && ['vertical', 'horizontal'].includes(req.query.orientation)
+        ? req.query.orientation
+        : null);
+
+    const ctx = impositionService.buildContext(order, lineItem);
+    const result = await impositionService.composeFromUrl(
+      lineItem.photo.fullUrl,
+      lineItem.sku,
+      ctx,
+      orientation
+    );
+
+    if (!result.imposed) {
+      return res.status(404).json({ error: result.reason });
+    }
+
+    // Resolve target path under downloadBase + sortSegments
+    const sortLevels = await folderSortService.getSortLevels();
+    const sortSegments = folderSortService.buildOrderPathSync(order, sortLevels);
+    const targetDir = pathsService.resolveFullPath(
+      'downloadBase',
+      order,
+      sortSegments
+    );
+
+    const safeLayoutName = (result.layout.name || 'sheet')
+      .trim()
+      .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+      .replace(/\s+/g, '_');
+    const filename = `${order.orderNumber || order.orderId}_cart${cartId}_${safeLayoutName}_preview.jpg`;
+    const filePath = require('path').win32.join(targetDir, filename);
+
+    // Atomic write — same .tmp + rename pattern the other services use
+    const fsp = require('fs').promises;
+    await fsp.mkdir(targetDir, { recursive: true });
+    const tmpPath = filePath + '.tmp';
+    await fsp.writeFile(tmpPath, result.buffer);
+    await fsp.rename(tmpPath, filePath);
+
+    res.json({
+      success: true,
+      filePath,
+      filename,
+      layout: result.layout,
+      mapping: result.mapping,
+      orientation: result.orientation,
+      warnings: result.warnings,
+      meta: result.meta,
+    });
+  } catch (err) {
+    console.error('[sytist/imposition/preview/save]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Layout CRUD (admin only) ─────────────────────────────
+
+router.get('/imposition/layouts', async (req, res) => {
+  try {
+    const layouts = await impositionService.getLayouts();
+    res.json({ layouts });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/imposition/layouts/:id', async (req, res) => {
+  try {
+    const layout = await impositionService.getLayout(req.params.id);
+    if (!layout) return res.status(404).json({ error: 'Layout not found' });
+    res.json({ layout });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/imposition/layouts', requireRole('admin'), async (req, res) => {
+  try {
+    const layout = await impositionService.addLayout(req.body || {});
+    res.json({ success: true, layout });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.put('/imposition/layouts/:id', requireRole('admin'), async (req, res) => {
+  try {
+    const layout = await impositionService.updateLayout(req.params.id, req.body || {});
+    res.json({ success: true, layout });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.delete('/imposition/layouts/:id', requireRole('admin'), async (req, res) => {
+  try {
+    const layouts = await impositionService.deleteLayout(req.params.id);
+    res.json({ success: true, layouts });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ─── Mapping CRUD (admin only) ────────────────────────────
+
+router.get('/imposition/mappings', async (req, res) => {
+  try {
+    const mappings = await impositionService.getMappings();
+    res.json({ mappings });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/imposition/mappings', requireRole('admin'), async (req, res) => {
+  try {
+    const { externalId, layoutId, orientation } = req.body || {};
+    if (!externalId || !layoutId) {
+      return res.status(400).json({ error: 'externalId and layoutId are required' });
+    }
+    const mappings = await impositionService.addMapping(
+      externalId,
+      layoutId,
+      orientation || null
+    );
+    res.json({ success: true, mappings });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+/**
+ * PUT /api/sytist/imposition/mappings/:externalId
+ * Body: { oldOrientation?: string, layoutId?: string, orientation?: string }
+ *
+ * Updates an existing mapping. The mapping is located by
+ * (externalId, oldOrientation) — pass empty string or omit oldOrientation
+ * for an "any-orientation" mapping. Body's layoutId / orientation are the
+ * new values.
+ */
+router.put(
+  '/imposition/mappings/:externalId',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const { oldOrientation, layoutId, orientation } = req.body || {};
+      const mappings = await impositionService.updateMapping(
+        req.params.externalId,
+        oldOrientation || null,
+        { layoutId, orientation }
+      );
+      res.json({ success: true, mappings });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+/**
+ * DELETE /api/sytist/imposition/mappings/:externalId
+ * Query: ?orientation=vertical|horizontal (optional)
+ *
+ * If orientation is given, deletes only that orientation's mapping.
+ * If omitted, deletes ALL mappings for this externalId.
+ */
+router.delete(
+  '/imposition/mappings/:externalId',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const orientation = req.query.orientation || null;
+      const mappings = await impositionService.deleteMapping(
+        req.params.externalId,
+        orientation
+      );
+      res.json({ success: true, mappings });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+router.get('/imposition/text-variables', async (req, res) => {
+  res.json({ variables: impositionService.getTextVariables() });
+});
 
 module.exports = router;

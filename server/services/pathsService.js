@@ -272,6 +272,88 @@ class PathsService {
       knownTokens: ['{date}', '{orderId}', '{gallery}', '{subGallery}', '{workflow}'],
     };
   }
+
+  // ─── Settings: full config + mutations ─────────────────
+
+  /**
+   * Returns the full config including every mode's templates. Used by
+   * the Settings UI so operators can edit test/production templates
+   * side by side.
+   */
+  describeFull() {
+    this._load();
+    const modes = {};
+    for (const [modeName, modeConfig] of Object.entries(this._overrides.modes || {})) {
+      modes[modeName] = { ...modeConfig };
+    }
+    return {
+      mode: this._mode,
+      loadedAt: this._loadedAt,
+      configPath: OVERRIDES_PATH,
+      modes,
+      outputTypes: [...OUTPUT_TYPES],
+      knownTokens: ['{date}', '{orderId}', '{gallery}', '{subGallery}', '{workflow}'],
+    };
+  }
+
+  /**
+   * Switches the active mode. Persists to disk. Reloads in-memory state
+   * so subsequent path resolutions reflect the new mode immediately.
+   *
+   * Allowed modes: 'test' | 'production'. The mode must already exist
+   * in the modes map (i.e. you can't switch to a mode whose templates
+   * haven't been defined).
+   */
+  setMode(newMode) {
+    this._load();
+    if (!newMode || typeof newMode !== 'string') {
+      throw new Error('mode is required');
+    }
+    if (!this._overrides.modes || !this._overrides.modes[newMode]) {
+      throw new Error(
+        `Mode "${newMode}" has no templates defined under modes.${newMode}`
+      );
+    }
+    const updated = { ...this._overrides, mode: newMode };
+    fs.writeFileSync(OVERRIDES_PATH, JSON.stringify(updated, null, 2), 'utf8');
+    this._overrides = null;
+    this._mode = null;
+    this._load();
+    console.log(`[PathsService] Mode changed → ${newMode}`);
+    return this._mode;
+  }
+
+  /**
+   * Updates a single template under a specific mode. Both the mode and
+   * the output type must exist; this method doesn't create new modes
+   * or new output types — those are controlled at the code level
+   * (OUTPUT_TYPES const) and require a code change to evolve.
+   */
+  setTemplate(mode, outputType, template) {
+    this._load();
+    if (!this._overrides.modes || !this._overrides.modes[mode]) {
+      throw new Error(`Mode "${mode}" not found`);
+    }
+    if (!OUTPUT_TYPES.includes(outputType)) {
+      throw new Error(
+        `Unknown output type "${outputType}". Valid: ${OUTPUT_TYPES.join(', ')}`
+      );
+    }
+    if (typeof template !== 'string') {
+      throw new Error('template must be a string');
+    }
+
+    const updated = JSON.parse(JSON.stringify(this._overrides));
+    updated.modes[mode][outputType] = template;
+    fs.writeFileSync(OVERRIDES_PATH, JSON.stringify(updated, null, 2), 'utf8');
+
+    // Reload so the active mode picks up the change immediately
+    this._overrides = null;
+    this._mode = null;
+    this._load();
+
+    return updated.modes[mode][outputType];
+  }
 }
 
 // ─── Helpers ─────────────────────────────────────────────

@@ -140,6 +140,10 @@ export default function OrderDetailPage() {
       <OutputPathsBlock orderId={order.orderId} />
 
       <DarkroomTxtBlock orderId={order.orderId} />
+
+      <PackingSlipBlock orderId={order.orderId} />
+
+      <ImpositionBlock order={order} />
     </div>
   );
 }
@@ -1270,6 +1274,735 @@ const txtTd = {
   color: 'var(--text-secondary)',
   verticalAlign: 'top',
 };
+
+// ──────────────────────────────────────────────────────────
+// Packing slip preview (Phase 4.3)
+// ──────────────────────────────────────────────────────────
+//
+// Card with: collapsed by default; on expand, fetches /info for metadata
+// (filename, target path, warnings, skipped) AND fetches the slip JPG as
+// an authenticated blob (the /preview endpoint requires X-Session-Id; a
+// plain <img src=...> tag can't pass that header, so the browser would
+// hit the auth wall and get redirected to login). The blob is rendered
+// via URL.createObjectURL so the <img> shows the slip without a second
+// network round-trip.
+//
+// StrictMode-safe ref-guarded fetch pattern — same as DarkroomTxtBlock
+// and OutputPathsBlock.
+
+function PackingSlipBlock({ orderId }) {
+  const [open, setOpen] = useState(false);
+  const [info, setInfo] = useState(null);
+  const [imgUrl, setImgUrl] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [savedPath, setSavedPath] = useState(null);
+
+  const fetchedRef = useRef({ orderId: null, status: 'idle' });
+  // Track the most recent object URL so we can revoke the previous one
+  // before swapping in a new one (avoids leaking blobs in the browser).
+  const objectUrlRef = useRef(null);
+
+  // Reset on order change
+  useEffect(() => {
+    fetchedRef.current = { orderId, status: 'idle' };
+    setInfo(null);
+    setError(null);
+    setLoading(false);
+    setSaving(false);
+    setSavedPath(null);
+    if (objectUrlRef.current) {
+      URL.revokeObjectURL(objectUrlRef.current);
+      objectUrlRef.current = null;
+    }
+    setImgUrl(null);
+  }, [orderId]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+        objectUrlRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    const ref = fetchedRef.current;
+    if (ref.orderId === orderId && ref.status !== 'idle') return;
+
+    fetchedRef.current = { orderId, status: 'loading' };
+    setLoading(true);
+    setError(null);
+
+    // Fetch metadata + image blob in parallel — both need auth headers,
+    // so both go through api (not raw <img src>).
+    Promise.all([
+      api.get(`/api/sytist/slip/preview/${orderId}/info`),
+      api.getBlob(`/api/sytist/slip/preview/${orderId}`),
+    ])
+      .then(([infoData, blob]) => {
+        if (fetchedRef.current.orderId !== orderId) return;
+        const url = URL.createObjectURL(blob);
+        // Revoke previous URL if any (e.g. after a re-fetch)
+        if (objectUrlRef.current) {
+          URL.revokeObjectURL(objectUrlRef.current);
+        }
+        objectUrlRef.current = url;
+        fetchedRef.current = { orderId, status: 'done' };
+        setInfo(infoData);
+        setImgUrl(url);
+        setLoading(false);
+      })
+      .catch((err) => {
+        if (fetchedRef.current.orderId !== orderId) return;
+        fetchedRef.current = { orderId, status: 'error' };
+        setError(err.message);
+        setLoading(false);
+      });
+  }, [open, orderId]);
+
+  async function handleSave() {
+    setSaving(true);
+    setSavedPath(null);
+    try {
+      const result = await api.post(`/api/sytist/slip/preview/${orderId}/save`, {});
+      setSavedPath(result.filePath);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Card title="Packing slip preview">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        style={{
+          background: 'transparent',
+          border: '1px solid var(--border-color)',
+          color: 'var(--text-secondary)',
+          padding: '6px 12px',
+          borderRadius: 6,
+          fontSize: 12,
+          cursor: 'pointer',
+          fontFamily: 'inherit',
+        }}
+      >
+        {open ? 'Hide' : 'Show'} slip preview
+      </button>
+      <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-muted)' }}>
+        Streamed from server — image is rendered fresh each time, not saved to disk.
+      </div>
+
+      {open && loading && (
+        <div style={{ marginTop: 12, fontSize: 12, color: 'var(--text-muted)' }}>
+          Building slip preview…
+        </div>
+      )}
+
+      {open && error && (
+        <div
+          style={{
+            marginTop: 12,
+            padding: 10,
+            background: 'rgba(220,53,69,0.1)',
+            border: '1px solid rgba(220,53,69,0.3)',
+            borderRadius: 6,
+            color: '#dc3545',
+            fontSize: 12,
+          }}
+        >
+          {error}
+        </div>
+      )}
+
+      {open && info && imgUrl && !loading && (
+        <SlipPreviewContent
+          info={info}
+          imgUrl={imgUrl}
+          orderId={orderId}
+          onSave={handleSave}
+          saving={saving}
+          savedPath={savedPath}
+        />
+      )}
+    </Card>
+  );
+}
+
+function SlipPreviewContent({ info, imgUrl, orderId, onSave, saving, savedPath }) {
+  const warnings = info.warnings || [];
+  const skipped = info.skippedItems || [];
+
+  return (
+    <div style={{ marginTop: 16 }}>
+      {/* Metadata strip */}
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'auto 1fr',
+          rowGap: 6,
+          columnGap: 12,
+          fontSize: 12,
+          marginBottom: 16,
+        }}
+      >
+        <span style={{ color: 'var(--text-muted)' }}>Filename:</span>
+        <span style={{ fontFamily: 'var(--font-mono, monospace)' }}>{info.filename}</span>
+        <span style={{ color: 'var(--text-muted)' }}>Target path:</span>
+        <span
+          style={{
+            fontFamily: 'var(--font-mono, monospace)',
+            fontSize: 11,
+            wordBreak: 'break-all',
+          }}
+        >
+          {info.filePath}
+        </span>
+        <span style={{ color: 'var(--text-muted)' }}>Items on slip:</span>
+        <span>
+          {info.meta?.printedCount ?? 0} printed
+          {info.meta?.skippedCount > 0 && `, ${info.meta.skippedCount} skipped`}
+        </span>
+      </div>
+
+      {/* Warnings */}
+      {warnings.length > 0 && (
+        <div
+          style={{
+            marginBottom: 12,
+            padding: 10,
+            background: 'rgba(224,179,65,0.1)',
+            border: '1px solid rgba(224,179,65,0.4)',
+            borderRadius: 6,
+          }}
+        >
+          <div
+            style={{
+              fontSize: 11,
+              fontWeight: 700,
+              textTransform: 'uppercase',
+              letterSpacing: 0.5,
+              color: '#e0b341',
+              marginBottom: 6,
+            }}
+          >
+            Warnings ({warnings.length})
+          </div>
+          {warnings.map((w, i) => (
+            <div
+              key={i}
+              style={{
+                fontSize: 12,
+                color: 'var(--text-secondary)',
+                marginTop: i === 0 ? 0 : 4,
+              }}
+            >
+              <span
+                style={{
+                  fontFamily: 'var(--font-mono, monospace)',
+                  fontSize: 10,
+                  padding: '1px 6px',
+                  borderRadius: 4,
+                  background: 'rgba(224,179,65,0.18)',
+                  color: '#e0b341',
+                  marginRight: 6,
+                }}
+              >
+                {w.type}
+              </span>
+              {w.message ||
+                (w.cartId
+                  ? `cartId ${w.cartId}${w.url ? ' — ' + w.url : ''}`
+                  : '')}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Skipped items */}
+      {skipped.length > 0 && (
+        <div
+          style={{
+            marginBottom: 12,
+            padding: 10,
+            background: 'rgba(158,158,158,0.08)',
+            border: '1px solid rgba(158,158,158,0.3)',
+            borderRadius: 6,
+          }}
+        >
+          <div
+            style={{
+              fontSize: 11,
+              fontWeight: 700,
+              textTransform: 'uppercase',
+              letterSpacing: 0.5,
+              color: 'var(--text-muted)',
+              marginBottom: 6,
+            }}
+          >
+            Skipped ({skipped.length})
+          </div>
+          {skipped.map((s, i) => (
+            <div
+              key={i}
+              style={{
+                fontSize: 12,
+                color: 'var(--text-secondary)',
+                marginTop: i === 0 ? 0 : 4,
+              }}
+            >
+              <span
+                style={{
+                  fontFamily: 'var(--font-mono, monospace)',
+                  fontSize: 10,
+                  padding: '1px 6px',
+                  borderRadius: 4,
+                  background: 'rgba(158,158,158,0.2)',
+                  color: 'var(--text-muted)',
+                  marginRight: 6,
+                }}
+              >
+                {s.reason}
+              </span>
+              {s.productName}
+              {s.sku && (
+                <span style={{ color: 'var(--text-muted)', marginLeft: 6 }}>
+                  (SKU {s.sku})
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Inline rendered slip image — blob URL so auth header was sent */}
+      <div
+        style={{
+          marginTop: 12,
+          padding: 16,
+          background: '#2a2a2a',
+          border: '1px solid var(--border-color)',
+          borderRadius: 6,
+          textAlign: 'center',
+        }}
+      >
+        <img
+          src={imgUrl}
+          alt={`Packing slip for order ${orderId}`}
+          style={{
+            maxWidth: '100%',
+            maxHeight: 1200,
+            border: '1px solid #444',
+            boxShadow: '0 2px 12px rgba(0,0,0,0.4)',
+          }}
+        />
+      </div>
+
+      {/* Save button + status */}
+      <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 12 }}>
+        <button
+          onClick={onSave}
+          disabled={saving}
+          style={{
+            background: 'var(--bg-input)',
+            border: '1px solid var(--border-color)',
+            color: 'var(--text-primary)',
+            padding: '8px 14px',
+            borderRadius: 6,
+            fontSize: 12,
+            cursor: saving ? 'wait' : 'pointer',
+            fontFamily: 'inherit',
+            opacity: saving ? 0.6 : 1,
+          }}
+        >
+          {saving ? 'Saving…' : 'Save preview to test sandbox'}
+        </button>
+        {savedPath && (
+          <span
+            style={{
+              fontSize: 11,
+              color: 'var(--text-muted)',
+              fontFamily: 'var(--font-mono, monospace)',
+              wordBreak: 'break-all',
+            }}
+          >
+            Saved → {savedPath}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ──────────────────────────────────────────────────────────
+// Imposition preview (Phase 4.4)
+// ──────────────────────────────────────────────────────────
+//
+// Imposition is per-line-item (not per-order), so this card lists the
+// order's print-eligible line items and lets the operator preview the
+// imposed sheet for each one. Each row shows: product name, SKU, layout
+// it would use, and an inline expand to render the actual imposed
+// sheet via authed blob fetch.
+//
+// Same StrictMode-safe ref-guarded pattern as the other preview blocks.
+
+function ImpositionBlock({ order }) {
+  const [open, setOpen] = useState(false);
+
+  // Filter to the line items that could possibly be imposed:
+  // - have a photo with a fullUrl (no point imposing without a source)
+  // - aren't flagged as download / booking / etc.
+  const candidateLineItems = (order.lineItems || []).filter((li) => {
+    if (!li.photo || !li.photo.fullUrl) return false;
+    const skipFlags = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell'];
+    return !skipFlags.some((f) => li.flags?.[f]);
+  });
+
+  return (
+    <Card title="Imposition preview">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        style={{
+          background: 'transparent',
+          border: '1px solid var(--border-color)',
+          color: 'var(--text-secondary)',
+          padding: '6px 12px',
+          borderRadius: 6,
+          fontSize: 12,
+          cursor: 'pointer',
+          fontFamily: 'inherit',
+        }}
+      >
+        {open ? 'Hide' : 'Show'} imposition
+      </button>
+      <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-muted)' }}>
+        Per-line-item preview. Layouts are looked up by SKU + auto-detected orientation.
+      </div>
+
+      {open && candidateLineItems.length === 0 && (
+        <div style={{ marginTop: 12, fontSize: 12, color: 'var(--text-muted)' }}>
+          No line items with photos eligible for imposition.
+        </div>
+      )}
+
+      {open &&
+        candidateLineItems.map((li) => (
+          <ImpositionItemRow
+            key={li.cartId}
+            order={order}
+            lineItem={li}
+          />
+        ))}
+    </Card>
+  );
+}
+
+function ImpositionItemRow({ order, lineItem }) {
+  const [info, setInfo] = useState(null);
+  const [imgUrl, setImgUrl] = useState(null);
+  const [expanded, setExpanded] = useState(false);
+  const [loadingInfo, setLoadingInfo] = useState(false);
+  const [loadingImg, setLoadingImg] = useState(false);
+  const [error, setError] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [savedPath, setSavedPath] = useState(null);
+
+  const objectUrlRef = useRef(null);
+  const infoFetchedRef = useRef(false);
+  const imgFetchedRef = useRef(false);
+
+  // Fetch metadata once when the row mounts so the layout name and
+  // hasRule status are visible without expanding.
+  useEffect(() => {
+    if (infoFetchedRef.current) return;
+    infoFetchedRef.current = true;
+    setLoadingInfo(true);
+    api
+      .get(
+        `/api/sytist/imposition/preview/${order.orderId}/${lineItem.cartId}/info`
+      )
+      .then((d) => {
+        setInfo(d);
+        setLoadingInfo(false);
+      })
+      .catch((err) => {
+        setError(err.message);
+        setLoadingInfo(false);
+      });
+  }, [order.orderId, lineItem.cartId]);
+
+  // Cleanup blob URL on unmount
+  useEffect(() => {
+    return () => {
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+        objectUrlRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!expanded || !info?.hasRule || imgFetchedRef.current) return;
+    imgFetchedRef.current = true;
+    setLoadingImg(true);
+
+    api
+      .getBlob(
+        `/api/sytist/imposition/preview/${order.orderId}/${lineItem.cartId}`
+      )
+      .then((blob) => {
+        const url = URL.createObjectURL(blob);
+        if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+        objectUrlRef.current = url;
+        setImgUrl(url);
+        setLoadingImg(false);
+      })
+      .catch((err) => {
+        setError(err.message);
+        setLoadingImg(false);
+      });
+  }, [expanded, info, order.orderId, lineItem.cartId]);
+
+  async function handleSave() {
+    setSaving(true);
+    setSavedPath(null);
+    try {
+      const result = await api.post(
+        `/api/sytist/imposition/preview/${order.orderId}/${lineItem.cartId}/save`,
+        {}
+      );
+      setSavedPath(result.filePath);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const noRule = info && !info.hasRule;
+  const hasRule = info && info.hasRule;
+
+  return (
+    <div
+      style={{
+        marginTop: 16,
+        padding: 12,
+        border: '1px solid var(--border-color)',
+        borderRadius: 6,
+        background: 'rgba(255,255,255,0.02)',
+      }}
+    >
+      {/* Header row */}
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'flex-start',
+          gap: 12,
+        }}
+      >
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>
+            {lineItem.productName}
+            {lineItem.qty > 1 && (
+              <span style={{ color: 'var(--text-muted)', marginLeft: 8 }}>
+                × {lineItem.qty}
+              </span>
+            )}
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+            SKU{' '}
+            <span style={{ fontFamily: 'var(--font-mono, monospace)' }}>
+              {lineItem.sku || '(none)'}
+            </span>
+            {lineItem.subGalleryName && (
+              <span style={{ marginLeft: 12 }}>Team: {lineItem.subGalleryName}</span>
+            )}
+          </div>
+          {loadingInfo && (
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+              Resolving layout…
+            </div>
+          )}
+          {hasRule && (
+            <div style={{ fontSize: 12, marginTop: 6 }}>
+              Layout:{' '}
+              <span style={{ fontFamily: 'var(--font-mono, monospace)' }}>
+                {info.layout.name}
+              </span>{' '}
+              <span style={{ color: 'var(--text-muted)' }}>
+                ({info.layout.cols}×{info.layout.rows} on{' '}
+                {info.layout.sheetWidth}×{info.layout.sheetHeight}″)
+              </span>
+              {info.mapping?.orientation && (
+                <span
+                  style={{
+                    fontSize: 10,
+                    fontFamily: 'var(--font-mono, monospace)',
+                    padding: '1px 6px',
+                    borderRadius: 4,
+                    background: 'rgba(120,120,200,0.18)',
+                    color: '#aab',
+                    marginLeft: 8,
+                  }}
+                >
+                  {info.mapping.orientation}
+                </span>
+              )}
+              {info.mappingFellBack && (
+                <span
+                  style={{
+                    fontSize: 10,
+                    fontFamily: 'var(--font-mono, monospace)',
+                    padding: '1px 6px',
+                    borderRadius: 4,
+                    background: 'rgba(224,179,65,0.18)',
+                    color: '#e0b341',
+                    marginLeft: 8,
+                  }}
+                >
+                  fallback
+                </span>
+              )}
+            </div>
+          )}
+          {noRule && (
+            <div
+              style={{
+                fontSize: 12,
+                color: 'var(--text-muted)',
+                marginTop: 6,
+                fontStyle: 'italic',
+              }}
+            >
+              No imposition rule for this SKU. Item will print as-is.
+            </div>
+          )}
+        </div>
+
+        {hasRule && (
+          <button
+            onClick={() => setExpanded((v) => !v)}
+            style={{
+              background: 'transparent',
+              border: '1px solid var(--border-color)',
+              color: 'var(--text-secondary)',
+              padding: '4px 10px',
+              borderRadius: 6,
+              fontSize: 11,
+              cursor: 'pointer',
+              fontFamily: 'inherit',
+              flexShrink: 0,
+            }}
+          >
+            {expanded ? 'Collapse' : 'Render preview'}
+          </button>
+        )}
+      </div>
+
+      {error && (
+        <div
+          style={{
+            marginTop: 8,
+            padding: 8,
+            background: 'rgba(220,53,69,0.1)',
+            border: '1px solid rgba(220,53,69,0.3)',
+            borderRadius: 4,
+            color: '#dc3545',
+            fontSize: 11,
+          }}
+        >
+          {error}
+        </div>
+      )}
+
+      {expanded && hasRule && (
+        <>
+          {loadingImg && (
+            <div
+              style={{
+                marginTop: 12,
+                fontSize: 12,
+                color: 'var(--text-muted)',
+              }}
+            >
+              Rendering imposed sheet…
+            </div>
+          )}
+          {imgUrl && (
+            <div
+              style={{
+                marginTop: 12,
+                padding: 12,
+                background: '#2a2a2a',
+                border: '1px solid var(--border-color)',
+                borderRadius: 6,
+                textAlign: 'center',
+              }}
+            >
+              <img
+                src={imgUrl}
+                alt={`Imposed sheet for ${lineItem.productName}`}
+                style={{
+                  maxWidth: '100%',
+                  maxHeight: 800,
+                  border: '1px solid #444',
+                  boxShadow: '0 2px 12px rgba(0,0,0,0.4)',
+                }}
+              />
+            </div>
+          )}
+          {imgUrl && (
+            <div
+              style={{
+                marginTop: 8,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 12,
+              }}
+            >
+              <button
+                onClick={handleSave}
+                disabled={saving}
+                style={{
+                  background: 'var(--bg-input)',
+                  border: '1px solid var(--border-color)',
+                  color: 'var(--text-primary)',
+                  padding: '6px 12px',
+                  borderRadius: 6,
+                  fontSize: 11,
+                  cursor: saving ? 'wait' : 'pointer',
+                  fontFamily: 'inherit',
+                  opacity: saving ? 0.6 : 1,
+                }}
+              >
+                {saving ? 'Saving…' : 'Save preview to test sandbox'}
+              </button>
+              {savedPath && (
+                <span
+                  style={{
+                    fontSize: 10,
+                    color: 'var(--text-muted)',
+                    fontFamily: 'var(--font-mono, monospace)',
+                    wordBreak: 'break-all',
+                  }}
+                >
+                  Saved → {savedPath}
+                </span>
+              )}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
 
 // ──────────────────────────────────────────────────────────
 // Building blocks

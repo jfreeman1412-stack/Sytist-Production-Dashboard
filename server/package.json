@@ -19,6 +19,8 @@
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "mysql2": "^3.11.5",
+    "qrcode": "^1.5.4",
+    "sharp": "^0.34.5",
     "sytist-dashboard": "file:..",
     "uuid": "^11.0.4"
   },

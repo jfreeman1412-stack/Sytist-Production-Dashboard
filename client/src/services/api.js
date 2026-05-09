@@ -5,6 +5,11 @@
 //
 // Auth methods (login/logout/getSession) plus generic get/post/put/del for
 // future calls in later phases.
+//
+// getBlob() is a sibling to get() that bypasses the JSON-parsing pipeline
+// for binary responses (slip JPGs, divider JPGs, etc). It still attaches
+// the X-Session-Id header so the request authenticates properly. Returns
+// a Blob the caller can hand to URL.createObjectURL().
 
 const SESSION_KEY = 'sytist_session_id';
 
@@ -47,6 +52,42 @@ async function _fetch(path, options = {}) {
   }
 
   return data;
+}
+
+/**
+ * Authenticated binary fetch. Returns a Blob the caller can pass to
+ * URL.createObjectURL() to render in an <img>. Used for slip and divider
+ * preview endpoints, which return image/jpeg.
+ */
+async function _fetchBlob(path, options = {}) {
+  const headers = { ...(options.headers || {}) };
+  const sessionId = getSessionId();
+  if (sessionId) headers['X-Session-Id'] = sessionId;
+
+  const response = await fetch(path, { ...options, headers });
+
+  if (!response.ok) {
+    // Try to surface a useful error if the server returned JSON
+    let message = `Request failed (${response.status})`;
+    try {
+      const text = await response.text();
+      if (text) {
+        try {
+          const parsed = JSON.parse(text);
+          if (parsed.error) message = parsed.error;
+        } catch {
+          /* not JSON, fall through */
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    const err = new Error(message);
+    err.status = response.status;
+    throw err;
+  }
+
+  return response.blob();
 }
 
 const api = {
@@ -104,8 +145,17 @@ const api = {
     return _fetch(path, { method: 'DELETE' });
   },
 
+  /**
+   * Authenticated binary fetch. Returns a Blob.
+   * Use with URL.createObjectURL(blob) for inline image rendering.
+   */
+  getBlob(path) {
+    return _fetchBlob(path);
+  },
+
   // Exposed for debugging.
   _fetch,
+  _fetchBlob,
   getSessionId,
   setSessionId,
 };

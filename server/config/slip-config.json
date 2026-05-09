@@ -1,0 +1,19 @@
+{
+  "_comment": "Sportsline packing slip configuration. Studio info renders in the slip footer next to the QR code. Phone is auto-formatted as (XXX) XXX-XXXX. Highlight colors apply to item rows: 'specialty' for items flagged by the future specialtyService (Phase 4.5); 'quantity' when qty > 1.",
+  "studio": {
+    "name": "Sportsline Photography",
+    "email": "info@sportslinephotography.com",
+    "phone": "6128392618",
+    "showReturnAddress": false,
+    "returnAddress": {
+      "address1": "6451 McKinley St NW Suite E",
+      "city": "Ramsey",
+      "state": "MN",
+      "zipCode": "55330"
+    }
+  },
+  "highlightColors": {
+    "specialty": "#fff5e6",
+    "quantity":  "#fff0f0"
+  }
+}
