@@ -5,7 +5,7 @@ const express = require('express');
 const router = express.Router();
 
 const sytistDb = require('../services/sytistDbService');
-const { requireAuth } = require('../middleware/auth');
+const { requireAuth, requireRole } = require('../middleware/auth');
 
 router.use(requireAuth);
 
@@ -150,16 +150,8 @@ router.get('/galleries', async (req, res) => {
 
 /**
  * GET /api/sytist/orders
- *
- * Real orders endpoint. Returns canonical-shaped orders.
- *
- * Query params:
- *   workflow         — 'ship_to_home' | 'ship_to_managers' | 'ship_to_league' | 'all'
- *   productionStatus — number (default 0 = Queue) or 'all'
- *   limit            — pagination size (default 50, max 1000)
- *   offset           — pagination offset (default 0)
- *   galleryId        — optional filter
- *   subGalleryId     — optional filter
+ * Returns canonical-shaped orders matching the filter. See sytistDbService
+ * for the full param list.
  */
 router.get('/orders', async (req, res) => {
   try {
@@ -187,11 +179,7 @@ router.get('/orders', async (req, res) => {
 
 /**
  * GET /api/sytist/orders/test
- *
- * Convenience endpoint — returns 5 most recent open paid orders with full
- * canonical shape. Used during phase 2b development for visual inspection.
- *
- * Will be kept through phase 3 for debugging; removed before phase 4.
+ * Convenience endpoint — returns recent open paid orders. Removed before phase 4.
  */
 router.get('/orders/test', async (req, res) => {
   try {
@@ -207,5 +195,67 @@ router.get('/orders/test', async (req, res) => {
     res.status(500).json({ error: err.message, code: err.code });
   }
 });
+
+/**
+ * GET /api/sytist/orders/:orderId
+ * Returns a single canonical-shaped order, or 404 if not found.
+ */
+router.get('/orders/:orderId', async (req, res) => {
+  try {
+    const order = await sytistDb.getOrderById(req.params.orderId);
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    res.json({ order });
+  } catch (err) {
+    console.error('[sytist/orders/:orderId]', err);
+    res.status(500).json({ error: err.message, code: err.code });
+  }
+});
+
+/**
+ * PUT /api/sytist/orders/:orderId/status
+ * Body: { statusId: number }
+ *
+ * Updates ms_orders.order_open_status. Requires admin or operator role.
+ * Viewers cannot write.
+ *
+ * Response:
+ *   {
+ *     success: true,
+ *     orderId: 110855,
+ *     previousStatus: { id: 0, name: "Queue" },
+ *     newStatus:      { id: 40, name: "Printing and Production" },
+ *     affectedRows: 1
+ *   }
+ */
+router.put(
+  '/orders/:orderId/status',
+  requireRole('admin', 'operator'),
+  async (req, res) => {
+    try {
+      const { statusId } = req.body || {};
+      if (statusId === undefined || statusId === null) {
+        return res
+          .status(400)
+          .json({ error: 'Request body must include { statusId: number }' });
+      }
+
+      const result = await sytistDb.updateOrderStatus(
+        req.params.orderId,
+        statusId
+      );
+      res.json({ success: true, ...result });
+    } catch (err) {
+      console.error('[sytist/orders/:orderId/status]', err);
+      const isClientError =
+        /not found|invalid|erased|does not exist/i.test(err.message);
+      res.status(isClientError ? 400 : 500).json({
+        error: err.message,
+        code: err.code,
+      });
+    }
+  }
+);
 
 module.exports = router;

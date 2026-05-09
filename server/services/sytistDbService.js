@@ -673,6 +673,353 @@ class SytistDbService {
     };
   }
 
+  /**
+   * Returns a single canonical-shaped order, or null if not found.
+   *
+   * Uses the same stitching logic as getOrdersByWorkflow but filters down to
+   * a single order ID. Bypasses the workflow filter (returns the order even
+   * if its workflow is something we don't normally show).
+   *
+   * Pagination/status filters are also bypassed — we want this exact order
+   * regardless of whether it's open, archived, or in any production status.
+   */
+  async getOrderById(orderId) {
+    const id = parseInt(orderId, 10);
+    if (Number.isNaN(id) || id <= 0) {
+      throw new Error('Invalid order ID');
+    }
+
+    const pool = this.getPool();
+
+    // Single-order query — bypass the open/paid filters since the caller
+    // explicitly asked for THIS order, whatever state it's in.
+    const [orderRows] = await pool.query(
+      `
+      SELECT
+        o.*,
+        st.status_name AS productionStatusName
+      FROM ms_orders o
+      LEFT JOIN ms_order_status st ON st.status_id = o.order_open_status
+      WHERE o.order_id = ?
+        AND o.order_erased = 0
+      LIMIT 1
+      `,
+      [id]
+    );
+
+    if (orderRows.length === 0) return null;
+
+    // Reuse the multi-order pipeline by calling getOrdersByWorkflow with a
+    // filter that matches just this one order... actually no, easier to just
+    // assemble inline. The cart/photo/options query logic is identical but
+    // for a single ID we can simplify.
+    //
+    // Implementation note: rather than duplicate the stitching logic, we
+    // shortcut by going through getOrdersByWorkflow with productionStatus
+    // = 'all' AND a fake workflow that matches everything. But filtering
+    // by orderId isn't currently a parameter. So we duplicate the stitching
+    // here. The duplication is a real cost but keeps each method clean.
+
+    const o = orderRows[0];
+
+    // Cart lines from correct table.
+    const fromArchive = o.order_archive_table === 1;
+    const cartTable = fromArchive ? 'ms_cart_archive' : 'ms_cart';
+    const cartAlias = fromArchive ? 'ca' : 'c';
+
+    const [cartRows] = await pool.query(
+      `
+      SELECT
+        ${cartAlias}.cart_id, ${cartAlias}.cart_order,
+        ${cartAlias}.cart_product_name, ${cartAlias}.cart_sku, ${cartAlias}.cart_qty, ${cartAlias}.cart_price,
+        ${cartAlias}.cart_photo_prod, ${cartAlias}.cart_photo_prod_connect,
+        ${cartAlias}.cart_pic_id, ${cartAlias}.cart_pic_org,
+        ${cartAlias}.cart_pic_date_id, ${cartAlias}.cart_pic_date_org,
+        ${cartAlias}.cart_sub_gal_id,
+        ${cartAlias}.cart_download, ${cartAlias}.cart_package, ${cartAlias}.cart_gift_certificate,
+        ${cartAlias}.cart_credit_product, ${cartAlias}.cart_booking, ${cartAlias}.cart_photo_bg,
+        ${cartAlias}.cart_pre_sell, ${cartAlias}.cart_pre_sold, ${cartAlias}.cart_pre_sold_gallery,
+        ${cartAlias}.cart_thumb, ${cartAlias}.cart_notes,
+        ${cartAlias}.cart_frame_size, ${cartAlias}.cart_canvas_id,
+        ${fromArchive ? 1 : 0} AS fromArchive
+      FROM ${cartTable} ${cartAlias}
+      WHERE ${cartAlias}.cart_order = ?
+      ORDER BY ${cartAlias}.cart_id
+      `,
+      [id]
+    );
+
+    // Photos.
+    const picIds = [
+      ...new Set(cartRows.map((r) => r.cart_pic_id).filter((p) => p > 0)),
+    ];
+    let photosById = new Map();
+    if (picIds.length > 0) {
+      const [photoRows] = await pool.query(
+        `
+        SELECT
+          pic_id, pic_org, pic_full, pic_large, pic_th,
+          pic_amazon, pic_amazon_endpoint, pic_bucket, pic_bucket_folder,
+          pic_width, pic_height
+        FROM ms_photos
+        WHERE pic_id IN (?)
+        `,
+        [picIds]
+      );
+      photosById = new Map(photoRows.map((p) => [p.pic_id, p]));
+    }
+
+    // Sub-galleries.
+    const subIds = [
+      ...new Set(cartRows.map((r) => r.cart_sub_gal_id).filter((sid) => sid > 0)),
+    ];
+    let subsById = new Map();
+    if (subIds.length > 0) {
+      const [subRows] = await pool.query(
+        `SELECT sub_id, sub_name FROM ms_sub_galleries WHERE sub_id IN (?)`,
+        [subIds]
+      );
+      subsById = new Map(subRows.map((s) => [s.sub_id, s.sub_name]));
+    }
+
+    // Cart options.
+    const cartIdsList = cartRows.map((r) => r.cart_id);
+    let optionsByCartId = new Map();
+    if (cartIdsList.length > 0) {
+      const [optRows] = await pool.query(
+        `
+        SELECT co_cart_id, co_opt_name, co_select_name, co_price
+        FROM ms_cart_options
+        WHERE co_cart_id IN (?)
+        ORDER BY co_id
+        `,
+        [cartIdsList]
+      );
+      for (const op of optRows) {
+        const list = optionsByCartId.get(op.co_cart_id) || [];
+        list.push({
+          name: op.co_opt_name || '',
+          selectedValue: op.co_select_name || '',
+          price: Number(op.co_price) || 0,
+        });
+        optionsByCartId.set(op.co_cart_id, list);
+      }
+    }
+
+    // Stitch line items.
+    const lineItems = cartRows.map((c) => {
+      const photoRow = c.cart_pic_id > 0 ? photosById.get(c.cart_pic_id) : null;
+      return {
+        cartId: c.cart_id,
+        productName: c.cart_product_name || '',
+        sku: c.cart_sku || '',
+        qty: Number(c.cart_qty) || 0,
+        price: Number(c.cart_price) || 0,
+        photoProductId: c.cart_photo_prod || 0,
+
+        galleryId: c.cart_pic_date_id || 0,
+        galleryName: c.cart_pic_date_org || '',
+        subGalleryId: c.cart_sub_gal_id || 0,
+        subGalleryName:
+          c.cart_sub_gal_id > 0 ? subsById.get(c.cart_sub_gal_id) || '' : '',
+
+        photo: photoRow
+          ? buildPhotoUrls({ ...photoRow, pic_id: c.cart_pic_id })
+          : null,
+
+        flags: {
+          download: c.cart_download === 1,
+          package: c.cart_package > 0,
+          giftCert: c.cart_gift_certificate === 1,
+          creditProduct: c.cart_credit_product > 0,
+          booking: c.cart_booking > 0,
+          greenScreen: c.cart_photo_bg > 0,
+          framed: c.cart_frame_size > 0,
+          canvas: c.cart_canvas_id > 0,
+          preSell: c.cart_pre_sell === 1,
+          preSold: c.cart_pre_sold === 1,
+          fromArchive: c.fromArchive === 1,
+        },
+
+        options: optionsByCartId.get(c.cart_id) || [],
+        thumbPath: c.cart_thumb || '',
+        notes: c.cart_notes || '',
+      };
+    });
+
+    const distinctSubGalleries = new Set(
+      lineItems.map((li) => li.subGalleryId).filter((sid) => sid > 0)
+    );
+    const isSibling = distinctSubGalleries.size > 1;
+    const primaryGallery = lineItems.find((li) => li.galleryId > 0) || null;
+    const shipping = categorizeShipping(o.order_shipping_option, o.order_shipping);
+
+    return {
+      source: 'sytist',
+      orderId: String(o.order_id),
+      orderNumber: String(o.order_id),
+      orderDate: o.order_date,
+      paymentStatus: o.order_payment_status,
+      productionStatus: {
+        id: o.order_open_status || 0,
+        name: o.productionStatusName || (o.order_open_status === 0 ? 'Queue' : ''),
+      },
+      orderStatus: o.order_status,
+      orderArchiveTable: o.order_archive_table === 1,
+
+      customer: {
+        firstName: o.order_first_name || '',
+        lastName: o.order_last_name || '',
+        email: o.order_email || '',
+        phone: o.order_phone || '',
+        businessName: o.order_business_name || '',
+      },
+
+      shipTo: {
+        firstName: o.order_ship_first_name || '',
+        lastName: o.order_ship_last_name || '',
+        address1: o.order_ship_address || '',
+        address2: o.order_ship_addres_2 || '',
+        city: o.order_ship_city || '',
+        state: o.order_ship_state || '',
+        zip: o.order_ship_zip || '',
+        country: o.order_ship_country || '',
+        phone: o.order_phone || '',
+        businessName: o.order_ship_business || '',
+      },
+
+      shipping: {
+        cost: Number(o.order_shipping) || 0,
+        optionName: o.order_shipping_option || '',
+        workflow: shipping.workflow,
+        uncategorized: shipping.uncategorized,
+      },
+
+      totals: {
+        subtotal: Number(o.order_sub_total) || 0,
+        tax: Number(o.order_tax) || 0,
+        total: Number(o.order_total) || 0,
+        paymentFee: Number(o.order_payment_fee) || 0,
+      },
+
+      subject: { fields: normalizeSubjectFields(o) },
+
+      galleryId: primaryGallery ? primaryGallery.galleryId : 0,
+      galleryName: primaryGallery ? primaryGallery.galleryName : '',
+      subGalleryId: primaryGallery ? primaryGallery.subGalleryId : 0,
+      subGalleryName: primaryGallery ? primaryGallery.subGalleryName : '',
+
+      lineItems,
+      isSibling,
+
+      dueDate:
+        o.order_due_date && o.order_due_date !== '0000-00-00'
+          ? o.order_due_date
+          : null,
+      customerNotes: o.order_notes || '',
+      adminNotes: o.order_admin_notes || '',
+
+      cardLastFour: o.order_card_last_four || '',
+      payType: o.order_pay_type || '',
+    };
+  }
+
+  /**
+   * Updates the production status of a single order.
+   *
+   * Writes ONLY to ms_orders.order_open_status. Does NOT write to
+   * ms_order_status_logs (owned by the existing Sytist automation).
+   *
+   * Validates statusId against ms_order_status (or 0 for "Queue") before
+   * writing. Reads the previous value first so the caller can confirm what
+   * changed.
+   *
+   * Returns:
+   *   {
+   *     orderId,
+   *     previousStatus: { id, name },
+   *     newStatus:      { id, name },
+   *     affectedRows
+   *   }
+   *
+   * Throws:
+   *   - Order not found
+   *   - Order erased (soft-deleted)
+   *   - Invalid statusId (not 0 and not in ms_order_status)
+   */
+  async updateOrderStatus(orderId, statusId) {
+    const id = parseInt(orderId, 10);
+    if (Number.isNaN(id) || id <= 0) {
+      throw new Error('Invalid order ID');
+    }
+
+    const newStatusId = parseInt(statusId, 10);
+    if (Number.isNaN(newStatusId) || newStatusId < 0) {
+      throw new Error('Invalid status ID');
+    }
+
+    const pool = this.getPool();
+
+    // 1. Validate the new status exists (or is 0 = Queue).
+    let newStatusName = '';
+    if (newStatusId === 0) {
+      newStatusName = 'Queue';
+    } else {
+      const [[statusRow]] = await pool.query(
+        'SELECT status_id, status_name FROM ms_order_status WHERE status_id = ?',
+        [newStatusId]
+      );
+      if (!statusRow) {
+        throw new Error(`Status ID ${newStatusId} does not exist in ms_order_status`);
+      }
+      newStatusName = statusRow.status_name;
+    }
+
+    // 2. Read current state. Confirm order exists and isn't erased.
+    const [[currentRow]] = await pool.query(
+      `
+      SELECT
+        o.order_id, o.order_open_status, o.order_erased,
+        st.status_name AS currentStatusName
+      FROM ms_orders o
+      LEFT JOIN ms_order_status st ON st.status_id = o.order_open_status
+      WHERE o.order_id = ?
+      `,
+      [id]
+    );
+
+    if (!currentRow) {
+      throw new Error(`Order ${id} not found`);
+    }
+    if (currentRow.order_erased === 1) {
+      throw new Error(`Order ${id} is erased; refusing to update`);
+    }
+
+    const previousStatusId = currentRow.order_open_status || 0;
+    const previousStatusName =
+      previousStatusId === 0 ? 'Queue' : currentRow.currentStatusName || '';
+
+    // 3. The actual write. Single row, by primary key, no triggers we control.
+    //
+    // Logging here so the action shows up in the dev console — useful while
+    // we're verifying behavior. Can quiet this down in phase 12.
+    console.log(
+      `[SytistDB] updateOrderStatus: order ${id}: ${previousStatusId} (${previousStatusName}) → ${newStatusId} (${newStatusName})`
+    );
+
+    const [result] = await pool.query(
+      'UPDATE ms_orders SET order_open_status = ? WHERE order_id = ?',
+      [newStatusId, id]
+    );
+
+    return {
+      orderId: id,
+      previousStatus: { id: previousStatusId, name: previousStatusName },
+      newStatus: { id: newStatusId, name: newStatusName },
+      affectedRows: result.affectedRows,
+    };
+  }
+
   async close() {
     if (this.pool) {
       await this.pool.end();
