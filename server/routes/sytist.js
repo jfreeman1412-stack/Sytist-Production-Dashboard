@@ -7,6 +7,7 @@ const router = express.Router();
 const sytistDb = require('../services/sytistDbService');
 const pathsService = require('../services/pathsService');
 const folderSortService = require('../services/folderSortService');
+const darkroomService = require('../services/darkroomService');
 const { requireAuth, requireRole } = require('../middleware/auth');
 
 router.use(requireAuth);
@@ -423,5 +424,218 @@ router.get('/paths/preview/:orderId', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ─── Phase 4.2: darkroom .txt preview + config ─────────────
+//
+// Preview-only endpoints. Nothing in this section writes files. The
+// /darkroom/preview/:orderId endpoint renders the .txt body as a string
+// alongside its target path; the config endpoints let operators inspect
+// (and eventually edit, via the future settings UI) the size/template/
+// filename mappings the service uses.
+//
+// The actual disk write — darkroomService.writeTxtFile() — exists but is
+// not wired to any route. Phase 4.6 will add the "Process this order"
+// orchestration that calls it.
+
+/**
+ * GET /api/sytist/darkroom/preview/:orderId
+ *
+ * Renders the .txt body for the given order without touching disk.
+ *
+ * Query params:
+ *   slipPath         — optional absolute path to a packing slip JPG. When
+ *                       given, a 5x8 line for it is included in the txt.
+ *   slipPosition     — 'first' | 'last' (default 'last' — Sportsline
+ *                       prints slip on top of the customer stack).
+ *   teamSubGalleryId — when given, only line items belonging to that
+ *                       sub-gallery are included (per-team chunk preview
+ *                       for non-home sibling orders).
+ *
+ * Response:
+ *   {
+ *     filename, filePath, targetDir, imageDir,
+ *     content: string,
+ *     printItems: [...], skippedItems: [...], warnings: [...],
+ *     packingSlip: { included, position, path },
+ *     meta: { ... }
+ *   }
+ */
+router.get('/darkroom/preview/:orderId', async (req, res) => {
+  try {
+    const order = await sytistDb.getOrderById(req.params.orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    const sortLevels = await folderSortService.getSortLevels();
+    const sortSegments = folderSortService.buildOrderPathSync(order, sortLevels);
+
+    const slipPath = req.query.slipPath || null;
+    const slipPosition =
+      req.query.slipPosition === 'first' ? 'first' : 'last';
+
+    let teamScope = null;
+    if (req.query.teamSubGalleryId) {
+      const id = parseInt(req.query.teamSubGalleryId, 10);
+      if (!Number.isNaN(id)) {
+        const matchingLine = (order.lineItems || []).find(
+          (li) => li.subGalleryId === id
+        );
+        teamScope = {
+          subGalleryId: id,
+          subGalleryName: matchingLine ? matchingLine.subGalleryName : '',
+        };
+      }
+    }
+
+    const result = await darkroomService.buildOrderTxt(order, {
+      sortSegments,
+      packingSlipPath: slipPath,
+      slipPosition,
+      teamScope,
+    });
+
+    res.json({
+      ...result,
+      sortLevels,
+      sortSegments,
+    });
+  } catch (err) {
+    console.error('[sytist/darkroom/preview]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/sytist/darkroom/config
+ *
+ * Returns the current size mappings, template mappings, and filename
+ * config in one snapshot. Used by the settings UI (future) and as a
+ * sanity-check endpoint.
+ */
+router.get('/darkroom/config', async (req, res) => {
+  try {
+    const [sizeMappings, templateMappings, filenameConfig] = await Promise.all([
+      darkroomService.getSizeMappings(),
+      darkroomService.getTemplateMappings(),
+      darkroomService.getFilenameConfig(),
+    ]);
+    res.json({
+      sizeMappings,
+      templateMappings,
+      filenameConfig,
+      defaultSize: darkroomService.DEFAULT_SIZE,
+      skipFlags: darkroomService.SKIP_FLAGS,
+    });
+  } catch (err) {
+    console.error('[sytist/darkroom/config]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Size-mapping CRUD (admin only) ───────────────────────
+
+router.post(
+  '/darkroom/size-mappings',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const mappings = await darkroomService.addSizeMapping(req.body || {});
+      res.json({ success: true, mappings });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+router.put(
+  '/darkroom/size-mappings/:externalId',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const updated = await darkroomService.updateSizeMapping(
+        req.params.externalId,
+        req.body || {}
+      );
+      res.json({ success: true, mapping: updated });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+router.delete(
+  '/darkroom/size-mappings/:externalId',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const mappings = await darkroomService.deleteSizeMapping(
+        req.params.externalId
+      );
+      res.json({ success: true, mappings });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+// ─── Template-mapping CRUD (admin only) ───────────────────
+
+router.post(
+  '/darkroom/template-mappings',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const mappings = await darkroomService.addTemplateMapping(req.body || {});
+      res.json({ success: true, mappings });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+router.put(
+  '/darkroom/template-mappings/:id',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const updated = await darkroomService.updateTemplateMapping(
+        req.params.id,
+        req.body || {}
+      );
+      res.json({ success: true, mapping: updated });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+router.delete(
+  '/darkroom/template-mappings/:id',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const mappings = await darkroomService.deleteTemplateMapping(
+        req.params.id
+      );
+      res.json({ success: true, mappings });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+// ─── Filename config (admin only) ─────────────────────────
+
+router.put(
+  '/darkroom/filename-config',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const updated = await darkroomService.updateFilenameConfig(req.body || {});
+      res.json({ success: true, filenameConfig: updated });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
 
 module.exports = router;

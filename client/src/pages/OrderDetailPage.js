@@ -138,6 +138,8 @@ export default function OrderDetailPage() {
       <NotesBlocks order={order} />
 
       <OutputPathsBlock orderId={order.orderId} />
+
+      <DarkroomTxtBlock orderId={order.orderId} />
     </div>
   );
 }
@@ -888,6 +890,386 @@ function OutputPathsBlock({ orderId }) {
     </Card>
   );
 }
+
+// ──────────────────────────────────────────────────────────
+// Darkroom .txt preview (Phase 4.2)
+// ──────────────────────────────────────────────────────────
+//
+// Diagnostic block showing the .txt body that WOULD be written for this
+// order, plus warnings, skipped line items, and the resolved target
+// path. Collapsed by default. No file is written from here — preview
+// only. Uses the same StrictMode-safe ref-guarded fetch pattern as
+// OutputPathsBlock above.
+
+function DarkroomTxtBlock({ orderId }) {
+  const [open, setOpen] = useState(false);
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const fetchedRef = useRef({ orderId: null, status: 'idle' });
+
+  useEffect(() => {
+    fetchedRef.current = { orderId, status: 'idle' };
+    setData(null);
+    setError(null);
+    setLoading(false);
+  }, [orderId]);
+
+  useEffect(() => {
+    if (!open) return;
+    const ref = fetchedRef.current;
+    if (ref.orderId === orderId && ref.status !== 'idle') return;
+
+    fetchedRef.current = { orderId, status: 'loading' };
+    setLoading(true);
+    setError(null);
+
+    api
+      .get(`/api/sytist/darkroom/preview/${orderId}`)
+      .then((d) => {
+        if (fetchedRef.current.orderId !== orderId) return;
+        fetchedRef.current = { orderId, status: 'done' };
+        setData(d);
+        setLoading(false);
+      })
+      .catch((err) => {
+        if (fetchedRef.current.orderId !== orderId) return;
+        fetchedRef.current = { orderId, status: 'error' };
+        setError(err.message);
+        setLoading(false);
+      });
+  }, [open, orderId]);
+
+  return (
+    <Card title="Darkroom .txt preview">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        style={{
+          background: 'transparent',
+          border: '1px solid var(--border-color)',
+          color: 'var(--text-secondary)',
+          padding: '6px 12px',
+          borderRadius: 6,
+          fontSize: 12,
+          cursor: 'pointer',
+          fontFamily: 'inherit',
+        }}
+      >
+        {open ? 'Hide' : 'Show'} .txt preview
+      </button>
+      <div
+        style={{
+          marginTop: 8,
+          fontSize: 11,
+          color: 'var(--text-muted)',
+        }}
+      >
+        Preview only — no file is written.
+      </div>
+
+      {open && loading && (
+        <div style={{ marginTop: 12, fontSize: 12, color: 'var(--text-muted)' }}>
+          Building preview…
+        </div>
+      )}
+
+      {open && error && (
+        <div
+          style={{
+            marginTop: 12,
+            padding: 10,
+            background: 'rgba(220,53,69,0.1)',
+            border: '1px solid rgba(220,53,69,0.3)',
+            borderRadius: 6,
+            color: '#dc3545',
+            fontSize: 12,
+          }}
+        >
+          {error}
+        </div>
+      )}
+
+      {open && data && !loading && !error && (
+        <DarkroomPreviewContent data={data} />
+      )}
+    </Card>
+  );
+}
+
+function DarkroomPreviewContent({ data }) {
+  const printItems = data.printItems || [];
+  const skipped = data.skippedItems || [];
+  const warnings = data.warnings || [];
+
+  return (
+    <div style={{ marginTop: 16 }}>
+      {/* Top metadata strip */}
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'auto 1fr',
+          rowGap: 6,
+          columnGap: 12,
+          fontSize: 12,
+          marginBottom: 16,
+        }}
+      >
+        <span style={{ color: 'var(--text-muted)' }}>Filename:</span>
+        <span style={{ fontFamily: 'var(--font-mono, monospace)' }}>
+          {data.filename}
+        </span>
+        <span style={{ color: 'var(--text-muted)' }}>Target path:</span>
+        <span
+          style={{
+            fontFamily: 'var(--font-mono, monospace)',
+            fontSize: 11,
+            wordBreak: 'break-all',
+          }}
+        >
+          {data.filePath}
+        </span>
+        <span style={{ color: 'var(--text-muted)' }}>Line items:</span>
+        <span>
+          {data.meta?.printedLineItems ?? printItems.length} printed
+          {data.meta?.skippedLineItems > 0 &&
+            `, ${data.meta.skippedLineItems} skipped`}
+        </span>
+        <span style={{ color: 'var(--text-muted)' }}>Packing slip:</span>
+        <span>
+          {data.packingSlip?.included
+            ? `included (${data.packingSlip.position})`
+            : 'not included (slip path not given)'}
+        </span>
+      </div>
+
+      {/* Warnings */}
+      {warnings.length > 0 && (
+        <div
+          style={{
+            marginBottom: 16,
+            padding: 10,
+            background: 'rgba(224,179,65,0.1)',
+            border: '1px solid rgba(224,179,65,0.4)',
+            borderRadius: 6,
+          }}
+        >
+          <div
+            style={{
+              fontSize: 11,
+              fontWeight: 700,
+              textTransform: 'uppercase',
+              letterSpacing: 0.5,
+              color: '#e0b341',
+              marginBottom: 6,
+            }}
+          >
+            Warnings ({warnings.length})
+          </div>
+          {warnings.map((w, i) => (
+            <div
+              key={i}
+              style={{
+                fontSize: 12,
+                color: 'var(--text-secondary)',
+                marginTop: i === 0 ? 0 : 4,
+              }}
+            >
+              <span
+                style={{
+                  fontFamily: 'var(--font-mono, monospace)',
+                  fontSize: 10,
+                  padding: '1px 6px',
+                  borderRadius: 4,
+                  background: 'rgba(224,179,65,0.18)',
+                  color: '#e0b341',
+                  marginRight: 6,
+                }}
+              >
+                {w.type}
+              </span>
+              {w.message}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Skipped items */}
+      {skipped.length > 0 && (
+        <div
+          style={{
+            marginBottom: 16,
+            padding: 10,
+            background: 'rgba(158,158,158,0.08)',
+            border: '1px solid rgba(158,158,158,0.3)',
+            borderRadius: 6,
+          }}
+        >
+          <div
+            style={{
+              fontSize: 11,
+              fontWeight: 700,
+              textTransform: 'uppercase',
+              letterSpacing: 0.5,
+              color: 'var(--text-muted)',
+              marginBottom: 6,
+            }}
+          >
+            Skipped ({skipped.length})
+          </div>
+          {skipped.map((s, i) => (
+            <div
+              key={i}
+              style={{
+                fontSize: 12,
+                color: 'var(--text-secondary)',
+                marginTop: i === 0 ? 0 : 4,
+              }}
+            >
+              <span
+                style={{
+                  fontFamily: 'var(--font-mono, monospace)',
+                  fontSize: 10,
+                  padding: '1px 6px',
+                  borderRadius: 4,
+                  background: 'rgba(158,158,158,0.2)',
+                  color: 'var(--text-muted)',
+                  marginRight: 6,
+                }}
+              >
+                {s.reason}
+              </span>
+              {s.productName}
+              {s.sku && (
+                <span style={{ color: 'var(--text-muted)', marginLeft: 6 }}>
+                  (SKU {s.sku})
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Print items in txt order */}
+      <div
+        style={{
+          fontSize: 11,
+          fontWeight: 600,
+          textTransform: 'uppercase',
+          letterSpacing: 0.5,
+          color: 'var(--text-muted)',
+          marginBottom: 8,
+        }}
+      >
+        Print order ({printItems.length} items)
+      </div>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12, marginBottom: 16 }}>
+        <thead>
+          <tr style={{ borderBottom: '1px solid var(--border-color)' }}>
+            <th style={txtTh}>#</th>
+            <th style={txtTh}>Size</th>
+            <th style={txtTh}>Qty</th>
+            <th style={txtTh}>Product</th>
+            <th style={txtTh}>Source</th>
+          </tr>
+        </thead>
+        <tbody>
+          {printItems.map((p, i) => (
+            <tr
+              key={i}
+              style={{ borderBottom: '1px solid var(--border-color)' }}
+            >
+              <td style={{ ...txtTd, width: 30, color: 'var(--text-muted)' }}>
+                {i + 1}
+              </td>
+              <td
+                style={{
+                  ...txtTd,
+                  width: 60,
+                  fontFamily: 'var(--font-mono, monospace)',
+                  fontWeight: 600,
+                }}
+              >
+                {p.size}
+              </td>
+              <td style={{ ...txtTd, width: 40 }}>{p.qty}</td>
+              <td style={txtTd}>
+                {p.isSlip ? (
+                  <em style={{ color: 'var(--accent)' }}>{p.productName}</em>
+                ) : (
+                  p.productName
+                )}
+                {p.templatePath && (
+                  <div
+                    style={{
+                      fontSize: 10,
+                      color: 'var(--text-muted)',
+                      marginTop: 2,
+                      fontFamily: 'var(--font-mono, monospace)',
+                    }}
+                  >
+                    template: {p.templatePath}
+                  </div>
+                )}
+              </td>
+              <td style={{ ...txtTd, width: 80, color: 'var(--text-muted)', fontSize: 11 }}>
+                {p.sizeSource}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      {/* Raw txt body */}
+      <div
+        style={{
+          fontSize: 11,
+          fontWeight: 600,
+          textTransform: 'uppercase',
+          letterSpacing: 0.5,
+          color: 'var(--text-muted)',
+          marginBottom: 8,
+        }}
+      >
+        Raw .txt content
+      </div>
+      <pre
+        style={{
+          margin: 0,
+          padding: 12,
+          background: 'var(--bg-input)',
+          border: '1px solid var(--border-color)',
+          borderRadius: 6,
+          fontFamily: 'var(--font-mono, monospace)',
+          fontSize: 11,
+          color: 'var(--text-primary)',
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-all',
+          maxHeight: 360,
+          overflow: 'auto',
+        }}
+      >
+        {data.content}
+      </pre>
+    </div>
+  );
+}
+
+const txtTh = {
+  textAlign: 'left',
+  padding: '6px 8px',
+  fontSize: 11,
+  fontWeight: 600,
+  color: 'var(--text-muted)',
+  textTransform: 'uppercase',
+  letterSpacing: 0.5,
+};
+const txtTd = {
+  padding: '8px',
+  fontSize: 12,
+  color: 'var(--text-secondary)',
+  verticalAlign: 'top',
+};
 
 // ──────────────────────────────────────────────────────────
 // Building blocks
