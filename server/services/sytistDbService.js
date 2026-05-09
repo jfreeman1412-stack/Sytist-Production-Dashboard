@@ -1020,6 +1020,92 @@ class SytistDbService {
     };
   }
 
+  /**
+   * Returns aggregate counts for the home dashboard cards.
+   *
+   * Three groupings, all over open + paid orders:
+   *   - byStatus:   counts keyed by order_open_status (0 = Queue, 12, 40, etc.)
+   *   - byWorkflow: counts keyed by workflow bucket (ship_to_home/managers/league)
+   *                 — only counts the QUEUE (order_open_status = 0), since that's
+   *                 the actionable bucket; "shipped" and "in production" are tracked
+   *                 by the byStatus card row instead.
+   *   - total:      sum of all open + paid orders regardless of status
+   *
+   * Single round-trip: one query for status counts (cheap — indexed), one for
+   * workflow assembly (slightly more work — needs the option string + cost so
+   * we can apply categorizeShipping in JS).
+   *
+   * Shape:
+   *   {
+   *     total: 12345,
+   *     byStatus:   { "0": 5894, "40": 257, "12": 4, ... },
+   *     byWorkflow: { "ship_to_home": 4500, "ship_to_managers": 600, "ship_to_league": 794, "uncategorized": 0 },
+   *     elapsedMs: 89
+   *   }
+   */
+  async getOrderCounts() {
+    const pool = this.getPool();
+    const start = Date.now();
+
+    // 1. Counts grouped by production status.
+    const [statusRows] = await pool.query(
+      `
+      SELECT order_open_status AS statusId, COUNT(*) AS count
+      FROM ms_orders
+      WHERE order_payment_status = 'Completed'
+        AND order_status = 0
+        AND order_erased = 0
+      GROUP BY order_open_status
+      `
+    );
+
+    const byStatus = {};
+    let total = 0;
+    for (const r of statusRows) {
+      const id = String(r.statusId == null ? 0 : r.statusId);
+      const n = Number(r.count) || 0;
+      byStatus[id] = n;
+      total += n;
+    }
+
+    // 2. Workflow counts — restricted to queue (order_open_status = 0) since
+    //    that's the actionable view operators care about.
+    const [workflowRows] = await pool.query(
+      `
+      SELECT order_shipping_option AS optionName, order_shipping AS cost, COUNT(*) AS count
+      FROM ms_orders
+      WHERE order_payment_status = 'Completed'
+        AND order_status = 0
+        AND order_erased = 0
+        AND order_open_status = 0
+      GROUP BY order_shipping_option, order_shipping
+      `
+    );
+
+    const byWorkflow = {
+      ship_to_home: 0,
+      ship_to_managers: 0,
+      ship_to_league: 0,
+      uncategorized: 0,
+    };
+
+    for (const r of workflowRows) {
+      const cat = categorizeShipping(r.optionName, r.cost);
+      const n = Number(r.count) || 0;
+      byWorkflow[cat.workflow] += n;
+      if (cat.uncategorized) {
+        byWorkflow.uncategorized += n;
+      }
+    }
+
+    return {
+      total,
+      byStatus,
+      byWorkflow,
+      elapsedMs: Date.now() - start,
+    };
+  }
+
   async close() {
     if (this.pool) {
       await this.pool.end();

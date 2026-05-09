@@ -122,6 +122,20 @@ router.get('/order-statuses', async (req, res) => {
   }
 });
 
+/**
+ * GET /api/sytist/order-counts
+ * Aggregates for the home dashboard stat cards. See sytistDbService for shape.
+ */
+router.get('/order-counts', async (req, res) => {
+  try {
+    const counts = await sytistDb.getOrderCounts();
+    res.json(counts);
+  } catch (err) {
+    console.error('[sytist/order-counts]', err);
+    res.status(500).json({ error: err.message, code: err.code });
+  }
+});
+
 router.get('/galleries', async (req, res) => {
   try {
     const monthsBack =
