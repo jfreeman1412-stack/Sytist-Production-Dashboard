@@ -9,6 +9,11 @@ const mysql = require('mysql2/promise');
 const fs = require('fs');
 const path = require('path');
 
+// Display name for production status 0. Sytist has no row in ms_order_status
+// for status 0; we synthesize a label for it. Internal Sytist convention
+// historically called this "Queue"; Sportsline operationally calls it "Open".
+const STATUS_OPEN_NAME = 'Open';
+
 // ─── Shipping option mapping ──────────────────────────────
 // Loaded once at module init; reload by restarting the server.
 const SHIPPING_MAPPING_PATH = path.join(
@@ -237,6 +242,8 @@ class SytistDbService {
       INNER JOIN ms_cart c   ON c.cart_pic_date_id = cal.date_id
       INNER JOIN ms_orders o ON o.order_id = c.cart_order
       WHERE o.order_status = 0
+        AND o.order_open_status = 0
+        AND o.order_erased = 0
         AND o.order_payment_status = 'Completed'
         ${dateFilter}
       GROUP BY cal.date_id, cal.date_title, cat.cat_id, cat.cat_name
@@ -261,6 +268,8 @@ class SytistDbService {
       INNER JOIN ms_orders o ON o.order_id = c.cart_order
       WHERE sub.sub_date_id IN (?)
         AND o.order_status = 0
+        AND o.order_open_status = 0
+        AND o.order_erased = 0
         AND o.order_payment_status = 'Completed'
         ${dateFilter}
       GROUP BY sub.sub_id, sub.sub_date_id, sub.sub_name
@@ -320,6 +329,8 @@ class SytistDbService {
       offset = 0,
       galleryId = null,
       subGalleryId = null,
+      shippingOption = null,
+      sort = 'date_asc',  // 'date_asc' (oldest first) | 'date_desc' (newest first)
     } = opts;
 
     const pool = this.getPool();
@@ -336,6 +347,11 @@ class SytistDbService {
     if (productionStatus !== 'all') {
       where.push('o.order_open_status = ?');
       params.push(productionStatus);
+    }
+
+    if (shippingOption) {
+      where.push('o.order_shipping_option = ?');
+      params.push(shippingOption);
     }
 
     // Gallery filter requires a join to ms_cart, so we use EXISTS to avoid
@@ -358,6 +374,11 @@ class SytistDbService {
     const limitSafe = Math.max(1, Math.min(parseInt(limit, 10) || 50, 1000));
     const offsetSafe = Math.max(0, parseInt(offset, 10) || 0);
 
+    // Sort: only two options for now. Default ASC (oldest first) since the
+    // operator workflow is "process older orders first".
+    const orderByClause =
+      sort === 'date_desc' ? 'o.order_date DESC' : 'o.order_date ASC';
+
     const [orderRows] = await pool.query(
       `
       SELECT
@@ -366,7 +387,7 @@ class SytistDbService {
       FROM ms_orders o
       LEFT JOIN ms_order_status st ON st.status_id = o.order_open_status
       WHERE ${where.join(' AND ')}
-      ORDER BY o.order_date DESC
+      ORDER BY ${orderByClause}
       LIMIT ? OFFSET ?
       `,
       [...params, limitSafe, offsetSafe]
@@ -602,7 +623,7 @@ class SytistDbService {
         paymentStatus: o.order_payment_status,
         productionStatus: {
           id: o.order_open_status || 0,
-          name: o.productionStatusName || (o.order_open_status === 0 ? 'Queue' : ''),
+          name: o.productionStatusName || (o.order_open_status === 0 ? STATUS_OPEN_NAME : ''),
         },
         orderStatus: o.order_status,
         orderArchiveTable: o.order_archive_table === 1,
@@ -862,7 +883,7 @@ class SytistDbService {
       paymentStatus: o.order_payment_status,
       productionStatus: {
         id: o.order_open_status || 0,
-        name: o.productionStatusName || (o.order_open_status === 0 ? 'Queue' : ''),
+        name: o.productionStatusName || (o.order_open_status === 0 ? STATUS_OPEN_NAME : ''),
       },
       orderStatus: o.order_status,
       orderArchiveTable: o.order_archive_table === 1,
@@ -963,7 +984,7 @@ class SytistDbService {
     // 1. Validate the new status exists (or is 0 = Queue).
     let newStatusName = '';
     if (newStatusId === 0) {
-      newStatusName = 'Queue';
+      newStatusName = STATUS_OPEN_NAME;
     } else {
       const [[statusRow]] = await pool.query(
         'SELECT status_id, status_name FROM ms_order_status WHERE status_id = ?',
@@ -997,7 +1018,7 @@ class SytistDbService {
 
     const previousStatusId = currentRow.order_open_status || 0;
     const previousStatusName =
-      previousStatusId === 0 ? 'Queue' : currentRow.currentStatusName || '';
+      previousStatusId === 0 ? STATUS_OPEN_NAME : currentRow.currentStatusName || '';
 
     // 3. The actual write. Single row, by primary key, no triggers we control.
     //

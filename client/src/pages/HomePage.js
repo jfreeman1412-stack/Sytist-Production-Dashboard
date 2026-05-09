@@ -88,7 +88,7 @@ export default function HomePage() {
 
       <div style={statCardGridStyle}>
         <StatCard
-          label="Queue"
+          label="Open"
           count={counts?.byStatus?.['0'] ?? null}
           loading={countsLoading}
           accent="var(--accent)"
@@ -121,7 +121,7 @@ export default function HomePage() {
           margin: '32px 0 12px',
         }}
       >
-        By workflow (queue only)
+        By workflow (open orders only)
       </h2>
 
       <div style={statCardGridStyle}>

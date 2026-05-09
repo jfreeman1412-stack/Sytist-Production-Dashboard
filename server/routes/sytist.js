@@ -123,6 +123,52 @@ router.get('/order-statuses', async (req, res) => {
 });
 
 /**
+ * GET /api/sytist/shipping-options
+ *
+ * Real endpoint (promoted from debug). Returns the list of distinct
+ * order_shipping_option strings seen in recent completed open orders, with
+ * order count and last-seen date.
+ *
+ * Used by the orders list filter dropdown so the dashboard discovers any new
+ * shipping options operators add in Sytist without a code change.
+ *
+ * Query params:
+ *   monthsBack — how far back to scan (default 18, 0 = all-time)
+ */
+router.get('/shipping-options', async (req, res) => {
+  try {
+    const monthsBack = parseInt(req.query.monthsBack || '18', 10);
+    const pool = sytistDb.getPool();
+    const [rows] = await pool.query(
+      `
+      SELECT
+        order_shipping_option AS optionName,
+        COUNT(*)              AS orderCount,
+        MAX(order_date)       AS lastOrderDate
+      FROM ms_orders
+      WHERE order_payment_status = 'Completed'
+        AND order_status = 0
+        AND order_erased = 0
+        AND order_date >= DATE_SUB(NOW(), INTERVAL ? MONTH)
+      GROUP BY order_shipping_option
+      ORDER BY orderCount DESC
+      `,
+      [monthsBack]
+    );
+    res.json({
+      meta: { monthsBack, distinctOptions: rows.length },
+      options: rows.map((r) => ({
+        optionName: r.optionName,
+        orderCount: Number(r.orderCount),
+        lastOrderDate: r.lastOrderDate,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, code: err.code });
+  }
+});
+
+/**
  * GET /api/sytist/order-counts
  * Aggregates for the home dashboard stat cards. See sytistDbService for shape.
  */
@@ -182,6 +228,8 @@ router.get('/orders', async (req, res) => {
     if (req.query.galleryId) opts.galleryId = parseInt(req.query.galleryId, 10);
     if (req.query.subGalleryId)
       opts.subGalleryId = parseInt(req.query.subGalleryId, 10);
+    if (req.query.shippingOption) opts.shippingOption = req.query.shippingOption;
+    if (req.query.sort) opts.sort = req.query.sort;
 
     const result = await sytistDb.getOrdersByWorkflow(opts);
     res.json(result);
