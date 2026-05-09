@@ -46,6 +46,20 @@ export default function OrdersListPage() {
   const [error, setError] = useState(null);
   const [softCapHit, setSoftCapHit] = useState(false);
 
+  // Phase 4.6 — batch processing state
+  // selectedOrderIds: which orders the operator has checked. Cleared
+  // automatically whenever filters change (so a filter-then-process
+  // workflow doesn't accidentally include orders from a prior view).
+  const [selectedOrderIds, setSelectedOrderIds] = useState(() => new Set());
+  // Modal visibility for the batch confirm dialog
+  const [batchModalOpen, setBatchModalOpen] = useState(false);
+  // "Process all filtered" mode — when true, the modal will pull every
+  // matching order ID (up to a limit) instead of just the selected ones.
+  const [batchAllMode, setBatchAllMode] = useState(false);
+  // Active batch job (when set, a sticky banner shows progress)
+  const [activeJobId, setActiveJobId] = useState(null);
+  const [activeJob, setActiveJob] = useState(null);
+
   // ─── Load filter dropdown data once ────────────────────
   useEffect(() => {
     api
@@ -117,6 +131,42 @@ export default function OrdersListPage() {
     sort,
   ]);
 
+  // Phase 4.6 — clear selection when filters change so the operator
+  // never accidentally batch-processes orders from a prior filter view.
+  useEffect(() => {
+    setSelectedOrderIds(new Set());
+  }, [workflow, productionStatus, galleryId, subGalleryId, shippingOption]);
+
+  // Phase 4.6 — poll the active batch job for progress every 2s.
+  useEffect(() => {
+    if (!activeJobId) return;
+    let cancelled = false;
+    let timer = null;
+
+    const poll = async () => {
+      try {
+        const job = await api.get(`/api/sytist/process/job/${activeJobId}`);
+        if (cancelled) return;
+        setActiveJob(job);
+        if (job.status === 'complete' || job.status === 'failed' || job.status === 'cancelled') {
+          // Stop polling. After a few seconds the operator can review and
+          // dismiss the banner.
+        } else {
+          timer = setTimeout(poll, 2000);
+        }
+      } catch (err) {
+        console.warn('[batch] poll error:', err.message);
+        if (!cancelled) timer = setTimeout(poll, 5000);
+      }
+    };
+    poll();
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [activeJobId]);
+
   // ─── Filter manipulation helpers ───────────────────────
   function updateParam(key, value) {
     const next = new URLSearchParams(searchParams);
@@ -130,6 +180,132 @@ export default function OrdersListPage() {
     // Clearing gallery also clears sub-gallery (it's a parent-child relationship).
     if (key === 'galleryId') next.delete('subGalleryId');
     setSearchParams(next, { replace: false });
+  }
+
+  // ─── Phase 4.6 — selection helpers ─────────────────────
+  function toggleOrderSelected(orderId) {
+    setSelectedOrderIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(orderId)) next.delete(orderId);
+      else next.add(orderId);
+      return next;
+    });
+  }
+
+  function selectAllOnPage() {
+    setSelectedOrderIds(new Set(orders.map((o) => o.orderId)));
+  }
+
+  function clearSelection() {
+    setSelectedOrderIds(new Set());
+  }
+
+  const allOnPageSelected =
+    orders.length > 0 && orders.every((o) => selectedOrderIds.has(o.orderId));
+
+  function togglePageSelection() {
+    if (allOnPageSelected) {
+      // Remove just this page's items from the selection
+      setSelectedOrderIds((prev) => {
+        const next = new Set(prev);
+        for (const o of orders) next.delete(o.orderId);
+        return next;
+      });
+    } else {
+      setSelectedOrderIds((prev) => {
+        const next = new Set(prev);
+        for (const o of orders) next.add(o.orderId);
+        return next;
+      });
+    }
+  }
+
+  // ─── Phase 4.6 — batch process actions ─────────────────
+  function openBatchModalSelected() {
+    if (selectedOrderIds.size === 0) return;
+    setBatchAllMode(false);
+    setBatchModalOpen(true);
+  }
+
+  function openBatchModalAll() {
+    setBatchAllMode(true);
+    setBatchModalOpen(true);
+  }
+
+  async function startBatch({ generateDivider, generateQrSheet }) {
+    let orderIds;
+    if (batchAllMode) {
+      // "Process all filtered" — fetch with the current filters but no
+      // pagination and grab the IDs.
+      const qs = new URLSearchParams();
+      if (workflow !== 'all') qs.set('workflow', workflow);
+      qs.set('productionStatus', productionStatus);
+      if (galleryId) qs.set('galleryId', galleryId);
+      if (subGalleryId) qs.set('subGalleryId', subGalleryId);
+      if (shippingOption) qs.set('shippingOption', shippingOption);
+      qs.set('limit', '500');
+      qs.set('offset', '0');
+      try {
+        const data = await api.get(`/api/sytist/orders?${qs.toString()}`);
+        orderIds = (data.orders || []).map((o) => o.orderId);
+      } catch (err) {
+        alert(`Failed to gather filtered orders: ${err.message}`);
+        return;
+      }
+    } else {
+      orderIds = Array.from(selectedOrderIds);
+    }
+
+    if (orderIds.length === 0) {
+      alert('No orders to process.');
+      return;
+    }
+
+    try {
+      const response = await api.post('/api/sytist/process/batch', {
+        orderIds,
+        generateDivider,
+        generateQrSheet,
+      });
+      setActiveJobId(response.jobId);
+      setActiveJob({
+        jobId: response.jobId,
+        status: 'queued',
+        total: response.total,
+        completed: 0,
+        results: [],
+      });
+      setBatchModalOpen(false);
+      // Don't clear selection yet — let the operator confirm what was processed.
+    } catch (err) {
+      alert(`Batch failed to start: ${err.message}`);
+    }
+  }
+
+  function dismissJobBanner() {
+    setActiveJobId(null);
+    setActiveJob(null);
+    clearSelection();
+  }
+
+  // Phase 4.7 — graceful cancel of an in-flight batch. Lets the
+  // currently-processing order finish, then halts before the next one.
+  async function cancelBatch() {
+    if (!activeJobId) return;
+    try {
+      const response = await api.post(
+        `/api/sytist/process/job/${activeJobId}/cancel`,
+        {}
+      );
+      // Update local state so the UI immediately reflects "cancelling…"
+      // status. The poll cycle picks up the actual server-side state
+      // a few seconds later.
+      if (response.job) {
+        setActiveJob((prev) => ({ ...(prev || {}), ...response.job }));
+      }
+    } catch (err) {
+      alert(`Cancel failed: ${err.message}`);
+    }
   }
 
   // Sub-galleries available for the currently selected gallery
@@ -379,12 +555,23 @@ export default function OrdersListPage() {
         </div>
       ) : (
         <>
+          {/* Phase 4.6 — selection action bar */}
+          <SelectionActionBar
+            selectedCount={selectedOrderIds.size}
+            onClearSelection={clearSelection}
+            onProcessSelected={openBatchModalSelected}
+            onProcessAllFiltered={openBatchModalAll}
+            disabled={!!activeJobId && activeJob?.status !== 'complete' && activeJob?.status !== 'failed' && activeJob?.status !== 'cancelled'}
+          />
+
           <OrdersTable
             orders={orders}
             subGalleryFilter={subGalleryId ? parseInt(subGalleryId, 10) : null}
+            selectedOrderIds={selectedOrderIds}
+            onToggleSelected={toggleOrderSelected}
+            allOnPageSelected={allOnPageSelected}
+            onTogglePageSelection={togglePageSelection}
             onRowClick={(orderId) => {
-              // Preserve current filters in browser history so back-button
-              // returns to the same view.
               navigate(`/orders/${orderId}`);
             }}
           />
@@ -398,6 +585,25 @@ export default function OrdersListPage() {
             />
           )}
         </>
+      )}
+
+      {/* Phase 4.6 — batch process modal */}
+      {batchModalOpen && (
+        <BatchProcessModal
+          allMode={batchAllMode}
+          selectedCount={selectedOrderIds.size}
+          onClose={() => setBatchModalOpen(false)}
+          onConfirm={startBatch}
+        />
+      )}
+
+      {/* Phase 4.6 — sticky job progress banner */}
+      {activeJob && (
+        <JobProgressBanner
+          job={activeJob}
+          onDismiss={dismissJobBanner}
+          onCancel={cancelBatch}
+        />
       )}
     </div>
   );
@@ -428,7 +634,15 @@ const selectStyle = {
   cursor: 'pointer',
 };
 
-function OrdersTable({ orders, subGalleryFilter, onRowClick }) {
+function OrdersTable({
+  orders,
+  subGalleryFilter,
+  selectedOrderIds,
+  onToggleSelected,
+  allOnPageSelected,
+  onTogglePageSelection,
+  onRowClick,
+}) {
   return (
     <div
       style={{
@@ -455,6 +669,22 @@ function OrdersTable({ orders, subGalleryFilter, onRowClick }) {
           }}
         >
           <tr>
+            <th
+              style={{
+                padding: '10px 12px',
+                width: 36,
+                textAlign: 'center',
+                borderBottom: '1px solid var(--border-color)',
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={allOnPageSelected}
+                onChange={onTogglePageSelection}
+                title="Select all on this page"
+                style={{ cursor: 'pointer' }}
+              />
+            </th>
             <Th>Order #</Th>
             <Th>Date</Th>
             <Th>Customer</Th>
@@ -472,6 +702,8 @@ function OrdersTable({ orders, subGalleryFilter, onRowClick }) {
               key={o.orderId}
               order={o}
               subGalleryFilter={subGalleryFilter}
+              isSelected={selectedOrderIds?.has(o.orderId) || false}
+              onToggleSelected={() => onToggleSelected(o.orderId)}
               onClick={() => onRowClick(o.orderId)}
             />
           ))}
@@ -497,7 +729,7 @@ function Th({ children, align = 'left' }) {
   );
 }
 
-function OrderRow({ order, subGalleryFilter, onClick }) {
+function OrderRow({ order, subGalleryFilter, isSelected, onToggleSelected, onClick }) {
   // Subject = first non-empty subject field (typically athlete name)
   const subjectName =
     (order.subject?.fields || []).find((f) => f.value)?.value || '—';
@@ -533,14 +765,33 @@ function OrderRow({ order, subGalleryFilter, onClick }) {
       style={{
         cursor: 'pointer',
         borderBottom: '1px solid var(--border-color)',
+        background: isSelected ? 'rgba(74,127,193,0.08)' : undefined,
       }}
       onMouseEnter={(e) => {
-        e.currentTarget.style.background = 'var(--bg-secondary)';
+        if (!isSelected) e.currentTarget.style.background = 'var(--bg-secondary)';
       }}
       onMouseLeave={(e) => {
-        e.currentTarget.style.background = '';
+        if (!isSelected) e.currentTarget.style.background = '';
       }}
     >
+      {/* Checkbox cell — clicks don't propagate to the row */}
+      <td
+        style={{ padding: '10px 12px', textAlign: 'center' }}
+        onClick={(e) => {
+          e.stopPropagation();
+          onToggleSelected();
+        }}
+      >
+        <input
+          type="checkbox"
+          checked={isSelected}
+          onChange={() => {
+            /* handled via td click */
+          }}
+          onClick={(e) => e.stopPropagation()}
+          style={{ cursor: 'pointer' }}
+        />
+      </td>
       <td style={{ padding: '10px 12px', fontFamily: 'var(--font-mono, monospace)', fontSize: 12 }}>
         {order.orderId}
       </td>
@@ -771,4 +1022,528 @@ function formatOrderDate(dateStr) {
   }
 
   return `${monthName} ${d}${time}`;
+}
+
+// ──────────────────────────────────────────────────────────
+// Phase 4.6 — Batch processing UI
+// ──────────────────────────────────────────────────────────
+
+/**
+ * Sticky action bar above the orders table. Always visible (so the
+ * "Process all filtered" affordance is reachable even when no rows are
+ * checked). Selected count + clear shows up only when ≥1 selected.
+ */
+function SelectionActionBar({
+  selectedCount,
+  onClearSelection,
+  onProcessSelected,
+  onProcessAllFiltered,
+  disabled,
+}) {
+  const hasSelection = selectedCount > 0;
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 12,
+        padding: '10px 14px',
+        marginBottom: 12,
+        background: hasSelection ? 'rgba(74,127,193,0.08)' : 'var(--bg-card)',
+        border: `1px solid ${hasSelection ? 'rgba(74,127,193,0.4)' : 'var(--border-color)'}`,
+        borderRadius: 6,
+        flexWrap: 'wrap',
+      }}
+    >
+      <div style={{ fontSize: 13, color: 'var(--text-primary)', flex: 1 }}>
+        {hasSelection ? (
+          <>
+            <strong>{selectedCount}</strong> selected
+          </>
+        ) : (
+          <span style={{ color: 'var(--text-muted)' }}>
+            Select orders with the checkboxes — or process all filtered orders.
+          </span>
+        )}
+      </div>
+
+      <div style={{ display: 'flex', gap: 8 }}>
+        {hasSelection && (
+          <button
+            onClick={onClearSelection}
+            disabled={disabled}
+            style={{
+              background: 'transparent',
+              border: '1px solid var(--border-color)',
+              color: 'var(--text-secondary)',
+              padding: '6px 12px',
+              borderRadius: 6,
+              fontSize: 12,
+              cursor: disabled ? 'not-allowed' : 'pointer',
+              fontFamily: 'inherit',
+            }}
+          >
+            Clear selection
+          </button>
+        )}
+
+        <button
+          onClick={onProcessSelected}
+          disabled={disabled || !hasSelection}
+          style={{
+            background: hasSelection ? '#4a7fc1' : 'var(--bg-input)',
+            border: `1px solid ${hasSelection ? '#4a7fc1' : 'var(--border-color)'}`,
+            color: hasSelection ? '#ffffff' : 'var(--text-muted)',
+            padding: '6px 14px',
+            borderRadius: 6,
+            fontSize: 12,
+            fontWeight: 600,
+            cursor: disabled || !hasSelection ? 'not-allowed' : 'pointer',
+            fontFamily: 'inherit',
+            opacity: disabled ? 0.6 : 1,
+          }}
+        >
+          Process selected ({selectedCount})
+        </button>
+
+        <button
+          onClick={onProcessAllFiltered}
+          disabled={disabled}
+          style={{
+            background: 'var(--bg-input)',
+            border: '1px solid var(--border-color)',
+            color: 'var(--text-secondary)',
+            padding: '6px 14px',
+            borderRadius: 6,
+            fontSize: 12,
+            cursor: disabled ? 'not-allowed' : 'pointer',
+            fontFamily: 'inherit',
+            opacity: disabled ? 0.6 : 1,
+          }}
+          title="Process every order matching the current filters (up to 500)"
+        >
+          Process all filtered
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Modal that confirms a batch process and lets the operator opt into
+ * team dividers and QR sheets. Closes on ESC or background click.
+ */
+function BatchProcessModal({ allMode, selectedCount, onClose, onConfirm }) {
+  const [generateDivider, setGenerateDivider] = useState(false);
+  const [generateQrSheet, setGenerateQrSheet] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    function onKey(e) {
+      if (e.key === 'Escape') onClose();
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  async function handleConfirm() {
+    setSubmitting(true);
+    try {
+      await onConfirm({ generateDivider, generateQrSheet });
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0,0,0,0.6)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        zIndex: 1000,
+        padding: 24,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: 'var(--bg-card)',
+          border: '1px solid var(--border-color)',
+          borderRadius: 8,
+          padding: 24,
+          width: '100%',
+          maxWidth: 500,
+        }}
+      >
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            marginBottom: 16,
+            paddingBottom: 12,
+            borderBottom: '1px solid var(--border-color)',
+          }}
+        >
+          <h3 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>
+            {allMode ? 'Process all filtered orders' : `Process ${selectedCount} order${selectedCount === 1 ? '' : 's'}`}
+          </h3>
+          <button
+            onClick={onClose}
+            style={{
+              background: 'transparent',
+              border: 'none',
+              color: 'var(--text-muted)',
+              cursor: 'pointer',
+              fontSize: 22,
+              padding: 0,
+              lineHeight: 1,
+            }}
+            aria-label="Close"
+          >
+            ×
+          </button>
+        </div>
+
+        <div
+          style={{
+            fontSize: 13,
+            color: 'var(--text-secondary)',
+            marginBottom: 16,
+            lineHeight: 1.5,
+          }}
+        >
+          Each order will be downloaded, imposed, and have its slip + .txt
+          written. Sibling orders split into per-team sub-orders automatically.
+          {allMode && (
+            <div
+              style={{
+                marginTop: 8,
+                padding: 8,
+                background: 'rgba(224,179,65,0.08)',
+                border: '1px solid rgba(224,179,65,0.3)',
+                borderRadius: 4,
+                color: '#e0b341',
+                fontSize: 12,
+              }}
+            >
+              ⚠ Will fetch every matching order from the server (cap 500).
+            </div>
+          )}
+        </div>
+
+        <div style={{ marginBottom: 20, display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <label
+            style={{
+              display: 'flex',
+              alignItems: 'flex-start',
+              gap: 8,
+              fontSize: 13,
+              cursor: 'pointer',
+              padding: 8,
+              borderRadius: 4,
+              background: 'var(--bg-input)',
+              border: '1px solid var(--border-color)',
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={generateDivider}
+              onChange={(e) => setGenerateDivider(e.target.checked)}
+              style={{ marginTop: 2 }}
+            />
+            <div>
+              <div style={{ fontWeight: 500 }}>Generate team dividers</div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
+                One 5×8 divider sheet per team for non-home orders.
+              </div>
+            </div>
+          </label>
+
+          <label
+            style={{
+              display: 'flex',
+              alignItems: 'flex-start',
+              gap: 8,
+              fontSize: 13,
+              cursor: 'pointer',
+              padding: 8,
+              borderRadius: 4,
+              background: 'var(--bg-input)',
+              border: '1px solid var(--border-color)',
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={generateQrSheet}
+              onChange={(e) => setGenerateQrSheet(e.target.checked)}
+              style={{ marginTop: 2 }}
+            />
+            <div>
+              <div style={{ fontWeight: 500 }}>Generate QR sheet</div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
+                Printable 8.5×11 sheet of QR codes (20 per page) for batch scanning.
+              </div>
+            </div>
+          </label>
+        </div>
+
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+          <button
+            onClick={onClose}
+            disabled={submitting}
+            style={{
+              background: 'transparent',
+              border: '1px solid var(--border-color)',
+              color: 'var(--text-secondary)',
+              padding: '8px 14px',
+              borderRadius: 6,
+              fontSize: 12,
+              cursor: submitting ? 'wait' : 'pointer',
+              fontFamily: 'inherit',
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={handleConfirm}
+            disabled={submitting}
+            style={{
+              background: '#4a7fc1',
+              border: '1px solid #4a7fc1',
+              color: '#ffffff',
+              padding: '8px 18px',
+              borderRadius: 6,
+              fontSize: 12,
+              fontWeight: 600,
+              cursor: submitting ? 'wait' : 'pointer',
+              fontFamily: 'inherit',
+              opacity: submitting ? 0.6 : 1,
+            }}
+          >
+            {submitting ? 'Starting…' : 'Start processing'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Bottom-of-screen progress banner for an active batch job. Updates via
+ * polling in the parent component. Stays until the operator dismisses
+ * it (so they can review the results).
+ */
+function JobProgressBanner({ job, onDismiss, onCancel }) {
+  const isComplete = job.status === 'complete';
+  const isFailed = job.status === 'failed';
+  const isCancelled = job.status === 'cancelled';
+  const isCancelling = !!job.cancelRequested && !isComplete && !isFailed && !isCancelled;
+  const isRunning = !isComplete && !isFailed && !isCancelled;
+
+  const successCount = (job.results || []).filter(
+    (r) => !r.error && r.subOrders && r.subOrders.every((s) => s.success)
+  ).length;
+  const errorCount = (job.results || []).filter((r) => !!r.error).length;
+  const partialCount = (job.results || []).filter(
+    (r) => !r.error && r.subOrders && !r.subOrders.every((s) => s.success)
+  ).length;
+
+  const pct = job.total ? Math.round((job.completed / job.total) * 100) : 0;
+
+  // Header label changes based on state. Cancel-requested gets its own
+  // label so the operator knows their click registered.
+  const headerLabel = isComplete
+    ? '✓ Batch complete'
+    : isFailed
+    ? '✗ Batch failed'
+    : isCancelled
+    ? `⊘ Batch cancelled (${job.completed}/${job.total} done)`
+    : isCancelling
+    ? `Cancelling after current order… ${job.completed}/${job.total}`
+    : `Processing… ${job.completed} / ${job.total}`;
+
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        bottom: 16,
+        right: 16,
+        width: 360,
+        background: 'var(--bg-card)',
+        border: `1px solid ${
+          isCancelled
+            ? 'rgba(158,158,158,0.5)'
+            : isComplete && errorCount === 0 && partialCount === 0
+            ? 'rgba(76,175,80,0.5)'
+            : isFailed || errorCount > 0
+            ? 'rgba(220,53,69,0.5)'
+            : 'rgba(74,127,193,0.5)'
+        }`,
+        borderRadius: 8,
+        boxShadow: '0 4px 20px rgba(0,0,0,0.4)',
+        padding: 16,
+        zIndex: 999,
+      }}
+    >
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          marginBottom: 8,
+        }}
+      >
+        <div style={{ fontSize: 13, fontWeight: 600 }}>{headerLabel}</div>
+        {!isRunning && (
+          <button
+            onClick={onDismiss}
+            style={{
+              background: 'transparent',
+              border: 'none',
+              color: 'var(--text-muted)',
+              cursor: 'pointer',
+              fontSize: 18,
+              padding: 0,
+              lineHeight: 1,
+            }}
+            aria-label="Dismiss"
+          >
+            ×
+          </button>
+        )}
+      </div>
+
+      {/* Progress bar */}
+      <div
+        style={{
+          width: '100%',
+          height: 6,
+          background: 'var(--bg-input)',
+          borderRadius: 3,
+          overflow: 'hidden',
+          marginBottom: 10,
+        }}
+      >
+        <div
+          style={{
+            width: `${pct}%`,
+            height: '100%',
+            background: isFailed
+              ? '#dc3545'
+              : isCancelled
+              ? '#9e9e9e'
+              : isComplete
+              ? '#4caf50'
+              : '#4a7fc1',
+            transition: 'width 0.3s ease',
+          }}
+        />
+      </div>
+
+      {(isComplete || isRunning || isCancelled) && (
+        <div
+          style={{
+            fontSize: 11,
+            color: 'var(--text-muted)',
+            display: 'flex',
+            gap: 12,
+          }}
+        >
+          {successCount > 0 && (
+            <span style={{ color: '#4caf50' }}>✓ {successCount} ok</span>
+          )}
+          {partialCount > 0 && (
+            <span style={{ color: '#e0b341' }}>⚠ {partialCount} partial</span>
+          )}
+          {errorCount > 0 && (
+            <span style={{ color: '#dc3545' }}>✗ {errorCount} failed</span>
+          )}
+        </div>
+      )}
+
+      {/* Phase 4.7 — graceful cancel button. Visible while the batch
+          is running and not already cancelling. Lets the current order
+          finish, then halts. */}
+      {isRunning && !isCancelling && (
+        <div style={{ marginTop: 10 }}>
+          <button
+            onClick={() => {
+              if (
+                window.confirm(
+                  'Stop the batch after the current order finishes?\n\n' +
+                    'Already-completed orders are NOT rolled back. The Darkroom watcher ' +
+                    "may have already picked them up, so you'll see partial output."
+                )
+              ) {
+                onCancel();
+              }
+            }}
+            style={{
+              background: 'transparent',
+              border: '1px solid rgba(220,53,69,0.5)',
+              color: '#dc3545',
+              padding: '5px 10px',
+              borderRadius: 4,
+              fontSize: 11,
+              cursor: 'pointer',
+              fontFamily: 'inherit',
+              fontWeight: 600,
+            }}
+          >
+            Stop after current order
+          </button>
+        </div>
+      )}
+
+      {isCancelling && (
+        <div
+          style={{
+            marginTop: 8,
+            fontSize: 11,
+            color: '#e0b341',
+            fontStyle: 'italic',
+          }}
+        >
+          Stop requested — finishing the current order, then halting…
+        </div>
+      )}
+
+      {isFailed && job.error && (
+        <div
+          style={{
+            marginTop: 8,
+            fontSize: 11,
+            color: '#dc3545',
+          }}
+        >
+          {job.error}
+        </div>
+      )}
+
+      {(job.qrSheetPaths && job.qrSheetPaths.length > 0) && (
+        <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-muted)' }}>
+          📋 QR sheet{job.qrSheetPaths.length === 1 ? '' : 's'} written:
+          {job.qrSheetPaths.map((p, i) => (
+            <div
+              key={i}
+              style={{
+                fontFamily: 'var(--font-mono, monospace)',
+                fontSize: 10,
+                marginLeft: 8,
+                wordBreak: 'break-all',
+              }}
+            >
+              {p}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }

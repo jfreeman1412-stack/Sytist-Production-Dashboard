@@ -103,6 +103,8 @@ export default function OrderDetailPage() {
 
       <HeaderStrip order={order} teamCount={teamCount} />
 
+      <ProcessOrderBlock order={order} teamCount={teamCount} isBundledHome={isBundledHome} />
+
       <div style={twoColumnStyle}>
         <CustomerBlock customer={order.customer} />
         <ShipToBlock shipTo={order.shipTo} />
@@ -2000,6 +2002,279 @@ function ImpositionItemRow({ order, lineItem }) {
           )}
         </>
       )}
+    </div>
+  );
+}
+
+// ──────────────────────────────────────────────────────────
+// Process order (Phase 4.6)
+// ──────────────────────────────────────────────────────────
+//
+// Prominent top-of-page action: "Process this order". Triggers
+// processingService.processOrder via the API. For sibling non-home
+// orders, shows a checkbox for "Generate team dividers". Result is
+// rendered inline below the button — sub-orders, success/failure,
+// paths to written files, warnings.
+
+function ProcessOrderBlock({ order, teamCount, isBundledHome }) {
+  const [processing, setProcessing] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+  const [generateDivider, setGenerateDivider] = useState(false);
+
+  const isPerTeam =
+    !isBundledHome &&
+    (order.shipping?.workflow === 'ship_to_managers' ||
+      order.shipping?.workflow === 'ship_to_league');
+  const showDividerOption = isPerTeam && teamCount >= 1;
+
+  async function handleProcess() {
+    if (
+      !window.confirm(
+        `Process order ${order.orderNumber || order.orderId}?\n\n` +
+          `This will download photos, run imposition, and write the .txt file ` +
+          `that triggers Darkroom. Make sure you're in TEST mode if this is a dry run.`
+      )
+    ) {
+      return;
+    }
+
+    setProcessing(true);
+    setError(null);
+    setResult(null);
+    try {
+      const response = await api.post(
+        `/api/sytist/process/order/${order.orderId}`,
+        { generateDivider }
+      );
+      setResult(response.result);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setProcessing(false);
+    }
+  }
+
+  return (
+    <div
+      style={{
+        marginBottom: 20,
+        padding: 16,
+        background: 'var(--bg-card)',
+        border: '1px solid var(--border-color)',
+        borderRadius: 8,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 12,
+      }}
+    >
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 16,
+          flexWrap: 'wrap',
+        }}
+      >
+        <div>
+          <div style={{ fontSize: 14, fontWeight: 600 }}>Process this order</div>
+          <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+            Downloads photos, runs imposition, writes slip + .txt to the configured
+            output path.{' '}
+            {isPerTeam && teamCount > 1 && (
+              <strong>{teamCount} sub-orders will be created (one per team).</strong>
+            )}
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          {showDividerOption && (
+            <label
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                fontSize: 12,
+                cursor: 'pointer',
+                color: 'var(--text-secondary)',
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={generateDivider}
+                onChange={(e) => setGenerateDivider(e.target.checked)}
+                disabled={processing}
+              />
+              Generate team dividers
+            </label>
+          )}
+
+          <button
+            onClick={handleProcess}
+            disabled={processing}
+            style={{
+              background: '#4a7fc1',
+              border: '1px solid #4a7fc1',
+              color: '#ffffff',
+              padding: '8px 18px',
+              borderRadius: 6,
+              fontSize: 13,
+              fontWeight: 600,
+              cursor: processing ? 'wait' : 'pointer',
+              fontFamily: 'inherit',
+              opacity: processing ? 0.6 : 1,
+            }}
+          >
+            {processing ? 'Processing…' : 'Process this order'}
+          </button>
+        </div>
+      </div>
+
+      {error && (
+        <div
+          style={{
+            padding: 10,
+            background: 'rgba(220,53,69,0.1)',
+            border: '1px solid rgba(220,53,69,0.3)',
+            borderRadius: 6,
+            color: '#dc3545',
+            fontSize: 12,
+          }}
+        >
+          {error}
+        </div>
+      )}
+
+      {result && <ProcessResultDisplay result={result} />}
+    </div>
+  );
+}
+
+function ProcessResultDisplay({ result }) {
+  const allOk = result.subOrders.every((s) => s.success);
+  return (
+    <div
+      style={{
+        padding: 12,
+        background: allOk ? 'rgba(76,175,80,0.08)' : 'rgba(224,179,65,0.08)',
+        border: `1px solid ${allOk ? 'rgba(76,175,80,0.3)' : 'rgba(224,179,65,0.3)'}`,
+        borderRadius: 6,
+      }}
+    >
+      <div
+        style={{
+          fontSize: 12,
+          fontWeight: 600,
+          color: allOk ? '#4caf50' : '#e0b341',
+          marginBottom: 8,
+        }}
+      >
+        {allOk
+          ? `✓ Processed ${result.subOrders.length} sub-order${result.subOrders.length === 1 ? '' : 's'} successfully`
+          : `⚠ Completed with errors`}
+        {result.statusUpdated && (
+          <span style={{ fontWeight: 500, marginLeft: 8 }}>
+            (status → {result.newStatusId})
+          </span>
+        )}
+      </div>
+
+      {result.subOrders.map((sub, i) => {
+        const scopeName =
+          sub.scope === 'home'
+            ? 'Whole order'
+            : `Team: ${sub.scope.subGalleryName || '(unnamed)'}`;
+        return (
+          <div
+            key={i}
+            style={{
+              padding: 8,
+              marginTop: i === 0 ? 0 : 8,
+              background: 'rgba(255,255,255,0.03)',
+              border: '1px solid var(--border-color)',
+              borderRadius: 4,
+              fontSize: 12,
+            }}
+          >
+            <div style={{ fontWeight: 600, marginBottom: 4 }}>
+              {sub.success ? '✓' : '✗'} {scopeName}
+              {sub.error && (
+                <span style={{ color: '#dc3545', marginLeft: 8 }}>— {sub.error}</span>
+              )}
+            </div>
+            <div
+              style={{
+                color: 'var(--text-muted)',
+                fontSize: 11,
+                fontFamily: 'var(--font-mono, monospace)',
+                wordBreak: 'break-all',
+              }}
+            >
+              {sub.txtPath && <div>📄 {sub.txtPath}</div>}
+              {sub.specialtyTxtPath && <div>📄 {sub.specialtyTxtPath} (specialty)</div>}
+              {sub.slipPath && <div>🧾 {sub.slipPath}</div>}
+              {sub.dividerPath && <div>📋 {sub.dividerPath}</div>}
+            </div>
+            <div
+              style={{
+                color: 'var(--text-muted)',
+                fontSize: 11,
+                marginTop: 4,
+              }}
+            >
+              {sub.photosDownloaded.length} photo{sub.photosDownloaded.length === 1 ? '' : 's'},{' '}
+              {sub.imposedSheets.length} imposed sheet{sub.imposedSheets.length === 1 ? '' : 's'}
+              {sub.photosFailed.length > 0 && (
+                <span style={{ color: '#dc3545', marginLeft: 8 }}>
+                  ⚠ {sub.photosFailed.length} failed
+                </span>
+              )}
+            </div>
+            {sub.warnings.length > 0 && (
+              <details style={{ marginTop: 6 }}>
+                <summary
+                  style={{
+                    fontSize: 11,
+                    color: '#e0b341',
+                    cursor: 'pointer',
+                  }}
+                >
+                  {sub.warnings.length} warning{sub.warnings.length === 1 ? '' : 's'}
+                </summary>
+                <div
+                  style={{
+                    marginTop: 4,
+                    paddingLeft: 12,
+                    fontSize: 11,
+                    color: 'var(--text-muted)',
+                  }}
+                >
+                  {sub.warnings.map((w, j) => (
+                    <div key={j}>
+                      <span
+                        style={{
+                          fontFamily: 'var(--font-mono, monospace)',
+                          fontSize: 10,
+                          padding: '1px 4px',
+                          background: 'rgba(224,179,65,0.18)',
+                          color: '#e0b341',
+                          borderRadius: 3,
+                          marginRight: 6,
+                        }}
+                      >
+                        {w.type}
+                      </span>
+                      {w.message ||
+                        (w.cartId ? `cartId ${w.cartId}` : '')}
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

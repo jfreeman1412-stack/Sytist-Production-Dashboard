@@ -35,6 +35,7 @@
 // JSON file. Restart the server to pick up changes.
 
 const fs = require('fs');
+const fsp = require('fs').promises;
 const path = require('path');
 
 const OVERRIDES_PATH = path.join(__dirname, '..', 'config', 'path-overrides.json');
@@ -353,6 +354,158 @@ class PathsService {
     this._load();
 
     return updated.modes[mode][outputType];
+  }
+
+  /**
+   * Phase 4.7 — pre-flight check for path mode switch.
+   *
+   * Tests every output type for the requested mode by:
+   *   1. Resolving the template against a synthetic order
+   *   2. Trying to mkdir the resolved path
+   *   3. Writing a small `.preflight-test` marker file
+   *   4. Reading it back to verify
+   *   5. Deleting it
+   *
+   * Returns a per-output-type report so the operator sees exactly which
+   * paths are healthy and which aren't before flipping modes.
+   *
+   * Note: only output types that produce real output files are checked
+   * (skips darkroomTemplateBase since that's an INPUT path the watcher
+   * reads from — a write test would be wrong there).
+   */
+  async preflightCheck(mode) {
+    this._load();
+    const targetMode = mode || this._mode;
+    if (!this._overrides.modes || !this._overrides.modes[targetMode]) {
+      throw new Error(`Mode "${targetMode}" has no templates defined`);
+    }
+
+    // Synthetic order for token resolution
+    const today = new Date().toISOString().split('T')[0];
+    const syntheticOrder = {
+      orderId: 'preflight',
+      orderNumber: 'preflight',
+      orderDate: `${today} 00:00:00`,
+      galleryName: 'Preflight',
+      subGalleryName: 'Test',
+      shipping: { workflow: 'ship_to_home' },
+    };
+
+    const checks = [];
+    const outputTypesToTest = OUTPUT_TYPES.filter(
+      (t) => t !== 'darkroomTemplateBase'
+    );
+
+    for (const outputType of outputTypesToTest) {
+      const check = {
+        outputType,
+        template: this._overrides.modes[targetMode][outputType],
+        resolvedPath: null,
+        ok: false,
+        steps: [],
+      };
+
+      try {
+        // Resolve path using temporarily-applied template (without flipping mode)
+        const template = this._overrides.modes[targetMode][outputType];
+        const resolved = this._applyTemplate(template, syntheticOrder, []);
+        check.resolvedPath = resolved;
+
+        // Each filesystem step gets a 5-second timeout so a hung NFS/SMB
+        // mount or a bizarre special path doesn't lock the UI.
+        const withTimeout = (label, promise) =>
+          Promise.race([
+            promise,
+            new Promise((_, reject) =>
+              setTimeout(
+                () => reject(new Error(`${label} timed out after 5s`)),
+                5000
+              )
+            ),
+          ]);
+
+        // mkdir
+        try {
+          await withTimeout('mkdir', fsp.mkdir(resolved, { recursive: true }));
+          check.steps.push({ step: 'mkdir', ok: true });
+        } catch (err) {
+          check.steps.push({ step: 'mkdir', ok: false, error: err.message });
+          throw err;
+        }
+
+        // write
+        const testFile = path.join(resolved, '.preflight-test');
+        const testContent = `preflight ${new Date().toISOString()}`;
+        try {
+          await withTimeout('write', fsp.writeFile(testFile, testContent, 'utf8'));
+          check.steps.push({ step: 'write', ok: true });
+        } catch (err) {
+          check.steps.push({ step: 'write', ok: false, error: err.message });
+          throw err;
+        }
+
+        // read
+        try {
+          const got = await withTimeout('read', fsp.readFile(testFile, 'utf8'));
+          if (got !== testContent) {
+            throw new Error('Read content mismatch');
+          }
+          check.steps.push({ step: 'read', ok: true });
+        } catch (err) {
+          check.steps.push({ step: 'read', ok: false, error: err.message });
+          throw err;
+        }
+
+        // delete
+        try {
+          await withTimeout('delete', fsp.unlink(testFile));
+          check.steps.push({ step: 'delete', ok: true });
+        } catch (err) {
+          check.steps.push({ step: 'delete', ok: false, error: err.message });
+          throw err;
+        }
+
+        check.ok = true;
+      } catch (err) {
+        check.error = err.message;
+      }
+
+      checks.push(check);
+    }
+
+    return {
+      mode: targetMode,
+      currentMode: this._mode,
+      timestamp: new Date().toISOString(),
+      allOk: checks.every((c) => c.ok),
+      checks,
+    };
+  }
+
+  /**
+   * Internal helper used by preflightCheck — applies a template with
+   * the same token substitution + folder-sort logic as resolveFullPath
+   * but for an arbitrary template (instead of the active one). Folder-
+   * sort segments aren't appended in preflight since we're testing the
+   * BASE path, not a fully-resolved per-order path.
+   */
+  _applyTemplate(template, order, segments) {
+    if (!template) return '';
+    const tokens = {
+      '{date}': sanitize(order.orderDate ? order.orderDate.split(' ')[0] : new Date().toISOString().split('T')[0]),
+      '{orderId}': sanitize(order.orderId || order.orderNumber || ''),
+      '{gallery}': sanitize(order.galleryName || ''),
+      '{subGallery}': sanitize(order.subGalleryName || ''),
+      '{workflow}': sanitize(order.shipping?.workflow || ''),
+    };
+    let resolved = template;
+    for (const [tok, val] of Object.entries(tokens)) {
+      resolved = resolved.split(tok).join(val);
+    }
+    if (segments && segments.length > 0) {
+      resolved = path.win32.join(resolved, ...segments);
+    }
+    return resolved;
   }
 }
 

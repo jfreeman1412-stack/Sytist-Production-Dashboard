@@ -1,0 +1,160 @@
+Phase 4.7 — production switch + safety harness
+
+═══════════════════════════════════════════════════════
+NO NEW DEPENDENCIES — `npm install` NOT REQUIRED
+═══════════════════════════════════════════════════════
+
+Deploy:
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-4.7.tar.gz --strip-components=1
+  npm run dev
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+NEW:
+  server/services/processHistoryService.js         Disk-backed batch job history
+  client/src/pages/settings/ProcessHistoryPage.js  History viewer UI
+
+MODIFIED:
+  server/services/pathsService.js              + preflightCheck()
+  server/services/processingService.js         + cancel flag, history hooks, ranBy
+  server/routes/sytist.js                      + /paths/preflight, /process/job/:id/cancel,
+                                                  /process/history, history clear
+  client/src/components/AppLayout.js           + PRODUCTION banner, mode chip in header,
+                                                  process-history route
+  client/src/pages/settings/SettingsLayout.js  + Process History sidebar link
+  client/src/pages/settings/PathsSettings.js   + Pre-flight check section
+  client/src/pages/OrdersListPage.js           + Stop-after-current-order button on banner
+
+NEW CONFIG (auto-created on first batch run):
+  server/config/process-history.json           Persisted batch job audit log
+
+═══════════════════════════════════════════════════════
+NEW CAPABILITIES
+═══════════════════════════════════════════════════════
+
+1. PRODUCTION MODE BANNER
+   - Red banner appears across the top of every page when path mode is "production"
+   - Cannot be dismissed (point is to be visible at all times in prod)
+   - Mode chip (TEST/PROD) also added next to user info in header
+
+2. PRE-FLIGHT CHECK (Settings → Paths → Pre-flight check)
+   - Verifies write access for every output path before flipping modes
+   - Tests mkdir + write + read + delete on a marker file per output type
+   - 5-second timeout per step so a hung NFS/SMB share doesn't lock the UI
+   - Defaults to checking the OPPOSITE of the current mode
+   - Skip's darkroomTemplateBase (an INPUT path the watcher reads)
+
+3. EMERGENCY STOP (Orders list → progress banner → Stop button)
+   - Visible while batch is running
+   - Confirm dialog explains: current order finishes, then halts
+   - Already-completed orders are NOT rolled back (Darkroom may have
+     picked them up — operator handles partial output manually)
+   - Banner shows "Cancelling after current order…" until it stops
+
+4. PROCESS HISTORY (Settings → History → Process History)
+   - Persistent log of every completed batch job
+   - Each entry: started/completed timestamps, mode, ranBy, total/completed,
+     success/partial/failed counts, options (dividers, qr), QR sheet paths
+   - Click row to expand per-order summary
+   - Click order # to jump to its detail page
+   - Pagination (50 per page, max 500 entries retained)
+   - Clear History button at top right (admin)
+   - Single-order processOrder() calls are NOT logged here
+     (those happen often during testing — would clutter history)
+
+═══════════════════════════════════════════════════════
+PRODUCTION SWITCH WORKFLOW
+═══════════════════════════════════════════════════════
+
+This is the recommended sequence for going to production.
+
+1. VERIFY IN TEST MODE (already in test by default)
+   a. Open Settings → Paths. Confirm chip shows "TEST".
+   b. Process a single ship_to_home order via the order detail page.
+   c. Process a multi-team sibling order. Confirm chunking worked.
+   d. Process an order with a specialty SKU. Confirm specialty routing.
+   e. Run a small batch (5 orders) from the Orders list.
+   f. Open Settings → Process History. Confirm the batch is logged.
+
+2. CONFIGURE PRODUCTION TEMPLATES
+   a. Open Settings → Paths → production templates section.
+   b. Verify templates point to the actual production tree
+      (e.g. `Z:\Sytist\__Open Orders\{date}`).
+   c. Confirm Darkroom watcher is configured for that path.
+
+3. RUN PRE-FLIGHT CHECK
+   a. Open Settings → Paths → Pre-flight check section.
+   b. Target mode: production.
+   c. Click "Run pre-flight on production".
+   d. All four output types should report OK (downloadBase,
+      darkroomTxtBase, packingSlipBase, impositionBase).
+   e. If any FAIL, fix the path / permission before continuing.
+
+4. SWITCH TO PRODUCTION
+   a. Open Settings → Paths → Active mode.
+   b. Click "Switch to production". Confirm the dialog.
+   c. PRODUCTION banner should appear across the top of the app.
+   d. Mode chip in header should show "PROD" in red.
+
+5. PROCESS ONE TEST ORDER IN PRODUCTION
+   a. Pick a single, low-risk order (small order count is best).
+   b. Click "Process this order" from the order detail page.
+   c. Watch the result — should show success with paths under
+      production tree.
+   d. Verify Darkroom picks up the .txt and prints correctly.
+   e. If anything looks wrong, click "Switch to test" immediately
+      and investigate.
+
+6. SMALL PRODUCTION BATCH
+   a. Select 5 orders from a single gallery.
+   b. Click "Process selected (5)". Optionally enable team dividers.
+   c. Watch the progress banner — note the "Stop after current order"
+      button is available if you need to bail.
+   d. After complete, check Settings → Process History — entry should
+      show mode "PROD" and your username under "Ran by".
+   e. Verify Darkroom output is correct for all 5.
+
+═══════════════════════════════════════════════════════
+SAFETY NOTES
+═══════════════════════════════════════════════════════
+
+- The PRODUCTION banner is intentionally NOT dismissible. If it
+  bothers you, switch to test mode while you're not actively
+  processing.
+
+- Pre-flight check creates and deletes a file named `.preflight-test`
+  in each output directory. If something prevents deletion (rare),
+  that file may be left behind. Safe to delete manually if seen.
+
+- Cancel sends a signal — it doesn't kill mid-order. If a single
+  order takes 30 seconds, cancel will take up to 30 seconds to
+  take effect. The "Cancelling after current order…" message
+  shows immediately so you know it registered.
+
+- History is capped at 500 entries (oldest pruned). For long-term
+  audit, consider rotating the file periodically or building a
+  proper archive in a future phase.
+
+- The /api/sytist/process/history/:jobId endpoint returns the full
+  detail of a single entry (handy for scripting / external audit).
+
+═══════════════════════════════════════════════════════
+PHASE 4 COMPLETE
+═══════════════════════════════════════════════════════
+
+Phase 4.1 Paths + folder sort
+Phase 4.2 darkroomService
+Phase 4.3 packingSlipService + teamDividerService
+Phase 4.4 impositionService
+Phase 4.5 Settings UI
+Phase 4.6 Process orchestrator + batch flow + specialty + qrcode
+Phase 4.6-data Specialty products seeded
+Phase 4.7 Production switch + safety harness   ← we are here
+
+NEXT (per your roadmap):
+- Phase 5+ SQLite migration (multi-user concurrency)
+- Phase 8  Composites (memory-mate-style multi-image)
+- Phase 9  Visual layout creator

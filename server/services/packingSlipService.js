@@ -69,6 +69,7 @@ const sharp = require('sharp');
 const QRCode = require('qrcode');
 
 const pathsService = require('./pathsService');
+const specialtyService = require('./specialtyService');
 
 // 5" × 8" at 300 DPI
 const SLIP_WIDTH = 1500;
@@ -566,17 +567,37 @@ class PackingSlipService {
 
     // Item rows
     let itemY = itemsStartY;
+
+    // Pre-resolve specialty status for each line item so the per-row loop
+    // doesn't have to await on each iteration. Specialty SKUs get the
+    // orange row tint from highlightColors.specialty (default #fff5e6).
+    const specialtyByCartId = {};
+    for (const li of printedItems) {
+      try {
+        specialtyByCartId[li.cartId] = await specialtyService.isSpecialty(li.sku);
+      } catch {
+        specialtyByCartId[li.cartId] = false;
+      }
+    }
+
     for (let idx = 0; idx < printedItems.length; idx++) {
       const li = printedItems[idx];
       const qty = li.qty || 1;
       const isHighQty = qty > 1;
+      const isSpecialty = !!specialtyByCartId[li.cartId];
 
-      // Highlight band for qty>1 rows
-      if (isHighQty && config.highlightColors.quantity) {
+      // Highlight band: specialty takes precedence over qty (specialty
+      // matters more for routing — operator needs to see those first).
+      const bandColor = isSpecialty
+        ? config.highlightColors.specialty
+        : isHighQty
+        ? config.highlightColors.quantity
+        : null;
+      if (bandColor) {
         composites.push({
           input: Buffer.from(
             `<svg width="${CONTENT_WIDTH}" height="${thumbSize + 10}" xmlns="http://www.w3.org/2000/svg">` +
-              `<rect width="${CONTENT_WIDTH}" height="${thumbSize + 10}" fill="${config.highlightColors.quantity}" rx="6"/></svg>`
+              `<rect width="${CONTENT_WIDTH}" height="${thumbSize + 10}" fill="${bandColor}" rx="6"/></svg>`
           ),
           left: MARGIN,
           top: itemY - 5,
@@ -653,6 +674,19 @@ class PackingSlipService {
           `font-weight="bold" fill="#ffffff" text-anchor="middle">CHECK QTY</text>`
         : '';
 
+      // SPECIALTY badge — different color (orange), placed below CHECK QTY
+      // (or alone if not a high-qty row).
+      const specialtyBadgeY = isHighQty
+        ? Math.round(itemNameSize * 3.0)
+        : Math.round(itemNameSize * 1.8);
+      const specialtyBadge = isSpecialty
+        ? `<rect x="${textWidth - Math.round(itemNameSize * 4)}" y="${specialtyBadgeY}" ` +
+          `width="${Math.round(itemNameSize * 4)}" height="${Math.round(itemNameSize * 1)}" rx="4" fill="#E87B34"/>` +
+          `<text x="${textWidth - Math.round(itemNameSize * 2)}" y="${specialtyBadgeY + Math.round(itemNameSize * 0.75)}" ` +
+          `font-family="Arial, sans-serif" font-size="${Math.round(itemNameSize * 0.6)}" ` +
+          `font-weight="bold" fill="#ffffff" text-anchor="middle">SPECIALTY</text>`
+        : '';
+
       const skuLine = li.sku ? `SKU: ${esc(li.sku)}` : '';
       const teamLine = li.subGalleryName && (!teamScope || teamScope.subGalleryId !== li.subGalleryId)
         ? esc(li.subGalleryName)
@@ -673,6 +707,7 @@ class PackingSlipService {
           `<text x="${textWidth}" y="${Math.round(itemQtySize * 1.1)}" font-family="Arial, sans-serif" ` +
           `font-size="${itemQtySize}" font-weight="bold" fill="${qtyColor}" text-anchor="end">${qty}</text>` +
           qtyBadge +
+          specialtyBadge +
           `</svg>`
       );
       composites.push({

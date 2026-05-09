@@ -1,0 +1,151 @@
+Phase 4.6 — order processing orchestrator + batch flow
+
+═══════════════════════════════════════════════════════
+NO NEW DEPENDENCIES — `npm install` NOT REQUIRED
+═══════════════════════════════════════════════════════
+
+Uses sharp + qrcode that were installed in Phase 4.3.
+
+Deploy:
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-4.6.tar.gz --strip-components=1
+  npm run dev
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+NEW SERVICES:
+  server/services/specialtyService.js     SKU registry + routing for specialty products
+  server/services/qrcodeService.js        Batch QR sheet generator
+  server/services/processingService.js    The orchestrator
+
+MODIFIED:
+  server/services/packingSlipService.js   Specialty highlight integration
+  server/routes/sytist.js                 New /process/* and /specialty/* endpoints
+  client/src/pages/OrderDetailPage.js     "Process this order" button + result display
+  client/src/pages/OrdersListPage.js      Checkbox column + batch selection + modal + progress
+  client/src/components/AppLayout.js      Routes for Processing + Specialty settings
+  client/src/pages/settings/SettingsLayout.js   Sidebar links for the two new sections
+
+NEW SETTINGS PAGES:
+  client/src/pages/settings/ProcessingSettings.js  Auto-status-update toggle + target picker
+  client/src/pages/settings/SpecialtySettings.js   Base path, products CRUD, highlight colors
+
+NEW CONFIG (auto-created on first run):
+  server/config/processing-settings.json    { autoStatusUpdate: false, targetStatusId: null }
+  server/config/specialty-products.json     { basePath: "", products: [], highlightColors: {…} }
+
+═══════════════════════════════════════════════════════
+NEW ENDPOINTS
+═══════════════════════════════════════════════════════
+
+POST /api/sytist/process/order/:orderId
+   Body: { generateDivider?: boolean }
+   Synchronously processes one order. Returns full result with every
+   sub-order's outcome.
+
+POST /api/sytist/process/batch
+   Body: { orderIds: string[], generateDivider?: boolean, generateQrSheet?: boolean }
+   Kicks off a batch job, returns jobId immediately. Cap 500 orders.
+
+GET  /api/sytist/process/job/:jobId
+   Polls a batch job's progress.
+
+GET  /api/sytist/process/settings
+PUT  /api/sytist/process/settings   (admin)
+   Body: { autoStatusUpdate, targetStatusId }
+
+GET  /api/sytist/specialty/config
+PUT  /api/sytist/specialty/base-path           (admin)
+PUT  /api/sytist/specialty/highlight-colors    (admin)
+POST /api/sytist/specialty/products            (admin)
+PUT  /api/sytist/specialty/products/:externalId (admin)
+DELETE /api/sytist/specialty/products/:externalId (admin)
+
+═══════════════════════════════════════════════════════
+WHAT TO VERIFY
+═══════════════════════════════════════════════════════
+
+CHECK PATH MODE FIRST — go to Settings > Paths and confirm mode is "test".
+DO NOT verify in production mode. The orchestrator writes real files,
+which Darkroom will pick up if those paths are watched.
+
+1. PER-ORDER PROCESS BUTTON:
+   - Open any order detail page (Phase 4.5+ orders should work).
+   - You'll see a new "Process this order" card right below the header strip.
+   - For sibling non-home orders, a "Generate team dividers" checkbox appears.
+   - Click "Process this order" — confirm dialog, then watch the result inline.
+   - Verify files exist at the printed paths (test sandbox).
+
+2. BATCH PROCESSING:
+   - Go to /orders.
+   - You'll see a new selection action bar above the table and a
+     checkbox column on each row.
+   - Select 2-3 orders via checkboxes. Click "Process selected (N)".
+   - Modal appears with two options: "Generate team dividers" and
+     "Generate QR sheet". Click Start.
+   - A floating progress banner appears bottom-right. Watch it tick
+     through each order. Final state shows success/partial/failed counts.
+   - Try "Process all filtered" too — confirms it pulls every matching
+     order into the batch.
+
+3. SPECIALTY PRODUCTS:
+   - Go to Settings > Specialty.
+   - The list will be empty. Add a real specialty SKU from your catalog
+     (e.g. an acrylic SKU). Subfolder defaults to product name.
+   - Open an order containing that SKU. Look at the slip preview —
+     specialty rows should now show an orange tint and a "SPECIALTY"
+     badge in the corner.
+   - Process the order. Specialty items should land in basePath\subfolder
+     instead of the regular order folder. A separate "*_specialty.txt"
+     gets written for them.
+
+4. AUTO STATUS UPDATE:
+   - Go to Settings > Processing.
+   - Toggle "Update order status after successful processing" ON.
+   - Pick a target status (e.g. "40 - Printing and Production").
+   - Save.
+   - Process an order. After successful processing, check Sytist —
+     the order's status should now be 40.
+   - Toggle it back OFF before exiting if you don't want this to fire
+     during routine verification.
+
+═══════════════════════════════════════════════════════
+SAFETY NOTES
+═══════════════════════════════════════════════════════
+
+- The .txt is written LAST. Every other artifact (downloads, imposed
+  sheets, slip, divider) lands first. If anything earlier fails, the
+  .txt either doesn't get written or excludes the failed line.
+
+- Atomic .tmp + rename for every write. The Darkroom watcher never sees
+  a half-written file.
+
+- Continue-on-error: if a single photo fails to download, the line item
+  is dropped and a warning surfaces; the rest of the sub-order completes.
+  PARTIAL OUTPUT WILL BE SENT TO DARKROOM. Operator sees the warning
+  in the result UI and handles the missing photo manually.
+
+- Sibling chunking: ship_to_managers and ship_to_league orders split
+  per-team. Each team gets its own slip, divider (if enabled), and .txt.
+  ship_to_home siblings stay as one bundle.
+
+═══════════════════════════════════════════════════════
+NEXT STEPS (Phase 4.7)
+═══════════════════════════════════════════════════════
+
+1. Verify several real orders through the per-order Process button in
+   test mode. Fix any layout/text overlay issues by editing imposition
+   layouts in Settings > Imposition.
+
+2. Verify a small batch (5-10 orders) end-to-end. Confirm slip+divider+txt
+   landed where expected and Darkroom would pick them up.
+
+3. Configure specialty products for your real specialty SKUs.
+
+4. Switch Settings > Paths > mode to "production". Process ONE order
+   in production. If anything goes wrong, the watcher would pick it up
+   immediately — be ready to delete the test order from Darkroom's queue.
+
+5. Run a small production batch. Verify customer bags look right.

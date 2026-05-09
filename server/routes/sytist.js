@@ -11,6 +11,9 @@ const darkroomService = require('../services/darkroomService');
 const packingSlipService = require('../services/packingSlipService');
 const teamDividerService = require('../services/teamDividerService');
 const impositionService = require('../services/impositionService');
+const processingService = require('../services/processingService');
+const processHistoryService = require('../services/processHistoryService');
+const specialtyService = require('../services/specialtyService');
 const { requireAuth, requireRole } = require('../middleware/auth');
 
 router.use(requireAuth);
@@ -448,6 +451,32 @@ router.put(
     } catch (err) {
       console.error('[sytist/paths/folder-sort]', err);
       res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+/**
+ * POST /api/sytist/paths/preflight
+ * Body: { mode: 'test' | 'production' }
+ *
+ * Phase 4.7 — verifies write access for every output path under the
+ * requested mode. Tests mkdir + write + read + delete on a small marker
+ * file. Returns per-output-type results so the operator can see exactly
+ * which paths are healthy before flipping modes.
+ *
+ * Admin only since this is part of the production-switch workflow.
+ */
+router.post(
+  '/paths/preflight',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const { mode } = req.body || {};
+      const result = await pathsService.preflightCheck(mode || null);
+      res.json(result);
+    } catch (err) {
+      console.error('[sytist/paths/preflight]', err);
+      res.status(500).json({ error: err.message });
     }
   }
 );
@@ -1382,5 +1411,287 @@ router.delete(
 router.get('/imposition/text-variables', async (req, res) => {
   res.json({ variables: impositionService.getTextVariables() });
 });
+
+// ─── Phase 4.6: order processing orchestrator ─────────────
+//
+// "Process this order" — turns a canonical Sytist order into actual
+// files on disk that the Darkroom watcher will pick up. Handles sibling
+// chunking, specialty routing, atomic per-sub-order writes.
+//
+// Per-order: synchronous, returns full result.
+// Batch:     async, returns jobId for polling.
+
+/**
+ * POST /api/sytist/process/order/:orderId
+ * Body: { generateDivider?: boolean }
+ *
+ * Synchronously processes one order. Returns the full result with every
+ * sub-order's outcome. Auth required (any role).
+ */
+router.post('/process/order/:orderId', async (req, res) => {
+  try {
+    const order = await sytistDb.getOrderById(req.params.orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    const result = await processingService.processOrder(order, {
+      generateDivider: !!(req.body && req.body.generateDivider),
+    });
+    res.json({ success: true, result });
+  } catch (err) {
+    console.error('[sytist/process/order]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/sytist/process/batch
+ * Body: { orderIds: string[], generateDivider?: boolean, generateQrSheet?: boolean }
+ *
+ * Kicks off a batch job and returns a jobId immediately. The job runs
+ * in the background; clients poll /process/job/:jobId for progress.
+ */
+router.post('/process/batch', async (req, res) => {
+  try {
+    const { orderIds, generateDivider, generateQrSheet } = req.body || {};
+    if (!Array.isArray(orderIds) || orderIds.length === 0) {
+      return res.status(400).json({ error: 'orderIds (non-empty array) is required' });
+    }
+    if (orderIds.length > 500) {
+      return res.status(400).json({
+        error: `Batch too large (${orderIds.length}). Max 500 orders per batch.`,
+      });
+    }
+
+    // Phase 4.7 — record who started the batch (for history audit)
+    const username =
+      req.user?.username ||
+      req.user?.displayName ||
+      null;
+
+    const jobId = processingService.startBatchProcess(orderIds, {
+      generateDivider: !!generateDivider,
+      generateQrSheet: !!generateQrSheet,
+      username,
+    });
+    res.json({ success: true, jobId, total: orderIds.length });
+  } catch (err) {
+    console.error('[sytist/process/batch]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/sytist/process/job/:jobId
+ *
+ * Polls a batch job's progress. Returns the current state of the job
+ * including completed count, results so far, and overall status.
+ */
+router.get('/process/job/:jobId', async (req, res) => {
+  try {
+    const job = processingService.getJob(req.params.jobId);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    res.json(job);
+  } catch (err) {
+    console.error('[sytist/process/job]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/sytist/process/job/:jobId/cancel
+ *
+ * Phase 4.7 — request graceful cancellation of an in-flight batch.
+ * The currently-processing order finishes; subsequent orders are
+ * skipped. Already-completed orders aren't rolled back.
+ */
+router.post('/process/job/:jobId/cancel', async (req, res) => {
+  try {
+    const job = processingService.cancelJob(req.params.jobId);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    res.json({ success: true, job });
+  } catch (err) {
+    console.error('[sytist/process/job/cancel]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/sytist/process/history
+ * Query: ?limit=50&offset=0
+ *
+ * Phase 4.7 — paginated list of completed batch jobs. Newest first.
+ */
+router.get('/process/history', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const offset = parseInt(req.query.offset, 10) || 0;
+    const result = await processHistoryService.list({ limit, offset });
+    res.json(result);
+  } catch (err) {
+    console.error('[sytist/process/history]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/sytist/process/history/:jobId
+ *
+ * Returns a specific historical job entry with full per-order summary.
+ */
+router.get('/process/history/:jobId', async (req, res) => {
+  try {
+    const entry = await processHistoryService.get(req.params.jobId);
+    if (!entry) return res.status(404).json({ error: 'History entry not found' });
+    res.json(entry);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * DELETE /api/sytist/process/history (admin)
+ *
+ * Wipes the history. Useful if it gets cluttered with test runs.
+ */
+router.delete(
+  '/process/history',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const result = await processHistoryService.clear();
+      res.json({ success: true, ...result });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+/**
+ * GET  /api/sytist/process/settings
+ * PUT  /api/sytist/process/settings  (admin)
+ *   Body: { autoStatusUpdate?: bool, targetStatusId?: number|null }
+ */
+router.get('/process/settings', async (req, res) => {
+  try {
+    const settings = await processingService.getSettings();
+    res.json(settings);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.put(
+  '/process/settings',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const updated = await processingService.updateSettings(req.body || {});
+      res.json({ success: true, settings: updated });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+// ─── Specialty products CRUD (admin) ──────────────────────
+
+/**
+ * GET /api/sytist/specialty/config
+ *
+ * Returns the full specialty config: basePath, products list,
+ * highlightColors. Used by the Settings page.
+ */
+router.get('/specialty/config', async (req, res) => {
+  try {
+    const config = await specialtyService.getConfig();
+    res.json(config);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * PUT /api/sytist/specialty/base-path
+ * Body: { basePath: string }
+ *
+ * Sets the base path for specialty products. Empty string falls back to
+ * downloadBase + "Specialty" at lookup time.
+ */
+router.put(
+  '/specialty/base-path',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const { basePath } = req.body || {};
+      const updated = await specialtyService.setBasePath(basePath || '');
+      res.json({ success: true, basePath: updated });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+/**
+ * PUT /api/sytist/specialty/highlight-colors
+ * Body: { specialty?: string, quantity?: string }
+ */
+router.put(
+  '/specialty/highlight-colors',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const updated = await specialtyService.setHighlightColors(req.body || {});
+      res.json({ success: true, highlightColors: updated });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+/**
+ * POST /api/sytist/specialty/products
+ * Body: { externalId, productName?, subfolder?, dropShipped? }
+ */
+router.post(
+  '/specialty/products',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const products = await specialtyService.addProduct(req.body || {});
+      res.json({ success: true, products });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+router.put(
+  '/specialty/products/:externalId',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const updated = await specialtyService.updateProduct(
+        req.params.externalId,
+        req.body || {}
+      );
+      res.json({ success: true, product: updated });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+router.delete(
+  '/specialty/products/:externalId',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const products = await specialtyService.deleteProduct(req.params.externalId);
+      res.json({ success: true, products });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
 
 module.exports = router;
