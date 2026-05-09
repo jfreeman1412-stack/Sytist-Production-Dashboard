@@ -5,6 +5,8 @@ const express = require('express');
 const router = express.Router();
 
 const sytistDb = require('../services/sytistDbService');
+const pathsService = require('../services/pathsService');
+const folderSortService = require('../services/folderSortService');
 const { requireAuth, requireRole } = require('../middleware/auth');
 
 router.use(requireAuth);
@@ -319,5 +321,107 @@ router.put(
     }
   }
 );
+
+// ─── Phase 4.1: paths + folder sort ────────────────────────
+//
+// Path resolution and folder-sort configuration. NO file writes happen here —
+// these endpoints only compute where files WOULD land for a given order. The
+// actual writes come in 4.2+ once we've verified the resolved paths look
+// correct against real orders.
+
+/**
+ * GET /api/sytist/paths/config
+ *
+ * Returns the current paths + folder-sort config snapshot. Used by an admin
+ * settings panel and as a sanity check ("which mode am I in right now?").
+ */
+router.get('/paths/config', async (req, res) => {
+  try {
+    const sortLevels = await folderSortService.getSortLevels();
+    res.json({
+      paths: pathsService.describe(),
+      folderSort: {
+        currentLevels: sortLevels,
+        availableOptions: folderSortService.getSortOptions(),
+      },
+    });
+  } catch (err) {
+    console.error('[sytist/paths/config]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * PUT /api/sytist/paths/folder-sort
+ * Body: { sortLevels: ["gallery", "sub_gallery"] }
+ *
+ * Updates the folder-sort config. Admin only — operators shouldn't be
+ * changing where files land mid-shift.
+ */
+router.put(
+  '/paths/folder-sort',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const { sortLevels } = req.body || {};
+      if (!Array.isArray(sortLevels)) {
+        return res.status(400).json({
+          error: 'Request body must include { sortLevels: string[] }',
+        });
+      }
+      const updated = await folderSortService.setSortLevels(sortLevels);
+      res.json({ success: true, sortLevels: updated });
+    } catch (err) {
+      console.error('[sytist/paths/folder-sort]', err);
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+/**
+ * GET /api/sytist/paths/preview/:orderId
+ *
+ * Returns where files WOULD land for the given order, without writing
+ * anything. Pulls the canonical order, asks folderSortService for the
+ * segments, then asks pathsService to compose them with the base templates.
+ *
+ * Response shape (excerpt):
+ *   {
+ *     mode: "test",
+ *     orderId: "110855",
+ *     orderDate: "2025-11-12 09:14:22",
+ *     workflow: "ship_to_home",
+ *     sortLevels: ["no_sort"],
+ *     sortSegments: [],
+ *     paths: {
+ *       downloadBase: {
+ *         template: "C:\\Users\\Sportsline\\Downloads\\sytist-dashboard-test-output\\{date}",
+ *         base:     "C:\\Users\\Sportsline\\Downloads\\sytist-dashboard-test-output\\2025-11-12",
+ *         full:     "C:\\Users\\Sportsline\\Downloads\\sytist-dashboard-test-output\\2025-11-12"
+ *       },
+ *       darkroomTxtBase:     { ... },
+ *       packingSlipBase:     { ... },
+ *       impositionBase:      { ... },
+ *       darkroomTemplateBase: { ... }
+ *     }
+ *   }
+ */
+router.get('/paths/preview/:orderId', async (req, res) => {
+  try {
+    const order = await sytistDb.getOrderById(req.params.orderId);
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const sortLevels = await folderSortService.getSortLevels();
+    const sortSegments = folderSortService.buildOrderPathSync(order, sortLevels);
+    const preview = pathsService.buildPreview(order, sortSegments, sortLevels);
+
+    res.json(preview);
+  } catch (err) {
+    console.error('[sytist/paths/preview]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 module.exports = router;

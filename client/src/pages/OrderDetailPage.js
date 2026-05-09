@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import api from '../services/api';
 
@@ -136,6 +136,8 @@ export default function OrderDetailPage() {
       <TotalsBlock order={order} />
 
       <NotesBlocks order={order} />
+
+      <OutputPathsBlock orderId={order.orderId} />
     </div>
   );
 }
@@ -660,6 +662,230 @@ function NotesBlocks({ order }) {
         </Card>
       )}
     </>
+  );
+}
+
+// ──────────────────────────────────────────────────────────
+// Output paths preview (Phase 4.1)
+// ──────────────────────────────────────────────────────────
+//
+// Diagnostic block that asks the server "where would production files for
+// this order land?" without writing anything. Collapsed by default — it's
+// meant for verifying configuration during the Phase 4 rollout, not for
+// daily operator use.
+
+function OutputPathsBlock({ orderId }) {
+  const [open, setOpen] = useState(false);
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  // Guard ref so React 18 StrictMode's double-invoke of effects doesn't fire
+  // two parallel fetches (whose cleanup-cancel flags race and leave the UI
+  // stuck on "Resolving paths…"). Tracks whether a fetch is in-flight or
+  // already completed for the current orderId.
+  const fetchedRef = useRef({ orderId: null, status: 'idle' });
+
+  // Reset when the order changes — a different order needs a new fetch.
+  useEffect(() => {
+    fetchedRef.current = { orderId, status: 'idle' };
+    setData(null);
+    setError(null);
+    setLoading(false);
+  }, [orderId]);
+
+  useEffect(() => {
+    if (!open) return;
+
+    const ref = fetchedRef.current;
+    // Skip if we've already fetched (or are mid-flight) for this orderId.
+    if (ref.orderId === orderId && ref.status !== 'idle') return;
+
+    fetchedRef.current = { orderId, status: 'loading' };
+    setLoading(true);
+    setError(null);
+
+    api
+      .get(`/api/sytist/paths/preview/${orderId}`)
+      .then((d) => {
+        // Drop the response if the user navigated to a different order
+        // mid-flight; the orderId-effect above will have reset things.
+        if (fetchedRef.current.orderId !== orderId) return;
+        fetchedRef.current = { orderId, status: 'done' };
+        setData(d);
+        setLoading(false);
+      })
+      .catch((err) => {
+        if (fetchedRef.current.orderId !== orderId) return;
+        fetchedRef.current = { orderId, status: 'error' };
+        setError(err.message);
+        setLoading(false);
+      });
+  }, [open, orderId]);
+
+  return (
+    <Card
+      title={
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span>Output paths</span>
+          {data?.mode && (
+            <span
+              style={{
+                fontSize: 10,
+                fontWeight: 700,
+                padding: '2px 8px',
+                borderRadius: 10,
+                background:
+                  data.mode === 'production'
+                    ? 'rgba(76,175,80,0.15)'
+                    : 'rgba(224,179,65,0.15)',
+                color: data.mode === 'production' ? '#4caf50' : '#e0b341',
+                border: `1px solid ${
+                  data.mode === 'production'
+                    ? 'rgba(76,175,80,0.4)'
+                    : 'rgba(224,179,65,0.4)'
+                }`,
+                textTransform: 'uppercase',
+                letterSpacing: 0.5,
+              }}
+            >
+              {data.mode}
+            </span>
+          )}
+        </div>
+      }
+    >
+      <button
+        onClick={() => setOpen((v) => !v)}
+        style={{
+          background: 'transparent',
+          border: '1px solid var(--border-color)',
+          color: 'var(--text-secondary)',
+          padding: '6px 12px',
+          borderRadius: 6,
+          fontSize: 12,
+          cursor: 'pointer',
+          fontFamily: 'inherit',
+        }}
+      >
+        {open ? 'Hide' : 'Show'} resolved paths
+      </button>
+      <div
+        style={{
+          marginTop: 8,
+          fontSize: 11,
+          color: 'var(--text-muted)',
+        }}
+      >
+        Preview only — no files are written.
+      </div>
+
+      {open && loading && (
+        <div style={{ marginTop: 12, fontSize: 12, color: 'var(--text-muted)' }}>
+          Resolving paths…
+        </div>
+      )}
+
+      {open && error && (
+        <div
+          style={{
+            marginTop: 12,
+            padding: 10,
+            background: 'rgba(220,53,69,0.1)',
+            border: '1px solid rgba(220,53,69,0.3)',
+            borderRadius: 6,
+            color: '#dc3545',
+            fontSize: 12,
+          }}
+        >
+          {error}
+        </div>
+      )}
+
+      {open && data && !loading && !error && (
+        <div style={{ marginTop: 16 }}>
+          <div
+            style={{
+              fontSize: 11,
+              color: 'var(--text-muted)',
+              marginBottom: 12,
+              display: 'flex',
+              gap: 16,
+              flexWrap: 'wrap',
+            }}
+          >
+            <span>
+              <strong>Workflow:</strong>{' '}
+              <span style={{ fontFamily: 'var(--font-mono, monospace)' }}>
+                {data.workflow || '—'}
+              </span>
+            </span>
+            <span>
+              <strong>Sort levels:</strong>{' '}
+              <span style={{ fontFamily: 'var(--font-mono, monospace)' }}>
+                {(data.sortLevels || []).join(' › ') || 'none'}
+              </span>
+            </span>
+            {data.sortSegments && data.sortSegments.length > 0 && (
+              <span>
+                <strong>Resolved segments:</strong>{' '}
+                <span style={{ fontFamily: 'var(--font-mono, monospace)' }}>
+                  {data.sortSegments.join(' \\ ')}
+                </span>
+              </span>
+            )}
+          </div>
+
+          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <tbody>
+              {Object.entries(data.paths || {}).map(([key, info]) => (
+                <tr
+                  key={key}
+                  style={{ borderBottom: '1px solid var(--border-color)' }}
+                >
+                  <td
+                    style={{
+                      padding: '8px 12px 8px 0',
+                      width: 180,
+                      verticalAlign: 'top',
+                      fontSize: 12,
+                      color: 'var(--text-secondary)',
+                      fontWeight: 600,
+                    }}
+                  >
+                    {key}
+                  </td>
+                  <td
+                    style={{
+                      padding: '8px 0',
+                      fontFamily: 'var(--font-mono, monospace)',
+                      fontSize: 11,
+                      color: 'var(--text-primary)',
+                      wordBreak: 'break-all',
+                    }}
+                  >
+                    {info.full || (
+                      <span style={{ color: 'var(--text-muted)' }}>—</span>
+                    )}
+                    {info.template && info.template !== info.full && (
+                      <div
+                        style={{
+                          marginTop: 4,
+                          fontSize: 10,
+                          color: 'var(--text-muted)',
+                        }}
+                      >
+                        template: {info.template}
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Card>
   );
 }
 
