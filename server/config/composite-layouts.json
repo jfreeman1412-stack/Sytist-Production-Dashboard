@@ -1,0 +1,96 @@
+{
+  "layouts": [
+    {
+      "id": "memory-mate-5x7-v1",
+      "name": "Memory Mate 5×7 (default)",
+      "sheetWidth": 5,
+      "sheetHeight": 7,
+      "dpi": 300,
+      "backgroundColor": "#ffffff",
+      "variants": {
+        "vertical": {
+          "slots": [
+            {
+              "kind": "logo",
+              "x": 0.25,
+              "y": 0.25,
+              "w": 1,
+              "h": 1,
+              "fit": "contain"
+            },
+            {
+              "kind": "playerPhoto",
+              "x": 1.5,
+              "y": 0.25,
+              "w": 3.25,
+              "h": 4,
+              "fit": "cover"
+            },
+            {
+              "kind": "teamPhoto",
+              "x": 0.25,
+              "y": 4.5,
+              "w": 4.5,
+              "h": 1.75,
+              "fit": "cover"
+            },
+            {
+              "kind": "text",
+              "x": 0.25,
+              "y": 6.4,
+              "w": 4.5,
+              "h": 0.4,
+              "text": "{subject.athleteName}",
+              "fontSize": 24,
+              "fontFamily": "Arial",
+              "color": "#000000",
+              "align": "center",
+              "weight": "bold"
+            }
+          ]
+        },
+        "horizontal": {
+          "slots": [
+            {
+              "kind": "logo",
+              "x": 0.25,
+              "y": 0.25,
+              "w": 1,
+              "h": 1,
+              "fit": "contain"
+            },
+            {
+              "kind": "playerPhoto",
+              "x": 0.25,
+              "y": 1.5,
+              "w": 4.5,
+              "h": 3,
+              "fit": "cover"
+            },
+            {
+              "kind": "teamPhoto",
+              "x": 0.25,
+              "y": 4.75,
+              "w": 4.5,
+              "h": 1.5,
+              "fit": "cover"
+            },
+            {
+              "kind": "text",
+              "x": 0.25,
+              "y": 6.4,
+              "w": 4.5,
+              "h": 0.4,
+              "text": "{subject.athleteName}",
+              "fontSize": 24,
+              "fontFamily": "Arial",
+              "color": "#000000",
+              "align": "center",
+              "weight": "bold"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

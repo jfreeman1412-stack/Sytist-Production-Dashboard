@@ -62,6 +62,9 @@ const teamDividerService = require('./teamDividerService');
 const impositionService = require('./impositionService');
 const specialtyService = require('./specialtyService');
 const qrcodeService = require('./qrcodeService');
+const compositeService = require('./compositeService');
+const teamPhotoService = require('./teamPhotoService');
+const galleryAssetsService = require('./galleryAssetsService');
 const sytistDb = require('./sytistDbService');
 
 const SETTINGS_PATH = path.join(
@@ -520,14 +523,218 @@ class ProcessingService {
       }
     }
 
+    // ─── Step 1.5 (Phase 8b): composite rendering ──────
+    // For SKUs mapped to a composite layout, build the multi-image
+    // composite (player + team photo + logo + text) and write it
+    // alongside the player photo. Two outcomes per line item:
+    //   - composite mapping has chainToImposition: true → replace
+    //     downloaded.path with the composite output so Step 2's
+    //     imposition uses the composite as its source. Used for
+    //     products like "memory mate magnet sheet" (composite + tile).
+    //   - chainToImposition: false (or unset) → composite output IS
+    //     the final, mark cartId in skipImposition set so Step 2
+    //     doesn't touch it.
+    //
+    // Failures fall back to placeholders — the orchestrator continues
+    // rather than blocking the whole sub-order. Operator sees warnings
+    // in the result UI.
+    const skipImpositionCartIds = new Set();
+    for (const li of sub.lineItems) {
+      const downloaded = photosByCartId[li.cartId];
+      if (!downloaded) continue;
+
+      let mapping;
+      try {
+        mapping = await compositeService.findMapping(li.sku);
+      } catch (err) {
+        subResult.warnings.push({
+          type: 'composite_mapping_error',
+          cartId: li.cartId,
+          message: err.message,
+        });
+        continue;
+      }
+      if (!mapping) continue; // no composite mapping = use default flow
+
+      let layout;
+      try {
+        layout = await compositeService.getLayout(mapping.layoutId);
+      } catch {
+        layout = null;
+      }
+      if (!layout) {
+        subResult.warnings.push({
+          type: 'composite_layout_missing',
+          cartId: li.cartId,
+          message: `Composite mapping points at layout "${mapping.layoutId}" which doesn't exist`,
+        });
+        continue;
+      }
+
+      try {
+        // Read the downloaded player photo from disk (it's already the
+        // S3 fetch from Step 1, no need to re-download)
+        const playerBuffer = await fsp.readFile(downloaded.path);
+
+        // Resolve team photo via teamPhotoService
+        let teamBuffer = null;
+        let teamLookup = null;
+        if (li.subGalleryId) {
+          teamLookup = await teamPhotoService.findTeamPhoto(li.subGalleryId);
+          if (teamLookup.found && teamLookup.photo.fullUrl) {
+            try {
+              const tpResp = await fetch(teamLookup.photo.fullUrl);
+              if (tpResp.ok) {
+                teamBuffer = Buffer.from(await tpResp.arrayBuffer());
+              } else {
+                subResult.warnings.push({
+                  type: 'team_photo_fetch_failed',
+                  cartId: li.cartId,
+                  message: `HTTP ${tpResp.status} fetching team photo`,
+                });
+              }
+            } catch (err) {
+              subResult.warnings.push({
+                type: 'team_photo_fetch_error',
+                cartId: li.cartId,
+                message: err.message,
+              });
+            }
+          }
+          // Surface team photo lookup warnings (multi-match, portrait etc.)
+          if (teamLookup.warnings) {
+            for (const w of teamLookup.warnings) {
+              subResult.warnings.push({
+                type: 'team_photo_' + (w.type || 'warning'),
+                cartId: li.cartId,
+                message: w.message,
+              });
+            }
+          }
+          if (!teamLookup.found) {
+            subResult.warnings.push({
+              type: 'team_photo_missing',
+              cartId: li.cartId,
+              message: `Team photo not found for sub-gallery ${li.subGalleryId} (rendering placeholder)`,
+            });
+          }
+        }
+
+        // Resolve logo (per gallery — not per sub-gallery)
+        // galleryId lives on each line item (set from cart_pic_date_id)
+        let logoBuffer = null;
+        const galleryId = li.galleryId || order.galleryId || null;
+        if (galleryId) {
+          logoBuffer = await galleryAssetsService.readLogoBuffer(galleryId);
+        }
+        if (!logoBuffer) {
+          subResult.warnings.push({
+            type: 'logo_missing',
+            cartId: li.cartId,
+            message: galleryId
+              ? `No logo uploaded for gallery ${galleryId} (rendering placeholder)`
+              : 'No galleryId on order — cannot resolve logo',
+          });
+        }
+
+        // Pick variant from the player photo's orientation
+        const playerWidth = li.photo?.width || 0;
+        const playerHeight = li.photo?.height || 0;
+        const variant = compositeService.pickVariant(
+          layout,
+          playerWidth,
+          playerHeight
+        );
+
+        // Build tokens from the order
+        const tokens = compositeService.buildTokensFromOrder(order, li);
+
+        const result = await compositeService.buildSheetBuffer({
+          layout,
+          variant,
+          playerPhoto: playerBuffer,
+          teamPhoto: teamBuffer,
+          logo: logoBuffer,
+          tokens,
+        });
+
+        // Write the composite output. Lives next to the player photo.
+        const compositeFilename = this._buildCompositeFilename(
+          order,
+          li,
+          layout
+        );
+        const compositePath = path.win32.join(
+          downloaded.targetDir,
+          compositeFilename
+        );
+        const tmp = compositePath + '.tmp';
+        await fsp.writeFile(tmp, result.buffer);
+        await fsp.rename(tmp, compositePath);
+
+        subResult.composites = subResult.composites || [];
+        subResult.composites.push({
+          cartId: li.cartId,
+          layoutId: layout.id,
+          layoutName: layout.name,
+          variant,
+          path: compositePath,
+          chainToImposition: !!mapping.chainToImposition,
+          teamPhotoFound: !!teamLookup?.found,
+          logoFound: !!logoBuffer,
+        });
+
+        // Surface composite-internal warnings
+        for (const w of result.warnings || []) {
+          subResult.warnings.push({
+            type: 'composite_' + (w.type || 'warning'),
+            cartId: li.cartId,
+            message: w.message,
+          });
+        }
+
+        if (mapping.chainToImposition) {
+          // Composite output becomes the source for imposition.
+          // Replace the player photo at the same path so Step 2
+          // imposition picks up the composite.
+          //
+          // We do this by overwriting the player photo file. Imposition
+          // expects a single source path; rather than threading a "use
+          // this other file" parameter through, we just replace the
+          // file at the existing path.
+          const tmp2 = downloaded.path + '.tmp';
+          await fsp.writeFile(tmp2, result.buffer);
+          await fsp.rename(tmp2, downloaded.path);
+        } else {
+          // Composite is the final. Step 2 should NOT run imposition
+          // on this cartId. Also: the .txt should reference the
+          // composite path, not the original player photo.
+          // We update photosByCartId to point at the composite path
+          // so the .txt-build step picks up the right file.
+          downloaded.path = compositePath;
+          skipImpositionCartIds.add(li.cartId);
+        }
+      } catch (err) {
+        subResult.warnings.push({
+          type: 'composite_render_error',
+          cartId: li.cartId,
+          message: err.message,
+        });
+      }
+    }
+
     // ─── Step 2: imposition in-place on every successfully-downloaded photo
     // composeSheetInPlace is destructive (.tmp + rename), but only fires
     // when there's a rule for the SKU. Items without a rule pass through
     // untouched.
+    //
+    // Phase 8b: cartIds in skipImpositionCartIds are skipped (composite
+    // already produced the final output for them).
     const successfullyImposedCartIds = new Set();
     for (const li of sub.lineItems) {
       const downloaded = photosByCartId[li.cartId];
       if (!downloaded) continue;
+      if (skipImpositionCartIds.has(li.cartId)) continue;
 
       try {
         const ctx = impositionService.buildContext(order, li);
@@ -754,6 +961,24 @@ class ProcessingService {
     // Sanitize
     const safe = String(originalName).replace(/[<>:"/\\|?*\x00-\x1F]/g, '_');
     return `${orderNum}_${cartId}_${safe}`;
+  }
+
+  /**
+   * Phase 8b: composite output filename. Lives next to the player photo
+   * with a "_composite_{layoutId}" infix so it's distinguishable when
+   * an operator browses the output folder. JPG-only since composite
+   * always renders to JPG (compositeService sets quality 95 internally).
+   *
+   * Example:
+   *   order 110855, cartId 12345, layout "memory-mate-5x7-v1" →
+   *     "110855_12345_composite_memory-mate-5x7-v1.jpg"
+   */
+  _buildCompositeFilename(order, lineItem, layout) {
+    const orderNum = order.orderNumber || order.orderId;
+    const cartId = lineItem.cartId;
+    const layoutId = (layout && layout.id) || 'composite';
+    const safeLayoutId = String(layoutId).replace(/[<>:"/\\|?*\x00-\x1F\s]/g, '_');
+    return `${orderNum}_${cartId}_composite_${safeLayoutId}.jpg`;
   }
 
   /**

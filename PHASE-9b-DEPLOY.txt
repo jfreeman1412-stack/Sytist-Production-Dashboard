@@ -1,0 +1,212 @@
+Phase 9b — visual layout designer (full editing)
+
+═══════════════════════════════════════════════════════
+PREREQUISITES
+═══════════════════════════════════════════════════════
+
+Phase 9a MUST be deployed first.
+
+═══════════════════════════════════════════════════════
+NO NEW DEPENDENCIES
+═══════════════════════════════════════════════════════
+
+Deploy:
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-9b.tar.gz --strip-components=1
+  npm run dev
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/routes/sytist.js                            /composite/preview now accepts
+                                                     inline layout for unsaved edits
+  client/src/components/LayoutCanvas.js              Full rewrite — interactive
+  client/src/pages/settings/LayoutDesignerPage.js    Full rewrite — editor
+
+═══════════════════════════════════════════════════════
+WHAT 9b DELIVERS
+═══════════════════════════════════════════════════════
+
+The layout designer is now fully interactive:
+
+DRAG TO MOVE
+  Click and drag any slot to reposition. Snap-to-grid (0.05″)
+  is on by default; toggle off in the canvas footer toolbar
+  for free-form positioning. Slots are constrained to the
+  sheet boundary.
+
+RESIZE BY HANDLES
+  Click a slot to select it. Eight resize handles appear
+  (4 corners + 4 edges). Drag any handle to resize. Corners
+  resize both dimensions; edges resize one. Slots can't go
+  smaller than 0.1″ × 0.1″.
+
+PROPERTY PANEL EDITING
+  All slot properties are editable on the right side panel:
+    - Position + size (numeric inputs, syncs with canvas drag)
+    - Kind (player photo / team photo / logo / overlay / text)
+    - Fit mode (for image slots)
+    - Text content + font size + family + color + weight + align
+      (for text slots)
+    - Overlay ID (for overlay slots)
+  When no slot is selected, the panel shows layout-wide
+  settings: name, sheet dimensions, DPI, background color.
+
+ADD AND DELETE SLOTS
+  Bottom-right "Add slot" toolbar: click any slot type to
+  add a new instance. Lands centered at 30% sheet size.
+  Delete the selected slot via "Delete slot" button at the
+  top of the property panel.
+
+VARIANT TABS
+  Switch between vertical and horizontal variants. Each is
+  edited independently (slot positions are per-variant).
+
+LIVE PREVIEW WITH REAL ORDER DATA
+  Canvas footer toolbar has a preview mode picker:
+    - Placeholder (default): gray rectangles for missing photos
+    - Use real order data: enter an orderId + cartId, the
+      backend renders the composite using that order's actual
+      photos. Re-renders 500ms after every layout change.
+      The rendered photos appear AS A BACKDROP behind the slot
+      boxes, so you can position slots over real photos while
+      editing.
+
+SAVE / DISCARD
+  Edits are local until you click "Save". An "● Unsaved
+  changes" indicator appears in the toolbar when the layout
+  differs from saved. "Discard" reverts to last-saved version
+  (with confirmation). Browser warns if you try to close the
+  tab with unsaved changes.
+
+═══════════════════════════════════════════════════════
+NEW SERVER BEHAVIOR
+═══════════════════════════════════════════════════════
+
+POST /api/sytist/composite/preview now accepts an optional
+`layout` field in the request body. When present, the server
+renders against that inline layout instead of looking up the
+saved version. Used by the designer to preview unsaved edits.
+
+The inline layout still has to satisfy the composite layout
+shape (variants object, slot arrays). Bad layouts return 400.
+
+═══════════════════════════════════════════════════════
+HOW TO USE IT
+═══════════════════════════════════════════════════════
+
+1. Settings → Composites → click "Designer" on a layout
+
+2. Try moving the player photo slot:
+   ☐ Click anywhere on the player photo (blue rectangle)
+   ☐ Drag — the slot moves with snapping (release to commit)
+   ☐ "● Unsaved changes" appears at the top
+   ☐ Resize by dragging a corner handle
+   ☐ Numbers in the right panel update as you drag
+
+3. Try property panel editing:
+   ☐ Type a new value in the X field — slot moves on canvas
+   ☐ Change the text slot's font size — text resizes on canvas
+   ☐ Change a text slot's color (e.g. "#ff0000") — text turns red
+
+4. Try adding a slot:
+   ☐ Click "+ Text" in the Add slot toolbar
+   ☐ New text slot appears centered on the sheet, selected
+   ☐ Drag it to position
+   ☐ Edit its text content in the property panel
+
+5. Try the live preview:
+   ☐ Pick a real order with a player photo (note its orderId)
+   ☐ Note one of its cartIds (you can see them in the Composite
+     preview block on the order detail page)
+   ☐ In the canvas footer, switch preview mode to "Use real
+     order data"
+   ☐ Enter the IDs
+   ☐ Wait ~2-4 seconds — the actual composite renders behind
+     the slot boxes
+   ☐ Drag a slot — wait 500ms — the preview re-renders showing
+     the new layout
+
+6. Try save/discard:
+   ☐ Make several edits
+   ☐ Click "Discard" — confirm — layout reverts
+   ☐ Make changes again, click "Save" — green "Saved" message
+   ☐ "Unsaved changes" indicator disappears
+
+7. Try the unsaved-changes guard:
+   ☐ Make a change without saving
+   ☐ Try to navigate away (back button or close tab)
+   ☐ Browser warns you
+   ☐ The "← Back" button also confirms before leaving
+
+═══════════════════════════════════════════════════════
+SAFETY NOTES
+═══════════════════════════════════════════════════════
+
+- Live preview mode hits S3 to fetch real photos. Each render
+  takes 2-4 seconds. The 500ms debounce means rapid drags
+  don't trigger many renders, but ONE render fires shortly
+  after you stop. Don't be alarmed if there's a brief delay.
+
+- The preview backdrop shows the LAST successfully-rendered
+  composite. While a new render is in flight, you'll see the
+  previous render plus the slot boxes. This is intentional —
+  the alternative would be flashing the canvas blank between
+  renders.
+
+- Snap-to-grid only applies during DRAG/RESIZE. Numeric inputs
+  in the property panel accept any value — fine-tuning to
+  1.234″ is fine.
+
+- The 0.1″ minimum slot size is enforced. If you try to resize
+  a slot below that, it stops at 0.1″.
+
+- The sheet boundary constraint is enforced. Slots can't
+  extend past the edge. If you need full-bleed designs, you'd
+  want to make the slot's dimensions exactly match the sheet's.
+
+- "Discard" is destructive — it reverts ALL unsaved changes.
+  The confirm dialog is your safety net.
+
+- The JSON editor (still accessible via Settings → Composites
+  → "JSON" button) remains available for advanced edits the
+  designer doesn't expose. Don't be afraid to use it for
+  one-off cases.
+
+═══════════════════════════════════════════════════════
+KNOWN GAPS — for later phases if needed
+═══════════════════════════════════════════════════════
+
+- UNDO / REDO: not implemented. "Discard" is the only escape
+  for accidental changes since last save.
+
+- KEYBOARD NUDGE: arrow keys don't move selected slots. Use
+  numeric inputs for fine-tuning.
+
+- MULTI-SELECT: can only edit one slot at a time. No bulk
+  operations.
+
+- ALIGNMENT GUIDES: no smart alignment when dragging near
+  another slot's edges.
+
+- COPY/PASTE BETWEEN LAYOUTS: not supported.
+
+- CUSTOM FONT FILES: text uses whatever fonts are installed
+  on the server. Custom fonts (uploaded TTF/OTF files) aren't
+  yet supported.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 4.1-4.7    Production pipeline complete
+✓ 8a/8b      Composite engine end-to-end
+✓ 9a         Visual layout designer (read-only)
+✓ 9b         Visual layout designer (full editing) ← we are here
+
+Memory mate composites are now fully designable through a
+visual UI. The remaining roadmap items (SQLite migration,
+per-order overrides, undo/redo, etc.) are polish or
+infrastructure improvements rather than core capability.

@@ -92,6 +92,8 @@ function Sidebar() {
         <SidebarLink to="imposition" label="Imposition" />
         <SidebarLink to="processing" label="Processing" />
         <SidebarLink to="specialty" label="Specialty" />
+        <SidebarLink to="gallery-assets" label="Gallery Assets" />
+        <SidebarLink to="composites" label="Composites" />
 
         <div
           style={{

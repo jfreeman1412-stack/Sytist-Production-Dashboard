@@ -1127,6 +1127,117 @@ class SytistDbService {
     };
   }
 
+  /**
+   * Phase 8a: locate a team photo for a sub-gallery.
+   *
+   * Used by the composite engine to find the team photo to layer onto
+   * memory mates. The discovery rule is structural — we don't pattern-
+   * match filenames or derive orientation from metadata; we just look
+   * for a photo assigned to the team-photo price list AND linked to the
+   * sub-gallery.
+   *
+   *   ms_blog_photos.bp_pl  = listId       (price list discriminator)
+   *   ms_blog_photos.bp_sub = subGalleryId (which team)
+   *
+   * Returns the same shape as buildPhotoUrls() — { isS3, originalFilename,
+   * width, height, fullUrl, largeUrl, thumbUrl } — or null if no match.
+   *
+   * @param {object} opts
+   * @param {number} opts.subGalleryId  ms_sub_galleries.sub_id
+   * @param {number} opts.listId        ms_photo_products_list.list_id
+   *                                    (default: 268, configurable per
+   *                                    teamPhotoService settings)
+   */
+  /**
+   * Phase 8a-hotfix: list every sub-gallery in a gallery, no order
+   * filter applied.
+   *
+   * Different from getGalleryHierarchy() which filters sub-galleries
+   * to those with paid/open/non-erased orders. The verification UI
+   * needs to look up team photos for sub-galleries that may not have
+   * orders yet (typical at gallery setup time, before customers buy).
+   *
+   * NOT a replacement for getGalleryHierarchy in the orders/dashboard
+   * flow — those should stay filtered. Only the team photo lookup
+   * tester should call this.
+   */
+  async getAllSubGalleries(galleryId) {
+    if (!galleryId || galleryId <= 0) return [];
+    const pool = this.getPool();
+    const [rows] = await pool.query(
+      `
+      SELECT
+        sub_id   AS subGalleryId,
+        sub_name AS subGalleryName
+      FROM ms_sub_galleries
+      WHERE sub_date_id = ?
+      ORDER BY sub_name
+      `,
+      [galleryId]
+    );
+    return rows.map((r) => ({
+      subGalleryId: r.subGalleryId,
+      subGalleryName: r.subGalleryName,
+    }));
+  }
+
+  async findTeamPhoto({ subGalleryId, listId = 268 }) {
+    if (!subGalleryId || subGalleryId <= 0) return null;
+    const pool = this.getPool();
+
+    // Phase 8b: LIMIT 2 (rather than 1) so the caller can detect when
+    // multiple team photos exist for the same sub-gallery. We still
+    // return only the most-recently-added photo (ORDER BY bp_id DESC),
+    // but we surface candidateCount so the caller can warn the operator.
+    // This addresses the legacy data where some old sub-galleries have
+    // multiple photos on the team-photo price list.
+    const [rows] = await pool.query(
+      `
+      SELECT
+        p.pic_id,
+        p.pic_org,
+        p.pic_full,
+        p.pic_large,
+        p.pic_th,
+        p.pic_amazon,
+        p.pic_amazon_endpoint,
+        p.pic_bucket,
+        p.pic_bucket_folder,
+        p.pic_width,
+        p.pic_height,
+        bp.bp_blog AS galleryId,
+        bp.bp_sub  AS subGalleryId,
+        bp.bp_id   AS bpId
+      FROM ms_blog_photos bp
+      INNER JOIN ms_photos p ON p.pic_id = bp.bp_pic
+      WHERE bp.bp_pl  = ?
+        AND bp.bp_sub = ?
+      ORDER BY bp.bp_id DESC
+      LIMIT 2
+      `,
+      [listId, subGalleryId]
+    );
+
+    if (rows.length === 0) return null;
+
+    const row = rows[0];
+    const photo = buildPhotoUrls(row);
+    if (!photo) return null;
+
+    // Annotate with the IDs we matched on so callers can verify the
+    // lookup hit the row they expected. candidateCount tells the caller
+    // whether multiple matches existed (≥2 means there's a tiebreaker
+    // situation worth surfacing).
+    return {
+      ...photo,
+      photoId: row.pic_id,
+      galleryId: row.galleryId,
+      subGalleryId: row.subGalleryId,
+      bpId: row.bpId,
+      candidateCount: rows.length, // 1 = clean match, 2 = multi-match (we returned newest)
+    };
+  }
+
   async close() {
     if (this.pool) {
       await this.pool.end();

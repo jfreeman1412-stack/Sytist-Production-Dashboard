@@ -1,0 +1,142 @@
+Phase 9a — visual layout designer (read-only)
+
+═══════════════════════════════════════════════════════
+PREREQUISITES
+═══════════════════════════════════════════════════════
+
+Phase 8b MUST be deployed first.
+
+═══════════════════════════════════════════════════════
+NO NEW DEPENDENCIES
+═══════════════════════════════════════════════════════
+
+Deploy:
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-9a.tar.gz --strip-components=1
+  npm run dev
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+NEW UI:
+  client/src/components/LayoutCanvas.js              SVG canvas component (311 lines)
+  client/src/pages/settings/LayoutDesignerPage.js    Designer page (426 lines)
+
+MODIFIED:
+  client/src/components/AppLayout.js                 + /settings/composites/designer/:layoutId route
+  client/src/pages/settings/CompositesSettings.js    Designer button in layouts table
+
+NO server-side changes. Phase 9a is purely a client-side visualization
+on top of the existing /api/sytist/composite/layouts/:id endpoint.
+
+═══════════════════════════════════════════════════════
+WHAT 9a DELIVERS
+═══════════════════════════════════════════════════════
+
+Visual rendering of composite layouts. Open Settings → Composites →
+click "Designer" on any layout row to see:
+
+  Left side: SVG canvas with the layout rendered to scale
+    - Sheet outline + background color
+    - Slots positioned in their actual locations:
+      * Blue rectangles = player photo slots
+      * Red rectangles = team photo slots
+      * Green rectangles = logo slots
+      * Gray rectangles = overlay slots
+      * Dashed boxes with rendered text = text slots
+    - Variant tabs (vertical / horizontal) with slot counts
+    - Click any slot to select it (blue highlight)
+    - Click background to deselect
+
+  Right side: property panel
+    - When a slot is selected: shows its kind, position (in inches),
+      size, fit mode, font properties (for text slots), raw JSON
+    - When nothing is selected: shows the layout's overall properties
+      (sheet size, DPI, background, variants defined)
+
+  No editing yet — this is read-only. Phase 9b adds drag/resize.
+
+═══════════════════════════════════════════════════════
+WHY READ-ONLY FIRST
+═══════════════════════════════════════════════════════
+
+The visual layout designer is the biggest UI undertaking in the
+project so far (will end up at ~3000 lines once 9b lands). 9a ships
+the foundation — the canvas, the selection model, the property
+panel — without any of the interactive editing complexity.
+
+This split lets you:
+  1. Verify slot rendering is correct (positions, sizes, colors)
+     before any editing features are built on top
+  2. Use the canvas for "I want to see what this layout looks like"
+     even without 9b
+  3. Catch any layout-level rendering bugs in isolation
+
+If something looks wrong in 9a (a slot rendering at the wrong
+position, text overflowing, wrong font), tell me and I'll fix
+before building 9b.
+
+═══════════════════════════════════════════════════════
+USING IT
+═══════════════════════════════════════════════════════
+
+1. Open Settings → Composites
+2. The layouts table now has three buttons per row:
+     - Designer  (new — opens visual canvas)
+     - JSON      (the existing JSON editor, for advanced edits)
+     - Delete    (unchanged)
+3. Click Designer on the seeded "memory-mate-5x7-v1" layout
+4. The canvas shows the layout. Verify:
+     ☐ Sheet is correctly proportioned (5×7 = taller than wide)
+     ☐ Logo box is in the top-left (~1″ × 1″)
+     ☐ Player photo is in the top-right area (large rectangle)
+     ☐ Team photo is across the bottom
+     ☐ Athlete name text is below the team photo, centered
+5. Click the player photo box → property panel switches to its details
+6. Click the canvas background → property panel returns to layout view
+7. Click "Horizontal" variant tab → see the alternate layout
+8. Click "← Back to layouts" to return to the layouts table
+
+═══════════════════════════════════════════════════════
+SAFETY NOTES
+═══════════════════════════════════════════════════════
+
+- 9a is purely a client-side visualization. It cannot break anything
+  on the server side. Your composite rendering pipeline (8b) is
+  unchanged.
+
+- The JSON editor still exists. If you find anything wrong with the
+  canvas rendering, you can drop to JSON to inspect what's actually
+  saved.
+
+- Sample tokens for text slots are hardcoded ("Sample Player",
+  "Coach Smith", etc.). Phase 9b will add the option to use a real
+  order's data for the preview.
+
+═══════════════════════════════════════════════════════
+KNOWN GAPS — addressed in 9b
+═══════════════════════════════════════════════════════
+
+- DRAG-AND-DROP: slots can't be moved by dragging in 9a
+- RESIZE HANDLES: slots can't be resized in 9a
+- PROPERTY EDITING: property panel is read-only in 9a
+- ADD/DELETE SLOTS: no toolbar to add new slots in 9a
+- LIVE PREVIEW WITH REAL ORDER DATA: 9a uses hardcoded samples;
+  9b will let you pick a real order to preview against
+- SAVE BACK TO JSON: nothing to save in 9a since nothing edits
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 4.1-4.7    Production pipeline complete
+✓ 8a         Composite data layer + verification
+✓ 8a-hotfix  Sub-gallery dropdown fix
+✓ 8b         Composite orchestrator integration
+✓ 9a         Visual layout designer (read-only)  ← we are here
+
+NEXT:
+- Phase 9b   Interactive editing (drag, resize, property editing,
+             save back, real-order preview)
+- Phase 5+   SQLite migration (eventually)

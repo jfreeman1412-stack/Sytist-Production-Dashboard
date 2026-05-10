@@ -146,6 +146,8 @@ export default function OrderDetailPage() {
       <PackingSlipBlock orderId={order.orderId} />
 
       <ImpositionBlock order={order} />
+
+      <CompositeBlock order={order} />
     </div>
   );
 }
@@ -2544,3 +2546,306 @@ const errorBoxStyle = {
   color: '#dc3545',
   fontSize: 13,
 };
+
+// ─── Phase 8b: Composite preview ────────────────────────────
+//
+// Per-line-item composite preview. Renders the same engine that runs
+// during processing — useful for spot-checking before processing an
+// order. Only line items that have a composite mapping appear here;
+// items without a mapping are skipped (composite is opt-in per SKU).
+
+function CompositeBlock({ order }) {
+  const [open, setOpen] = useState(false);
+  const [mappings, setMappings] = useState(null);
+
+  // Load mappings once on first expand so we know which line items have
+  // composite SKUs.
+  useEffect(() => {
+    if (!open || mappings !== null) return;
+    api
+      .get('/api/sytist/composite/mappings')
+      .then((r) => setMappings(r.mappings || []))
+      .catch(() => setMappings([]));
+  }, [open, mappings]);
+
+  const candidateLineItems = (order.lineItems || []).filter((li) => {
+    if (!li.photo || !li.photo.fullUrl) return false;
+    const skipFlags = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell'];
+    if (skipFlags.some((f) => li.flags?.[f])) return false;
+    if (!mappings) return true; // before mappings load, show all eligible
+    return mappings.some((m) => String(m.externalId) === String(li.sku));
+  });
+
+  return (
+    <Card title="Composite preview">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        style={{
+          background: 'transparent',
+          border: '1px solid var(--border-color)',
+          color: 'var(--text-secondary)',
+          padding: '6px 12px',
+          borderRadius: 6,
+          fontSize: 12,
+          cursor: 'pointer',
+          fontFamily: 'inherit',
+        }}
+      >
+        {open ? 'Hide' : 'Show'} composites
+      </button>
+      <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-muted)' }}>
+        Renders memory-mate-style composites for SKUs with a composite mapping.
+        Player photo + team photo (auto-resolved from Sytist) + logo (from app
+        config) + text overlays, composed per the layout's slot definitions.
+      </div>
+
+      {open && mappings === null && (
+        <div style={{ marginTop: 12, fontSize: 12, color: 'var(--text-muted)' }}>
+          Loading mappings…
+        </div>
+      )}
+
+      {open && mappings !== null && candidateLineItems.length === 0 && (
+        <div style={{ marginTop: 12, fontSize: 12, color: 'var(--text-muted)' }}>
+          No line items in this order have composite mappings. Set up mappings in
+          Settings → Composites.
+        </div>
+      )}
+
+      {open &&
+        mappings !== null &&
+        candidateLineItems.map((li) => (
+          <CompositeItemRow
+            key={li.cartId}
+            order={order}
+            lineItem={li}
+            mapping={mappings.find(
+              (m) => String(m.externalId) === String(li.sku)
+            )}
+          />
+        ))}
+    </Card>
+  );
+}
+
+function CompositeItemRow({ order, lineItem, mapping }) {
+  const [expanded, setExpanded] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+
+  // Lazily fetch the preview when expanded — composite render is
+  // bandwidth-heavy (downloads player + team photo from S3) so we
+  // don't render until the operator asks.
+  async function loadPreview() {
+    if (loading || result) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const r = await api.post('/api/sytist/composite/preview', {
+        orderId: order.orderId,
+        cartId: lineItem.cartId,
+        layoutId: mapping?.layoutId,
+      });
+      setResult(r);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function toggle() {
+    if (!expanded) loadPreview();
+    setExpanded((v) => !v);
+  }
+
+  return (
+    <div
+      style={{
+        marginTop: 12,
+        padding: 10,
+        background: 'var(--bg-input)',
+        border: '1px solid var(--border-color)',
+        borderRadius: 6,
+      }}
+    >
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+        }}
+      >
+        <div style={{ fontSize: 12 }}>
+          <div style={{ fontWeight: 600 }}>{lineItem.productName}</div>
+          <div style={{ color: 'var(--text-muted)', fontSize: 11 }}>
+            cartId {lineItem.cartId} · SKU {lineItem.sku}
+            {mapping ? (
+              <>
+                {' · '}layout{' '}
+                <code style={{ fontSize: 10 }}>{mapping.layoutId}</code>
+                {mapping.chainToImposition && (
+                  <span
+                    style={{
+                      marginLeft: 6,
+                      padding: '1px 5px',
+                      fontSize: 9,
+                      background: 'rgba(120,120,200,0.2)',
+                      color: '#aab',
+                      borderRadius: 3,
+                      textTransform: 'uppercase',
+                      fontWeight: 600,
+                      letterSpacing: 0.5,
+                    }}
+                  >
+                    chain
+                  </span>
+                )}
+              </>
+            ) : null}
+          </div>
+        </div>
+        <button
+          onClick={toggle}
+          style={{
+            background: 'transparent',
+            border: '1px solid var(--border-color)',
+            color: 'var(--text-secondary)',
+            padding: '4px 10px',
+            borderRadius: 4,
+            fontSize: 11,
+            cursor: 'pointer',
+            fontFamily: 'inherit',
+          }}
+        >
+          {expanded ? 'Hide' : 'Preview'}
+        </button>
+      </div>
+
+      {expanded && loading && (
+        <div
+          style={{ marginTop: 10, fontSize: 11, color: 'var(--text-muted)' }}
+        >
+          Rendering composite…
+        </div>
+      )}
+
+      {expanded && error && (
+        <div
+          style={{
+            marginTop: 10,
+            padding: 8,
+            background: 'rgba(220,53,69,0.08)',
+            border: '1px solid rgba(220,53,69,0.3)',
+            borderRadius: 4,
+            color: '#dc3545',
+            fontSize: 11,
+          }}
+        >
+          {error}
+        </div>
+      )}
+
+      {expanded && result && (
+        <div
+          style={{
+            marginTop: 10,
+            display: 'grid',
+            gridTemplateColumns: 'auto 1fr',
+            gap: 12,
+          }}
+        >
+          <img
+            src={`data:image/jpeg;base64,${result.jpegBase64}`}
+            alt="Composite preview"
+            style={{
+              maxWidth: 280,
+              maxHeight: 360,
+              border: '1px solid var(--border-color)',
+              borderRadius: 4,
+              background: '#fff',
+            }}
+          />
+          <div style={{ fontSize: 11, lineHeight: 1.6 }}>
+            <DetailLine label="Variant" value={result.variant} />
+            <DetailLine
+              label="Output"
+              value={
+                result.dimensions
+                  ? `${result.dimensions.width} × ${result.dimensions.height} px`
+                  : '—'
+              }
+            />
+            <DetailLine
+              label="Team photo"
+              value={
+                result.teamPhotoFound ? (
+                  <span style={{ color: '#4caf50' }}>✓ Found</span>
+                ) : (
+                  <span style={{ color: '#e0b341' }}>
+                    ⚠ Missing ({result.teamPhotoReason})
+                  </span>
+                )
+              }
+            />
+            <DetailLine
+              label="Logo"
+              value={
+                result.logoFound ? (
+                  <span style={{ color: '#4caf50' }}>✓ Found</span>
+                ) : (
+                  <span style={{ color: '#e0b341' }}>⚠ Missing</span>
+                )
+              }
+            />
+            <DetailLine
+              label="Render bytes"
+              value={result.sizeBytes ? `${(result.sizeBytes / 1024).toFixed(1)} KB` : '—'}
+            />
+
+            {result.warnings && result.warnings.length > 0 && (
+              <div
+                style={{
+                  marginTop: 8,
+                  padding: 6,
+                  background: 'rgba(224,179,65,0.08)',
+                  border: '1px solid rgba(224,179,65,0.3)',
+                  borderRadius: 4,
+                }}
+              >
+                {result.warnings.map((w, i) => (
+                  <div
+                    key={i}
+                    style={{
+                      fontSize: 10,
+                      color: '#e0b341',
+                      marginBottom: 1,
+                    }}
+                  >
+                    ⚠ {w.message || JSON.stringify(w)}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DetailLine({ label, value }) {
+  return (
+    <div
+      style={{
+        display: 'grid',
+        gridTemplateColumns: '90px 1fr',
+        marginBottom: 2,
+      }}
+    >
+      <span style={{ color: 'var(--text-muted)' }}>{label}:</span>
+      <span>{value}</span>
+    </div>
+  );
+}

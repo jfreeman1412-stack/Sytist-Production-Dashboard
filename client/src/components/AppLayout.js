@@ -13,6 +13,9 @@ import ImpositionSettings from '../pages/settings/ImpositionSettings';
 import ProcessingSettings from '../pages/settings/ProcessingSettings';
 import SpecialtySettings from '../pages/settings/SpecialtySettings';
 import ProcessHistoryPage from '../pages/settings/ProcessHistoryPage';
+import GalleryAssetsSettings from '../pages/settings/GalleryAssetsSettings';
+import CompositesSettings from '../pages/settings/CompositesSettings';
+import LayoutDesignerPage from '../pages/settings/LayoutDesignerPage';
 
 /**
  * App shell shown to authenticated users.
@@ -89,6 +92,12 @@ export default function AppLayout({ user, onLogout }) {
             <Route path="imposition" element={<ImpositionSettings />} />
             <Route path="processing" element={<ProcessingSettings />} />
             <Route path="specialty" element={<SpecialtySettings />} />
+            <Route path="gallery-assets" element={<GalleryAssetsSettings />} />
+            <Route path="composites" element={<CompositesSettings />} />
+            <Route
+              path="composites/designer/:layoutId"
+              element={<LayoutDesignerPage />}
+            />
             <Route path="process-history" element={<ProcessHistoryPage />} />
           </Route>
 

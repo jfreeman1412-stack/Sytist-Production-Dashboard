@@ -1,0 +1,202 @@
+Phase 8a — composite engine (data layer + verification)
+
+═══════════════════════════════════════════════════════
+NO NEW DEPENDENCIES — `npm install` NOT REQUIRED
+═══════════════════════════════════════════════════════
+
+Deploy:
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-8a.tar.gz --strip-components=1
+  npm run dev
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+NEW SERVICES:
+  server/services/teamPhotoService.js          Sytist team photo discovery
+  server/services/galleryAssetsService.js      Logo + overlay registry (app-owned)
+  server/services/compositeService.js          Multi-image renderer with slot-based layout
+
+MODIFIED:
+  server/services/sytistDbService.js           + findTeamPhoto() method
+  server/routes/sytist.js                      + 18 new endpoints
+  client/src/components/AppLayout.js           + GalleryAssetsSettings route
+  client/src/pages/settings/SettingsLayout.js  + Gallery Assets sidebar link
+
+NEW UI:
+  client/src/pages/settings/GalleryAssetsSettings.js
+    - Team Photo Lookup tester (the centerpiece — verify lookup before 8b)
+    - Team Photo settings (configurable list ID, default 268)
+    - Logo uploader with preview
+
+NEW CONFIG (auto-created on first run):
+  server/config/team-photo-settings.json       { teamPhotoListId: 268, ... }
+  server/config/gallery-assets.json            { galleries: {}, overlays: [] }
+  server/config/composite-layouts.json         Seed memory mate 5x7 layout
+  server/config/composite-mappings.json        Empty (no SKU mappings yet)
+  server/config/gallery-assets/logos/          Empty directory for uploads
+  server/config/gallery-assets/overlays/       Empty directory
+
+═══════════════════════════════════════════════════════
+WHAT 8a IS — AND ISN'T
+═══════════════════════════════════════════════════════
+
+8a delivers the DATA LAYER and VERIFICATION TOOLS for memory-mate
+composites. It does NOT yet wire composites into the order processing
+pipeline.
+
+Specifically:
+  ✓ Team photo discovery via Sytist (price list 268 + sub-gallery match)
+  ✓ Logo upload/registry (logos owned by the app, not the Z: share)
+  ✓ Composite layout schema + CRUD endpoints
+  ✓ Composite preview endpoint (renders for any order, no disk write)
+  ✓ Verification UI for spot-checking team photo lookup
+
+  ✗ Process orchestrator integration — composites NOT yet rendered
+    during order processing
+  ✗ Order detail page composite preview card (deferred to 8b)
+  ✗ Visual layout designer (still JSON editor only — Phase 9)
+
+This split is deliberate. Before wiring composites into the pipeline,
+we need to confirm:
+  1. Team photo discovery returns the RIGHT photos for varied galleries
+  2. Logo upload/preview works as expected
+  3. The default memory mate layout looks right at production scale
+
+═══════════════════════════════════════════════════════
+NEW ENDPOINTS
+═══════════════════════════════════════════════════════
+
+TEAM PHOTOS:
+  GET    /api/sytist/team-photo/settings
+  PUT    /api/sytist/team-photo/settings           (admin)
+  GET    /api/sytist/team-photo/lookup?subGalleryId=X[&listId=Y]
+  POST   /api/sytist/team-photo/cache/clear
+  GET    /api/sytist/team-photo/cache/stats
+
+COMPOSITE LAYOUTS:
+  GET    /api/sytist/composite/layouts
+  GET    /api/sytist/composite/layouts/:id
+  POST   /api/sytist/composite/layouts             (admin)
+  PUT    /api/sytist/composite/layouts/:id         (admin)
+  DELETE /api/sytist/composite/layouts/:id         (admin)
+
+COMPOSITE MAPPINGS:
+  GET    /api/sytist/composite/mappings
+  POST   /api/sytist/composite/mappings            (admin)
+  DELETE /api/sytist/composite/mappings/:externalId (admin)
+
+COMPOSITE PREVIEW:
+  POST   /api/sytist/composite/preview
+    Body: { orderId, cartId, layoutId? }
+    Returns: { ..., jpegBase64 }  for inline rendering in UI
+
+GALLERY ASSETS:
+  GET    /api/sytist/gallery-assets/stats
+  GET    /api/sytist/gallery-assets/logos
+  POST   /api/sytist/gallery-assets/logos/:galleryId  (admin, base64-in-JSON)
+  DELETE /api/sytist/gallery-assets/logos/:galleryId  (admin)
+  GET    /api/sytist/gallery-assets/logos/:galleryId/preview
+  GET    /api/sytist/gallery-assets/overlays
+  POST   /api/sytist/gallery-assets/overlays          (admin, base64-in-JSON)
+  DELETE /api/sytist/gallery-assets/overlays/:id      (admin)
+
+═══════════════════════════════════════════════════════
+VERIFICATION CHECKLIST
+═══════════════════════════════════════════════════════
+
+THIS IS THE WHOLE POINT OF 8a — verify these before moving to 8b.
+
+1. TEAM PHOTO LOOKUP
+
+   Open Settings → Gallery Assets → Team Photo Lookup Tester.
+   For each of these galleries, pick a few sub-galleries and click
+   "Look up":
+
+   ☐ Pick a gallery you know has team photos for every sub-gallery —
+     all sub-galleries should return found=true with thumbnails
+     matching the actual team
+
+   ☐ Pick a sub-gallery where you DIDN'T assign a team photo (rare
+     case — team didn't have enough players) — should return
+     found=false with reason='no_match'
+
+   ☐ Spot-check at least 5 sub-galleries across at least 2 different
+     galleries. The thumbnails should look like team photos, not
+     individual player headshots
+
+   ☐ The "Override list ID" field — try entering 32 (team panos).
+     Different photos should come back. This confirms the list ID
+     filter is doing real work.
+
+   ☐ If any team photo comes back portrait-oriented, you'll see a
+     warning. Composites assume horizontal — confirm whether your
+     team photos are reliably horizontal
+
+2. LOGO UPLOAD
+
+   Settings → Gallery Assets → Gallery Logos.
+
+   ☐ Upload a logo for a real gallery. Preview should appear in the
+     table immediately
+   ☐ Replace the same gallery's logo with a different file. Old file
+     should disappear from disk; preview updates
+   ☐ Delete a logo. Confirm the file is removed from
+     server/config/gallery-assets/logos/
+
+3. COMPOSITE PREVIEW (HTTP only — no UI for this yet)
+
+   Open a browser to a real order with a player photo. Note the orderId
+   and one of its cartIds. Then run this from the server logs or curl:
+
+     POST /api/sytist/composite/preview
+     { "orderId": "110855", "cartId": 12345, "layoutId": "memory-mate-5x7-v1" }
+
+   Response includes a `jpegBase64` field. Decode it (paste into a
+   base64 image viewer) — should show the player photo + team photo +
+   logo (or placeholders) composed onto a 5x7 sheet.
+
+   ☐ Preview renders without errors
+   ☐ Player photo is in the top-right area
+   ☐ Logo (or placeholder) in top-left
+   ☐ Team photo (or placeholder) in bottom strip
+   ☐ Player name renders below team photo
+
+4. SETTINGS PERSISTENCE
+
+   ☐ Change Team Photo List ID, save, reload — value persists
+   ☐ Toggle "Warn on portrait orientation", save, reload — persists
+
+═══════════════════════════════════════════════════════
+WHAT'S NEXT — PHASE 8b
+═══════════════════════════════════════════════════════
+
+After verification confirms 8a is working, Phase 8b will:
+
+  1. Wire composite engine into processingService orchestrator
+  2. SKUs with composite mappings render via composite (not imposition)
+  3. Add composite preview card to order detail pages
+  4. Composite mapping CRUD UI in Settings → Composites
+  5. Composite layouts CRUD UI in Settings → Composites (JSON editor;
+     visual designer still deferred to Phase 9)
+
+═══════════════════════════════════════════════════════
+SAFETY NOTES
+═══════════════════════════════════════════════════════
+
+- The composite preview endpoint downloads photos from S3 to render.
+  This can be slow for large player photos. Consider this a "test
+  one order at a time" tool, not a batch preview tool.
+
+- Logos are written atomically (.tmp + rename) and uploading a new
+  logo for a gallery DELETES the old file before writing the new
+  one. There's a tiny window where neither exists; safe given that
+  composite rendering happens at processing time, not concurrent
+  with uploads.
+
+- If gallery-assets/logos/ is included in your tarball backup
+  workflow, your logos will travel with the dashboard. Recommended.
+
+- Deleting a logo doesn't unmap it from any composite renders that
+  may already be in flight. Always delete during a quiet period.

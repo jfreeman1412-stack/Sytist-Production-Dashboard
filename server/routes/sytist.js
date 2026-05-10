@@ -14,6 +14,9 @@ const impositionService = require('../services/impositionService');
 const processingService = require('../services/processingService');
 const processHistoryService = require('../services/processHistoryService');
 const specialtyService = require('../services/specialtyService');
+const teamPhotoService = require('../services/teamPhotoService');
+const galleryAssetsService = require('../services/galleryAssetsService');
+const compositeService = require('../services/compositeService');
 const { requireAuth, requireRole } = require('../middleware/auth');
 
 router.use(requireAuth);
@@ -1688,6 +1691,520 @@ router.delete(
     try {
       const products = await specialtyService.deleteProduct(req.params.externalId);
       res.json({ success: true, products });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+// ─── Phase 8a: composite engine (verification phase) ─────
+//
+// 8a ships the data layer + verification UI. The orchestrator does NOT
+// yet route SKUs through compositeService — that's 8b after we've
+// confirmed the team photo discovery and asset management work right.
+//
+// Endpoints below cover:
+//   - team photo settings (the listId)
+//   - team photo lookup (verification — "what would you find for this team?")
+//   - composite layouts CRUD
+//   - composite mappings CRUD
+//   - composite preview (render a sample for any order, no disk write)
+//   - gallery assets CRUD (logo upload via base64, list, delete)
+
+// ─── Team photo settings ─────────────────────────────────
+
+router.get('/team-photo/settings', async (req, res) => {
+  try {
+    res.json(await teamPhotoService.getSettings());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.put(
+  '/team-photo/settings',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const updated = await teamPhotoService.updateSettings(req.body || {});
+      res.json({ success: true, settings: updated });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+/**
+ * GET /api/sytist/galleries/:galleryId/sub-galleries
+ *
+ * Phase 8a-hotfix: returns ALL sub-galleries for a gallery, no order
+ * filter. Used by the team photo lookup tester so verification works
+ * for galleries that haven't had orders yet.
+ */
+router.get('/galleries/:galleryId/sub-galleries', async (req, res) => {
+  try {
+    const galleryId = parseInt(req.params.galleryId, 10);
+    if (!galleryId || galleryId <= 0) {
+      return res.status(400).json({ error: 'galleryId must be a positive integer' });
+    }
+    const subGalleries = await sytistDb.getAllSubGalleries(galleryId);
+    res.json({ galleryId, subGalleries });
+  } catch (err) {
+    console.error('[sytist/galleries/:id/sub-galleries]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/sytist/team-photo/lookup?subGalleryId=44384
+ *
+ * Verification endpoint: returns what the team photo discovery would
+ * find for a given sub-gallery, without doing anything else. Used by
+ * the Settings UI's spot-check tool.
+ */
+router.get('/team-photo/lookup', async (req, res) => {
+  try {
+    const subGalleryId = parseInt(req.query.subGalleryId, 10);
+    const listId = req.query.listId
+      ? parseInt(req.query.listId, 10)
+      : undefined;
+    if (!subGalleryId || subGalleryId <= 0) {
+      return res
+        .status(400)
+        .json({ error: 'subGalleryId is required (positive integer)' });
+    }
+    const result = await teamPhotoService.findTeamPhoto(subGalleryId, {
+      listId,
+    });
+    res.json(result);
+  } catch (err) {
+    console.error('[sytist/team-photo/lookup]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/team-photo/cache/clear', async (req, res) => {
+  res.json(teamPhotoService.clearCache());
+});
+
+router.get('/team-photo/cache/stats', async (req, res) => {
+  res.json(teamPhotoService.getCacheStats());
+});
+
+// ─── Composite layouts CRUD ──────────────────────────────
+
+router.get('/composite/layouts', async (req, res) => {
+  try {
+    const layouts = await compositeService.listLayouts();
+    res.json({ layouts });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/composite/layouts/:id', async (req, res) => {
+  try {
+    const layout = await compositeService.getLayout(req.params.id);
+    if (!layout) return res.status(404).json({ error: 'Layout not found' });
+    res.json(layout);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post(
+  '/composite/layouts',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const layout = await compositeService.addLayout(req.body || {});
+      res.json({ success: true, layout });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+router.put(
+  '/composite/layouts/:id',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const layout = await compositeService.updateLayout(
+        req.params.id,
+        req.body || {}
+      );
+      res.json({ success: true, layout });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+router.delete(
+  '/composite/layouts/:id',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const result = await compositeService.deleteLayout(req.params.id);
+      res.json({ success: true, ...result });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+// ─── Composite mappings CRUD ────────────────────────────
+
+router.get('/composite/mappings', async (req, res) => {
+  try {
+    const mappings = await compositeService.listMappings();
+    res.json({ mappings });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post(
+  '/composite/mappings',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const mapping = await compositeService.addMapping(req.body || {});
+      res.json({ success: true, mapping });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+router.put(
+  '/composite/mappings/:externalId',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const updated = await compositeService.updateMapping(
+        req.params.externalId,
+        req.body || {}
+      );
+      res.json({ success: true, mapping: updated });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+router.delete(
+  '/composite/mappings/:externalId',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const result = await compositeService.deleteMapping(
+        req.params.externalId
+      );
+      res.json({ success: true, ...result });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+/**
+ * POST /api/sytist/composite/preview
+ * Body: { orderId, cartId, layoutId? }
+ *
+ * Renders a composite for a specific line item of a real order, but
+ * does NOT write anything to disk. Used by the verification UI to spot-
+ * check that team photo discovery + asset resolution + variant
+ * selection all work end-to-end. Returns the rendered JPG bytes as
+ * base64.
+ *
+ * If layoutId is omitted, the SKU's mapped layout is used. If no
+ * mapping exists for that SKU, returns 400 — caller must specify
+ * layoutId explicitly.
+ */
+router.post('/composite/preview', async (req, res) => {
+  try {
+    const { orderId, cartId, layoutId, layout: inlineLayout } = req.body || {};
+    if (!orderId || !cartId) {
+      return res.status(400).json({
+        error: 'orderId and cartId are required',
+      });
+    }
+
+    const order = await sytistDb.getOrderById(orderId);
+    if (!order) {
+      return res.status(404).json({ error: `Order ${orderId} not found` });
+    }
+    const lineItem = (order.lineItems || []).find(
+      (li) => String(li.cartId) === String(cartId)
+    );
+    if (!lineItem) {
+      return res.status(404).json({
+        error: `cartId ${cartId} not found in order ${orderId}`,
+      });
+    }
+    if (!lineItem.photo || !lineItem.photo.fullUrl) {
+      return res.status(400).json({
+        error: `Line item has no player photo URL`,
+      });
+    }
+
+    // Resolve which layout to use:
+    //   - inline layout in request body wins (used by Phase 9b designer
+    //     to preview unsaved changes without round-tripping to disk)
+    //   - else layoutId (loaded from disk)
+    //   - else SKU's mapped layout
+    let layout = null;
+    if (inlineLayout) {
+      // Validate the inline layout passes the same checks save() applies.
+      // Reuse compositeService's validator by calling _validateLayout
+      // through a thin wrapper — it throws on bad input.
+      try {
+        // The validator is private but compositeService exposes the
+        // same checks via addLayout/updateLayout. We can't call those
+        // here (they'd persist) so we duplicate the minimal validation:
+        // ensure variants object + at least one slot array.
+        if (!inlineLayout.variants ||
+            (!Array.isArray(inlineLayout.variants.vertical?.slots) &&
+             !Array.isArray(inlineLayout.variants.horizontal?.slots))) {
+          throw new Error('Inline layout must have variants.vertical.slots or variants.horizontal.slots');
+        }
+        layout = inlineLayout;
+      } catch (err) {
+        return res.status(400).json({ error: `Invalid inline layout: ${err.message}` });
+      }
+    } else if (layoutId) {
+      layout = await compositeService.getLayout(layoutId);
+      if (!layout) {
+        return res
+          .status(404)
+          .json({ error: `Layout "${layoutId}" not found` });
+      }
+    } else {
+      const mapping = await compositeService.findMapping(lineItem.sku);
+      if (!mapping) {
+        return res.status(400).json({
+          error: `No composite mapping for SKU "${lineItem.sku}". Pass layoutId explicitly to preview.`,
+        });
+      }
+      layout = await compositeService.getLayout(mapping.layoutId);
+      if (!layout) {
+        return res
+          .status(404)
+          .json({ error: `Mapped layout "${mapping.layoutId}" missing` });
+      }
+    }
+
+    // Fetch player photo
+    const playerResp = await fetch(lineItem.photo.fullUrl);
+    if (!playerResp.ok) {
+      return res.status(502).json({
+        error: `Player photo fetch failed: HTTP ${playerResp.status}`,
+      });
+    }
+    const playerPhoto = Buffer.from(await playerResp.arrayBuffer());
+
+    // Pick variant from player orientation
+    const variant = compositeService.pickVariant(
+      layout,
+      lineItem.photo.width || 0,
+      lineItem.photo.height || 0
+    );
+
+    // Resolve team photo via teamPhotoService
+    const teamLookup = await teamPhotoService.findTeamPhoto(
+      lineItem.subGalleryId
+    );
+    let teamPhotoBuffer = null;
+    if (teamLookup.found && teamLookup.photo.fullUrl) {
+      try {
+        const tpResp = await fetch(teamLookup.photo.fullUrl);
+        if (tpResp.ok) {
+          teamPhotoBuffer = Buffer.from(await tpResp.arrayBuffer());
+        }
+      } catch (err) {
+        console.warn(`[Composite preview] team photo fetch: ${err.message}`);
+      }
+    }
+
+    // Resolve logo via galleryAssetsService — uses the order's gallery
+    // (we look it up by the line item's date_id / parent gallery)
+    let logoBuffer = null;
+    const galleryId = lineItem.galleryId || order.galleryId || null;
+    if (galleryId) {
+      logoBuffer = await galleryAssetsService.readLogoBuffer(galleryId);
+    }
+
+    const tokens = compositeService.buildTokensFromOrder(order, lineItem);
+
+    const result = await compositeService.buildSheetBuffer({
+      layout,
+      variant,
+      playerPhoto,
+      teamPhoto: teamPhotoBuffer,
+      logo: logoBuffer,
+      tokens,
+    });
+
+    res.json({
+      success: true,
+      orderId,
+      cartId,
+      sku: lineItem.sku,
+      layoutId: layout.id,
+      layoutName: layout.name,
+      variant: result.variant,
+      dimensions: result.dimensions,
+      teamPhotoFound: teamLookup.found,
+      teamPhotoReason: teamLookup.found ? null : teamLookup.reason,
+      logoFound: !!logoBuffer,
+      warnings: [
+        ...result.warnings,
+        ...(teamLookup.warnings || []),
+      ],
+      // base64 for inline preview in the UI
+      jpegBase64: result.buffer.toString('base64'),
+      sizeBytes: result.buffer.length,
+    });
+  } catch (err) {
+    console.error('[sytist/composite/preview]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Gallery assets (logos + overlays) ───────────────────
+
+router.get('/gallery-assets/stats', async (req, res) => {
+  try {
+    res.json(await galleryAssetsService.getStats());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/gallery-assets/logos', async (req, res) => {
+  try {
+    res.json({ logos: await galleryAssetsService.listLogos() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/sytist/gallery-assets/logos/:galleryId
+ * Body: { filename: 'logo.png', dataBase64: '...' }
+ *
+ * Upload a logo for a gallery via base64-in-JSON. Avoids needing a
+ * multipart parser; payload is small (logos cap at 10MB).
+ */
+router.post(
+  '/gallery-assets/logos/:galleryId',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const { filename, dataBase64 } = req.body || {};
+      if (!filename || !dataBase64) {
+        return res
+          .status(400)
+          .json({ error: 'filename and dataBase64 are required' });
+      }
+      const fileBuffer = Buffer.from(dataBase64, 'base64');
+      const galleryId = parseInt(req.params.galleryId, 10);
+      const entry = await galleryAssetsService.setLogo({
+        galleryId,
+        fileBuffer,
+        filename,
+        uploadedBy: req.user?.username || null,
+      });
+      res.json({ success: true, logo: entry });
+    } catch (err) {
+      console.error('[sytist/gallery-assets/logos POST]', err);
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+router.delete(
+  '/gallery-assets/logos/:galleryId',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const galleryId = parseInt(req.params.galleryId, 10);
+      const result = await galleryAssetsService.deleteLogo(galleryId);
+      res.json({ success: true, ...result });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+/**
+ * GET /api/sytist/gallery-assets/logos/:galleryId/preview
+ *
+ * Streams the logo bytes back so the Settings UI can show a preview.
+ * 404 if not set.
+ */
+router.get('/gallery-assets/logos/:galleryId/preview', async (req, res) => {
+  try {
+    const galleryId = parseInt(req.params.galleryId, 10);
+    const meta = await galleryAssetsService.getLogo(galleryId);
+    if (!meta) return res.status(404).json({ error: 'No logo set' });
+    const buffer = await galleryAssetsService.readLogoBuffer(galleryId);
+    if (!buffer) return res.status(404).json({ error: 'Logo file missing' });
+    const ext = require('path').extname(meta.logoFilename).toLowerCase();
+    const ct =
+      ext === '.png' ? 'image/png' :
+      ext === '.webp' ? 'image/webp' :
+      'image/jpeg';
+    res.set('Content-Type', ct);
+    res.set('Cache-Control', 'no-store');
+    res.send(buffer);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/gallery-assets/overlays', async (req, res) => {
+  try {
+    res.json({ overlays: await galleryAssetsService.listOverlays() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post(
+  '/gallery-assets/overlays',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const { name, filename, dataBase64 } = req.body || {};
+      if (!name || !filename || !dataBase64) {
+        return res
+          .status(400)
+          .json({ error: 'name, filename, dataBase64 are required' });
+      }
+      const fileBuffer = Buffer.from(dataBase64, 'base64');
+      const entry = await galleryAssetsService.addOverlay({
+        name,
+        fileBuffer,
+        filename,
+        uploadedBy: req.user?.username || null,
+      });
+      res.json({ success: true, overlay: entry });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+router.delete(
+  '/gallery-assets/overlays/:id',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const result = await galleryAssetsService.deleteOverlay(req.params.id);
+      res.json({ success: true, ...result });
     } catch (err) {
       res.status(400).json({ error: err.message });
     }

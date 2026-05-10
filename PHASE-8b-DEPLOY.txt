@@ -1,0 +1,209 @@
+Phase 8b — composite engine orchestrator integration
+
+═══════════════════════════════════════════════════════
+PREREQUISITES
+═══════════════════════════════════════════════════════
+
+- Phase 8a + 8a-hotfix MUST be deployed first
+- Phase 4.7 MUST be deployed first
+- 8a verification (team photo lookup) MUST be confirmed working
+
+═══════════════════════════════════════════════════════
+NO NEW DEPENDENCIES
+═══════════════════════════════════════════════════════
+
+Deploy:
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-8b.tar.gz --strip-components=1
+  npm run dev
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+NEW UI:
+  client/src/pages/settings/CompositesSettings.js       Layouts JSON + Mappings CRUD
+
+MODIFIED:
+  server/services/processingService.js                  + Step 1.5 composite branch
+  server/services/compositeService.js                   + chainToImposition + updateMapping
+  server/services/teamPhotoService.js                   + multiple_team_photos warning
+  server/services/sytistDbService.js                    + LIMIT 2 candidate detection
+  server/routes/sytist.js                               + PUT mapping endpoint
+  client/src/pages/OrderDetailPage.js                   + Composite preview block
+  client/src/components/AppLayout.js                    + composites route
+  client/src/pages/settings/SettingsLayout.js           + Composites sidebar link
+  client/src/pages/settings/GalleryAssetsSettings.js    (carried forward from 8a-hotfix)
+
+═══════════════════════════════════════════════════════
+WHAT 8b DELIVERS
+═══════════════════════════════════════════════════════
+
+The COMPOSITE PIPELINE is now integrated into the orchestrator:
+
+Per line item, when processing an order:
+  1. Player photo downloaded (existing Step 1)
+  2. Phase 8b NEW: if SKU has composite mapping →
+     - resolve team photo via Sytist (price list 268)
+     - resolve logo via app config dir
+     - render composite at chosen variant (vertical/horizontal)
+     - write to {orderNum}_{cartId}_composite_{layoutId}.jpg
+     - if mapping.chainToImposition: composite output replaces the
+       player photo at the original path so Step 2 imposition picks
+       it up (e.g. 4 memory mates tiled onto a magnet sheet)
+     - if NOT chainToImposition: composite IS the final output, the
+       photo path now points at the composite, Step 2 imposition is
+       skipped for this cartId
+  3. Step 2 imposition (existing, unchanged for non-composite SKUs)
+  4. Step 3-onwards (slip, txt) reference the final photo path
+     (which may be a composite, an imposed sheet, or the original)
+
+THREE PIPELINES PER LINE ITEM:
+  A. Imposition only            — current behavior, e.g. 8 wallets
+  B. Composite only             — single finished sheet, e.g. memory mate 5x7
+  C. Composite + imposition     — chained, e.g. memory mate magnet sheet
+
+═══════════════════════════════════════════════════════
+NEW ENDPOINTS
+═══════════════════════════════════════════════════════
+
+  PUT  /api/sytist/composite/mappings/:externalId    (admin)
+       Body: { layoutId?, chainToImposition? }
+       Update an existing mapping in place.
+
+═══════════════════════════════════════════════════════
+NEW UI
+═══════════════════════════════════════════════════════
+
+Settings → Composites:
+  - Layouts: JSON editor for slot definitions (visual designer is
+    Phase 9). Create / edit / delete.
+  - Mappings: SKU → layout, with "Chain to imposition" checkbox.
+    Toggle inline by clicking the checkbox in the table.
+
+Order detail page:
+  - New "Composite preview" card below "Imposition preview".
+  - Per line item with a composite mapping, click "Preview" to render
+    the composite right there. Shows team photo found/missing, logo
+    found/missing, dimensions, all warnings.
+
+═══════════════════════════════════════════════════════
+RECOMMENDED FIRST USE
+═══════════════════════════════════════════════════════
+
+Start in TEST MODE (settings → paths → mode = test) so any composite
+output lands in your sandbox area, not on the production share.
+
+1. CREATE A LAYOUT (or use the seeded default)
+
+   Settings → Composites → "+ New layout"
+   The default `memory-mate-5x7-v1` is already there with slots for
+   logo (top-left), player photo (top-right), team photo (bottom),
+   and player name text. Adjust dimensions to match your actual
+   memory mate print size.
+
+2. UPLOAD A LOGO
+
+   Settings → Gallery Assets → upload a logo for a real gallery.
+
+3. CREATE A MAPPING
+
+   Settings → Composites → Mappings → "+ Add mapping"
+     SKU: the externalId of a memory mate product
+     Layout: pick the one you adjusted
+     Chain to imposition: leave UNCHECKED for a standalone memory
+       mate, CHECK if it's a "memory mate magnet sheet" type product
+
+4. PREVIEW IN THE ORDER DETAIL PAGE
+
+   Open a real order from that gallery that contains the SKU you
+   mapped. Scroll to "Composite preview". Click "Show composites" →
+   click "Preview" on the line item.
+
+   Verify visually:
+     ☐ Player photo in correct slot
+     ☐ Team photo in correct slot (auto-resolved from sub-gallery)
+     ☐ Logo in correct slot (resolved from gallery)
+     ☐ Player name text rendered correctly
+     ☐ Dimensions match your layout
+     ☐ "Variant" matches the player photo's orientation
+
+5. PROCESS THE ORDER (still in test mode)
+
+   Order detail → "Process this order" or batch-select on Orders list.
+   The composite output should land in the test sandbox.
+   Open the rendered JPG manually to spot-check.
+
+6. CHECK THE .TXT FILE
+
+   The Darkroom .txt file should reference the composite output path
+   (not the original player photo) for the composite SKU.
+
+7. ONLY AFTER ALL OF THIS WORKS — switch to production mode.
+
+═══════════════════════════════════════════════════════
+SAFETY NOTES
+═══════════════════════════════════════════════════════
+
+- The composite branch in processingService is fail-soft: missing
+  team photo or logo renders a placeholder + emits a warning, but
+  doesn't fail the whole order. Operator sees warnings in the
+  process result UI. This matches your "placeholder + warning"
+  decision from the design phase.
+
+- chainToImposition replaces the player photo at its original path
+  with the composite output. The original player photo from S3 is
+  thus NOT preserved on disk after composite runs — it's been
+  overwritten with the composite. If you need to preserve the
+  original, set chainToImposition: false.
+
+- Multiple team photos for the same sub-gallery (legacy data — your
+  SQL check showed sub_id=18079 has 8 of them) now produces a
+  warning "multiple_team_photos" but uses the most-recently-added
+  (ORDER BY bp_id DESC). Operator sees the warning and can clean
+  up the legacy assignments at their leisure.
+
+- Composite output filenames include the layout ID:
+    {orderNum}_{cartId}_composite_{layoutId}.jpg
+  This makes it easy to spot in the output folder which SKU's
+  composite is which.
+
+- Specialty SKUs that ALSO have composite mappings: the composite
+  output lands in the specialty folder (not the regular download
+  folder). Specialty routing happens at download time and the
+  composite write uses downloaded.targetDir, so they compose
+  correctly.
+
+═══════════════════════════════════════════════════════
+KNOWN GAPS — addressed in later phases
+═══════════════════════════════════════════════════════
+
+- VISUAL LAYOUT DESIGNER: still JSON-only. Phase 9 will replace
+  the JSON editor with a drag-and-drop canvas.
+
+- TEXT AUTO-FIT: text overlays don't auto-shrink to fit yet. Long
+  player names may overflow their slot. The composite layout schema
+  has an autoFit field; renderer doesn't honor it yet (Phase 9).
+
+- MULTIPLE TEXT SLOTS: layouts support multiple text overlays in
+  the schema, but the seeded default only uses one ({athleteName}).
+  If you want jersey number + year + team, add more text slots to
+  the layout JSON.
+
+- PER-ORDER OVERRIDES: if an operator wants to tweak ONE
+  composite's text or layout for a specific order without changing
+  the template, that's not yet supported. Phase 9.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 4.1-4.7   Production pipeline complete
+✓ 8a        Composite data layer + verification
+✓ 8a-hotfix Sub-gallery dropdown fix
+✓ 8b        Composite orchestrator integration  ← we are here
+
+NEXT (per your roadmap):
+- Phase 5+   SQLite migration (multi-user concurrency)
+- Phase 9    Visual layout designer
+- Phase 10   Per-order render overrides
