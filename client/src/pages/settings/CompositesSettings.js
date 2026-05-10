@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import api from '../../services/api';
 import {
   PageHeader,
@@ -39,6 +39,7 @@ export default function CompositesSettings() {
 // ─── Layouts ──────────────────────────────────────────────
 
 function LayoutsSection() {
+  const navigate = useNavigate();
   const [layouts, setLayouts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -46,7 +47,18 @@ function LayoutsSection() {
   const [draftJson, setDraftJson] = useState('');
   const [draftError, setDraftError] = useState(null);
   const [saving, setSaving] = useState(false);
+
+  // Phase 9b-hotfix: showCreate no longer triggers JSON editor for new
+  // layouts. Instead it shows a small "what should we call it?" dialog,
+  // and on submit the layout is created via API + we navigate to the
+  // designer for it. JSON editor is only reachable via the per-row
+  // "JSON" button on existing layouts (advanced/repair use).
   const [showCreate, setShowCreate] = useState(false);
+  const [draftId, setDraftId] = useState('');
+  const [draftName, setDraftName] = useState('');
+  const [draftWidth, setDraftWidth] = useState('5');
+  const [draftHeight, setDraftHeight] = useState('7');
+  const [creating, setCreating] = useState(false);
 
   async function load() {
     setLoading(true);
@@ -72,27 +84,74 @@ function LayoutsSection() {
   }
 
   function startCreate() {
+    // Pre-fill defaults; operator can adjust before submission. The id
+    // is auto-suggested from the name on the fly.
     setShowCreate(true);
     setEditingId(null);
-    setDraftJson(
-      JSON.stringify(
-        {
-          id: 'new-layout-id',
-          name: 'New Layout',
-          sheetWidth: 5,
-          sheetHeight: 7,
-          dpi: 300,
-          backgroundColor: '#ffffff',
-          variants: {
-            vertical: { slots: [] },
-            horizontal: { slots: [] },
-          },
-        },
-        null,
-        2
-      )
-    );
+    setDraftId('');
+    setDraftName('');
+    setDraftWidth('5');
+    setDraftHeight('7');
     setDraftError(null);
+  }
+
+  function suggestIdFromName(name) {
+    return name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 60);
+  }
+
+  async function handleCreate() {
+    setDraftError(null);
+    const id = (draftId || suggestIdFromName(draftName)).trim();
+    const name = (draftName || '').trim();
+    const width = parseFloat(draftWidth);
+    const height = parseFloat(draftHeight);
+
+    if (!id) {
+      setDraftError('ID is required (auto-suggested from name; you can edit)');
+      return;
+    }
+    if (!name) {
+      setDraftError('Name is required');
+      return;
+    }
+    if (!Number.isFinite(width) || width <= 0) {
+      setDraftError('Sheet width must be a positive number (inches)');
+      return;
+    }
+    if (!Number.isFinite(height) || height <= 0) {
+      setDraftError('Sheet height must be a positive number (inches)');
+      return;
+    }
+
+    const seedLayout = {
+      id,
+      name,
+      sheetWidth: width,
+      sheetHeight: height,
+      dpi: 300,
+      backgroundColor: '#ffffff',
+      // Both variants present but empty so the designer's variant
+      // tabs work immediately. Operator adds slots via the designer.
+      variants: {
+        vertical: { slots: [] },
+        horizontal: { slots: [] },
+      },
+    };
+
+    setCreating(true);
+    try {
+      await api.post('/api/sytist/composite/layouts', seedLayout);
+      // Navigate straight into the designer for the new layout
+      navigate(`/settings/composites/designer/${encodeURIComponent(id)}`);
+    } catch (err) {
+      setDraftError(err.message);
+      setCreating(false);
+    }
+    // Note: no need to clear creating on success because we navigate away
   }
 
   async function handleSave() {
@@ -106,16 +165,14 @@ function LayoutsSection() {
     }
     setSaving(true);
     try {
-      if (showCreate) {
-        await api.post('/api/sytist/composite/layouts', parsed);
-      } else {
-        await api.put(
-          `/api/sytist/composite/layouts/${encodeURIComponent(editingId)}`,
-          parsed
-        );
-      }
+      // After hotfix, create flow goes through handleCreate (dialog +
+      // navigate). handleSave is only reached via the per-row "JSON"
+      // button on existing layouts → always a PUT.
+      await api.put(
+        `/api/sytist/composite/layouts/${encodeURIComponent(editingId)}`,
+        parsed
+      );
       setEditingId(null);
-      setShowCreate(false);
       setDraftJson('');
       await load();
     } catch (err) {
@@ -127,8 +184,16 @@ function LayoutsSection() {
 
   function cancelEdit() {
     setEditingId(null);
-    setShowCreate(false);
     setDraftJson('');
+    setDraftError(null);
+  }
+
+  function cancelCreate() {
+    setShowCreate(false);
+    setDraftId('');
+    setDraftName('');
+    setDraftWidth('5');
+    setDraftHeight('7');
     setDraftError(null);
   }
 
@@ -166,7 +231,116 @@ function LayoutsSection() {
         <div style={{ color: 'var(--text-muted)', fontSize: 13 }}>Loading…</div>
       ) : (
         <>
-          {(editingId || showCreate) && (
+          {showCreate && (
+            <div
+              style={{
+                padding: 12,
+                marginBottom: 16,
+                background: 'var(--bg-input)',
+                border: '1px solid var(--border-color)',
+                borderRadius: 6,
+              }}
+            >
+              <div
+                style={{
+                  fontSize: 12,
+                  fontWeight: 600,
+                  marginBottom: 12,
+                  textTransform: 'uppercase',
+                  letterSpacing: 0.5,
+                  color: 'var(--text-muted)',
+                }}
+              >
+                New layout
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 12 }}>
+                Set the basics here. After saving, you'll go straight to the
+                visual designer to add slots.
+              </div>
+
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: '1fr 1fr',
+                  gap: 8,
+                  marginBottom: 8,
+                }}
+              >
+                <FormRow
+                  label="Name"
+                  hint="Human-readable, shown in the layouts list"
+                >
+                  <TextInput
+                    value={draftName}
+                    onChange={(v) => {
+                      setDraftName(v);
+                      // Auto-suggest id when blank — operator can override
+                      if (!draftId.trim()) {
+                        setDraftId(suggestIdFromName(v));
+                      }
+                    }}
+                    placeholder="Memory Mate 8x10"
+                  />
+                </FormRow>
+                <FormRow
+                  label="ID"
+                  hint="Used in URLs and mappings (lowercase, hyphenated)"
+                >
+                  <TextInput
+                    value={draftId}
+                    onChange={setDraftId}
+                    placeholder="memory-mate-8x10"
+                    monospace
+                  />
+                </FormRow>
+                <FormRow label="Sheet width (in)">
+                  <TextInput
+                    value={draftWidth}
+                    onChange={setDraftWidth}
+                    monospace
+                  />
+                </FormRow>
+                <FormRow label="Sheet height (in)">
+                  <TextInput
+                    value={draftHeight}
+                    onChange={setDraftHeight}
+                    monospace
+                  />
+                </FormRow>
+              </div>
+
+              {draftError && (
+                <div
+                  style={{
+                    marginTop: 8,
+                    padding: 8,
+                    background: 'rgba(220,53,69,0.08)',
+                    border: '1px solid rgba(220,53,69,0.3)',
+                    borderRadius: 4,
+                    color: '#dc3545',
+                    fontSize: 12,
+                  }}
+                >
+                  {draftError}
+                </div>
+              )}
+
+              <div style={{ marginTop: 12, display: 'flex', gap: 8 }}>
+                <Button
+                  variant="primary"
+                  onClick={handleCreate}
+                  disabled={creating}
+                >
+                  {creating ? 'Creating…' : 'Create + open designer'}
+                </Button>
+                <Button variant="ghost" onClick={cancelCreate} disabled={creating}>
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {editingId && (
             <div
               style={{
                 padding: 12,
@@ -186,7 +360,7 @@ function LayoutsSection() {
                   color: 'var(--text-muted)',
                 }}
               >
-                {showCreate ? 'New layout' : `Editing: ${editingId}`}
+                Editing JSON: {editingId}
               </div>
               <textarea
                 value={draftJson}

@@ -91,6 +91,87 @@
           ]
         }
       }
+    },
+    {
+      "id": "MM-General",
+      "name": "Generic Memory Mate",
+      "sheetWidth": 8,
+      "sheetHeight": 10,
+      "dpi": 300,
+      "backgroundColor": "#ffffff",
+      "variants": {
+        "vertical": {
+          "slots": [
+            {
+              "kind": "playerPhoto",
+              "x": 4.75,
+              "y": 0.4,
+              "w": 2.75,
+              "h": 3.75,
+              "fit": "cover"
+            },
+            {
+              "kind": "teamPhoto",
+              "x": 0.55,
+              "y": 4.6000000000000005,
+              "w": 7,
+              "h": 5,
+              "fit": "cover"
+            },
+            {
+              "kind": "staticGraphic",
+              "x": 0,
+              "y": 0,
+              "w": 8,
+              "h": 10,
+              "fit": "contain",
+              "graphicKey": "Generic-MM2025"
+            },
+            {
+              "kind": "logo",
+              "x": 0.9,
+              "y": 0.7000000000000001,
+              "w": 3.35,
+              "h": 3,
+              "fit": "contain"
+            },
+            {
+              "kind": "text",
+              "x": 1.05,
+              "y": 3.75,
+              "w": 3.1,
+              "h": 0.8500000000000001,
+              "text": "{yeaer}",
+              "fontSize": 100,
+              "fontFamily": "Arial",
+              "color": "#000000",
+              "align": "center",
+              "weight": "normal"
+            }
+          ]
+        },
+        "horizontal": {
+          "slots": []
+        }
+      },
+      "graphics": {
+        "Generic-MM2025": {
+          "filename": "Generic-MM2025.png",
+          "mimeType": "image/png",
+          "sizeBytes": 2161695,
+          "uploadedAt": "2026-05-10T14:17:00.060Z",
+          "uploadedBy": "joey",
+          "originalFilename": "Generic MM2025.png"
+        },
+        "Generic-Shimmer-MM2025": {
+          "filename": "Generic-Shimmer-MM2025.png",
+          "mimeType": "image/png",
+          "sizeBytes": 2827845,
+          "uploadedAt": "2026-05-10T14:25:20.607Z",
+          "uploadedBy": "joey",
+          "originalFilename": "Generic Shimmer MM2025.png"
+        }
+      }
     }
   ]
 }

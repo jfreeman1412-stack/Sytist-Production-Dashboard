@@ -29,7 +29,11 @@ const SLOT_STYLES = {
   playerPhoto: { fill: '#5d8fc4', stroke: '#3c6a9a', label: 'Player photo' },
   teamPhoto:   { fill: '#c46060', stroke: '#9a3c3c', label: 'Team photo' },
   logo:        { fill: '#7cc46d', stroke: '#4a9a3c', label: 'Logo' },
-  overlay:     { fill: '#aaaaaa', stroke: '#777777', label: 'Overlay' },
+  // Phase 9c: rename overlay → staticGraphic (more obvious to non-
+  // technical operators). Both keys map to the same visual treatment;
+  // any persisted "kind: overlay" still renders correctly.
+  staticGraphic: { fill: '#b888d0', stroke: '#8866a0', label: 'Static graphic' },
+  overlay:     { fill: '#b888d0', stroke: '#8866a0', label: 'Static graphic' },
   text:        { fill: 'transparent', stroke: '#888888', label: 'Text' },
 };
 const FALLBACK_STYLE = { fill: '#888888', stroke: '#555555', label: '?' };
@@ -51,6 +55,16 @@ export default function LayoutCanvas({
   // Optional preview backdrop — base64 JPG, rendered behind slot boxes
   // so the operator can position slots over actual photos.
   backgroundImageDataUrl = null,
+  // Phase 9c: map of { graphicKey → URL or data URL } so static graphic
+  // slots render the actual uploaded image inline in the canvas. URLs
+  // are typically /api/sytist/composite/layouts/{id}/graphics/{key}/preview
+  // — the designer constructs them once per layout and passes here.
+  graphicsUrls = {},
+  // Phase 9e: per-slot hide/lock state — both maps from slot index
+  // to boolean. Hidden slots aren't rendered at all. Locked slots
+  // render normally but ignore mouse interactions.
+  hiddenSlots = {},
+  lockedSlots = {},
 }) {
   const svgRef = useRef(null);
 
@@ -208,6 +222,20 @@ export default function LayoutCanvas({
 
   // ─── Mousedown handlers on slot body / handle ─────────────
 
+  // Phase 9c-hotfix2: coerce x/y/w/h to numbers when capturing the
+  // drag-start snapshot. If the slot was loaded from JSON with string
+  // values for these (legacy data, hand-edited files), the drag math
+  // would otherwise concatenate strings: "1.5" + 0.1 = "1.50.1".
+  function coerceSlotDims(slot) {
+    return {
+      ...slot,
+      x: Number(slot.x) || 0,
+      y: Number(slot.y) || 0,
+      w: Number(slot.w) || 0,
+      h: Number(slot.h) || 0,
+    };
+  }
+
   function startDrag(e, slotIndex, originalSlot) {
     if (!interactive) return;
     e.preventDefault();
@@ -219,7 +247,7 @@ export default function LayoutCanvas({
       handle: null,
       startX: e.clientX,
       startY: e.clientY,
-      originalSlot: { ...originalSlot },
+      originalSlot: coerceSlotDims(originalSlot),
     });
   }
 
@@ -233,7 +261,7 @@ export default function LayoutCanvas({
       handle,
       startX: e.clientX,
       startY: e.clientY,
-      originalSlot: { ...originalSlot },
+      originalSlot: coerceSlotDims(originalSlot),
     });
   }
 
@@ -338,23 +366,40 @@ export default function LayoutCanvas({
           </g>
         )}
 
-        {/* Slots */}
-        {slots.map((slot, idx) => (
-          <SlotShape
-            key={idx}
-            slot={slot}
-            sampleTokens={sampleTokens}
-            isSelected={selectedIndex === idx}
-            interactive={interactive}
-            hasBackdrop={!!backgroundImageDataUrl}
-            onMouseDown={(e) => startDrag(e, idx, slot)}
-            onSelect={() => onSlotSelect && onSlotSelect(idx)}
-          />
-        ))}
+        {/* Slots. Phase 9e: hidden slots render nothing; locked slots
+            render normally but ignore interaction (no drag, no select).
+            Interaction state is computed per-slot from the lockedSlots
+            map; hidden ones are filtered before rendering. */}
+        {slots.map((slot, idx) => {
+          if (hiddenSlots[idx]) return null;
+          const isLocked = !!lockedSlots[idx];
+          return (
+            <SlotShape
+              key={idx}
+              slot={slot}
+              sampleTokens={sampleTokens}
+              isSelected={selectedIndex === idx}
+              interactive={interactive && !isLocked}
+              isLocked={isLocked}
+              hasBackdrop={!!backgroundImageDataUrl}
+              graphicsUrls={graphicsUrls}
+              onMouseDown={
+                isLocked ? null : (e) => startDrag(e, idx, slot)
+              }
+              onSelect={
+                isLocked ? null : () => onSlotSelect && onSlotSelect(idx)
+              }
+            />
+          );
+        })}
 
         {/* Resize handles for the selected slot — drawn after slots so
-            they overlay on top */}
-        {interactive && selectedIndex !== null && slots[selectedIndex] && (
+            they overlay on top. Don't render handles for locked slots. */}
+        {interactive &&
+          selectedIndex !== null &&
+          slots[selectedIndex] &&
+          !lockedSlots[selectedIndex] &&
+          !hiddenSlots[selectedIndex] && (
           <ResizeHandles
             slot={slots[selectedIndex]}
             sheetW={sheetW}
@@ -384,7 +429,7 @@ export default function LayoutCanvas({
 
 // ─── Sub-components ─────────────────────────────────────────
 
-function SlotShape({ slot, sampleTokens, isSelected, interactive, hasBackdrop, onMouseDown, onSelect }) {
+function SlotShape({ slot, sampleTokens, isSelected, interactive, isLocked, hasBackdrop, graphicsUrls, onMouseDown, onSelect }) {
   const style = SLOT_STYLES[slot.kind] || FALLBACK_STYLE;
   const x = slot.x || 0;
   const y = slot.y || 0;
@@ -393,6 +438,15 @@ function SlotShape({ slot, sampleTokens, isSelected, interactive, hasBackdrop, o
 
   if (w <= 0 || h <= 0) return null;
 
+  // Phase 9e: locked slots have no mouse interaction. We tolerate null
+  // onMouseDown/onSelect by guarding all calls — keeps the parent from
+  // having to pass dummy fns for the locked case.
+  const handleMouseDown = onMouseDown || undefined;
+  const handleClick = (e) => {
+    e.stopPropagation();
+    if (onSelect) onSelect();
+  };
+
   // When a backdrop image exists, slot boxes become semi-transparent
   // outlines so the operator can see the photos behind them. Otherwise
   // (placeholder mode) slots are filled solid as visual placeholders.
@@ -400,17 +454,17 @@ function SlotShape({ slot, sampleTokens, isSelected, interactive, hasBackdrop, o
   const strokeWidth = isSelected ? 0.04 : 0.015;
   const strokeColor = isSelected ? '#4a7fc1' : style.stroke;
 
-  const cursor = interactive ? 'move' : 'pointer';
+  // Phase 9e: locked slots get a "not-allowed" cursor and ignore clicks.
+  // 'move' when interactive, 'pointer' otherwise (selection still works
+  // unless explicitly null), 'not-allowed' when locked.
+  const cursor = isLocked ? 'not-allowed' : interactive ? 'move' : 'pointer';
 
   if (slot.kind === 'text') {
     return (
       <g
         style={{ cursor }}
-        onMouseDown={onMouseDown}
-        onClick={(e) => {
-          e.stopPropagation();
-          onSelect();
-        }}
+        onMouseDown={handleMouseDown}
+        onClick={handleClick}
       >
         <rect
           x={x} y={y} width={w} height={h}
@@ -424,34 +478,77 @@ function SlotShape({ slot, sampleTokens, isSelected, interactive, hasBackdrop, o
     );
   }
 
+  // Phase 9c: if this is a staticGraphic / overlay slot AND we have a
+  // URL for its uploaded image, render the actual image inline so the
+  // operator sees what they're working with. Falls back to the colored
+  // placeholder rect when no upload exists yet.
+  const isStaticGraphic = slot.kind === 'staticGraphic' || slot.kind === 'overlay';
+  const graphicKey = slot.graphicKey || slot.overlayId;
+  const graphicUrl =
+    isStaticGraphic && graphicKey && graphicsUrls
+      ? graphicsUrls[graphicKey]
+      : null;
+
   const labelFontSize = Math.min(w, h) * 0.08;
 
   return (
     <g
       style={{ cursor }}
-      onMouseDown={onMouseDown}
-      onClick={(e) => {
-        e.stopPropagation();
-        onSelect();
-      }}
+      onMouseDown={handleMouseDown}
+      onClick={handleClick}
     >
-      <rect
-        x={x} y={y} width={w} height={h}
-        fill={style.fill}
-        stroke={strokeColor}
-        strokeWidth={strokeWidth}
-        opacity={fillOpacity}
-      />
-      {!hasBackdrop && (
-        <text
-          x={x + w / 2} y={y + h / 2}
-          textAnchor="middle" dominantBaseline="middle"
-          fontSize={labelFontSize}
-          fill="white" fontFamily="Arial, sans-serif" fontWeight="500"
-          pointerEvents="none"
-        >
-          {style.label}
-        </text>
+      {graphicUrl ? (
+        // Uploaded graphic — render the real image, sized to the slot.
+        // preserveAspectRatio respects fit mode: 'contain' lets the
+        // image fit inside, 'cover' fills (may crop) — sharp's resize
+        // semantics, mirrored here for visual fidelity.
+        //
+        // Phase 9e: render at full opacity. PNG alpha channels are
+        // respected natively by the browser's <image> element, so
+        // graphics with transparent cutouts (e.g. frames) just work
+        // — the transparent regions show through to slots beneath.
+        // We slightly lower opacity only when there's a preview
+        // backdrop image (real-order photos) so the graphic doesn't
+        // completely occlude the photos in that view.
+        <>
+          <image
+            href={graphicUrl}
+            x={x} y={y} width={w} height={h}
+            preserveAspectRatio={
+              slot.fit === 'cover'
+                ? 'xMidYMid slice'
+                : 'xMidYMid meet'
+            }
+            opacity={hasBackdrop ? 0.85 : 1}
+          />
+          <rect
+            x={x} y={y} width={w} height={h}
+            fill="transparent"
+            stroke={strokeColor}
+            strokeWidth={strokeWidth}
+          />
+        </>
+      ) : (
+        <>
+          <rect
+            x={x} y={y} width={w} height={h}
+            fill={style.fill}
+            stroke={strokeColor}
+            strokeWidth={strokeWidth}
+            opacity={fillOpacity}
+          />
+          {!hasBackdrop && (
+            <text
+              x={x + w / 2} y={y + h / 2}
+              textAnchor="middle" dominantBaseline="middle"
+              fontSize={labelFontSize}
+              fill="white" fontFamily="Arial, sans-serif" fontWeight="500"
+              pointerEvents="none"
+            >
+              {isStaticGraphic ? `${style.label} (no upload)` : style.label}
+            </text>
+          )}
+        </>
       )}
     </g>
   );

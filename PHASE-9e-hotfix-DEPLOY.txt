@@ -1,0 +1,160 @@
+Phase 9e-hotfix — body-parser limit fix + upload diagnostics
+
+═══════════════════════════════════════════════════════
+THE LIKELY BUG
+═══════════════════════════════════════════════════════
+
+You uploaded an 8×10 @ 300 DPI PNG but the canvas shows it heavily
+pixelated, as if scaled up from a tiny source. Most likely cause:
+the Express JSON body parser is silently truncating large uploads.
+
+The default express.json() middleware caps payloads at 100kb.
+An 8×10 @ 300 DPI PNG is 2400×3000 pixels — typically 2–7 MB raw,
+3–9 MB base64-encoded. That's 30–90× over the default limit.
+
+Depending on Express version, oversized requests either:
+  - Reject with a 413 error (you'd have seen an error in the UI), OR
+  - Pass through with `req.body` empty or partially parsed
+
+The screenshot shows a heavily pixelated image RENDERING, which
+suggests the file IS on disk but is much smaller than expected.
+Could be either:
+  (a) Body parser is silently truncating at 100kb, leaving a partial
+      base64 string that decodes to a partial PNG
+  (b) Something else upstream is degrading the file
+  (c) The file on disk is actually fine and rendering is at fault
+
+═══════════════════════════════════════════════════════
+THE FIX (with diagnostic so we can confirm)
+═══════════════════════════════════════════════════════
+
+1. PER-ROUTE BODY PARSER WITH 15 MB LIMIT
+   The graphics-upload endpoint now uses `express.json({ limit: '15mb' })`
+   as a per-route middleware. 15 MB JSON fits a 10 MB binary base64-
+   encoded with overhead. Other endpoints continue to use whatever the
+   server's existing express.json() limit is.
+
+2. SERVER LOGGING ON UPLOAD
+   Each upload now logs its byte counts:
+     [composite/graphics POST] layout=foo key=frame
+       base64Length=12345678 decodedBytes=9258759 filename=frame.png
+   If decodedBytes ≠ ~base64Length × 0.75, the body got truncated.
+
+3. NEW DIAGNOSTIC ENDPOINT
+     GET /api/sytist/composite/layouts/:layoutId/graphics/:key/info
+   Returns:
+     {
+       "onDisk": { "mimeType": "image/png", "streamedBytes": 9258759 },
+       "jsonMeta": { "sizeBytes": 9258759, "filename": "frame.png", ... },
+       "sizeMatches": true
+     }
+   If `sizeMatches` is false or `streamedBytes` is suspiciously small
+   (e.g., 100k for what should be 5 MB), the upload pipeline is
+   corrupting bytes.
+
+═══════════════════════════════════════════════════════
+PREREQUISITES
+═══════════════════════════════════════════════════════
+
+Phase 9c-hotfix2 must be deployed. (9d/9e are pure client-side and
+don't change this server file.)
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/routes/sytist.js   + 15 MB per-route body parser on upload
+                            + byte-count logging
+                            + new /info diagnostic endpoint
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-9e-hotfix.tar.gz --strip-components=1
+  npm run dev
+
+═══════════════════════════════════════════════════════
+HOW TO DIAGNOSE
+═══════════════════════════════════════════════════════
+
+After deploy:
+
+1. Re-upload your 8×10 @ 300 DPI PNG via the designer's Static
+   Graphic slot or the Graphics library section.
+
+2. Watch the server console. You should see:
+   [composite/graphics POST] layout=<id> key=<key>
+     base64Length=<N>  decodedBytes=<M>  filename=...
+
+   If M is roughly N * 0.75 and is in the millions of bytes
+   (e.g., 4–8 MB), the upload pipeline is fine. Move on.
+
+   If M is small (~75 KB or less), the body is being truncated.
+   The fix in this hotfix should already resolve that — but if
+   M is STILL small after deploy, your server may have a global
+   limit set elsewhere that overrides per-route.
+
+3. Hit the diagnostic endpoint to verify what's on disk:
+   http://localhost:3011/api/sytist/composite/layouts/<id>/graphics/<key>/info
+
+   `streamedBytes` is the actual file size on disk. If it matches
+   the original file's size on your computer, the pipeline is
+   correct and the rendering is at fault.
+
+4. Open the file directly:
+   C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard\
+       server\config\composite-graphics\<layoutId>\<key>.png
+
+   Right-click → Properties → file size matches your original?
+   Open the file → pixel dimensions match (2400×3000 for 8×10
+   @ 300 DPI)?
+
+5. Tell me the results. Specifically:
+   - The console log line from upload
+   - The /info endpoint response
+   - Disk file size and pixel dimensions
+
+═══════════════════════════════════════════════════════
+IF THE PIPELINE TURNS OUT TO BE FINE
+═══════════════════════════════════════════════════════
+
+If the file on disk is 2400×3000 pixels and several megabytes,
+but the canvas still renders pixelated, the issue is in the SVG
+rendering path, not the upload. In that case:
+  - Possibly a browser-side scaling artifact
+  - Possibly an issue with how SVG <image> handles large external
+    images
+  - Possibly a stale browser cache showing an earlier upload
+
+I'd ship a separate fix for that case. But let's confirm the
+pipeline first — it's the more likely culprit by far.
+
+═══════════════════════════════════════════════════════
+SAFETY NOTES
+═══════════════════════════════════════════════════════
+
+- The 15 MB body limit applies ONLY to the graphics upload route.
+  Other endpoints are unaffected. No risk of accidentally accepting
+  giant payloads on other routes.
+
+- The /info endpoint streams the whole file just to count bytes.
+  For big files (5+ MB) this takes a moment. Don't hit it in a
+  loop. It's a one-off diagnostic, not for production traffic.
+
+- Server console logs are written by Node — visible in your
+  PowerShell window where `npm run dev` is running.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 9c            Static Graphics
+✓ 9c-hotfix     Rules-of-hooks
+✓ 9c-hotfix2    .toFixed crash
+✗ 9d            See-through-graphics (rolled back)
+✓ 9e            Native PNG transparency + hide/lock
+🔍 9e-hotfix    Body-parser limit + upload diagnostics ← here
+                  (also fixes the issue if body-parser was the cause)

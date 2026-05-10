@@ -31,7 +31,8 @@
 //   - { kind: "playerPhoto", x, y, w, h, fit: "cover"|"contain" }
 //   - { kind: "logo",        x, y, w, h, fit: "contain" }
 //   - { kind: "teamPhoto",   x, y, w, h, fit: "cover"|"contain" }
-//   - { kind: "overlay",     x, y, w, h, overlayId: "ov-..." }
+//   - { kind: "staticGraphic", x, y, w, h, graphicKey: "frame-1", fit: ... }
+//     (also accepts legacy: kind="overlay", overlayId="...")
 //   - { kind: "text",        x, y, w, h, text: "{customer.firstName}",
 //       fontSize, fontFamily, color, align, weight, autoFit }
 //
@@ -219,6 +220,18 @@ class CompositeService {
       throw new Error(`Layout "${id}" not found`);
     }
     await this._writeLayouts(next);
+
+    // Phase 9c: also remove the graphics directory for this layout.
+    // Lazy require to avoid load-order issues with compositeGraphicsService
+    // (it doesn't require compositeService, but the singleton init order
+    // is undefined and we want to be conservative).
+    try {
+      const cgs = require('./compositeGraphicsService');
+      await cgs.deleteLayoutGraphics(id);
+    } catch (e) {
+      // Non-fatal — orphaned files don't break anything, just waste disk
+    }
+
     return { deleted: true };
   }
 
@@ -452,19 +465,31 @@ class CompositeService {
         } else if (slot.kind === 'text') {
           const resolvedText = this._substituteTokens(slot.text || '', tokens || {});
           composites.push(this._textSvg(slot, x, y, w, h, resolvedText));
-        } else if (slot.kind === 'overlay') {
-          // Overlays come in as buffers passed via `tokens.overlays[id]`
-          const overlayBuffer =
-            (tokens && tokens.overlays && tokens.overlays[slot.overlayId]) || null;
-          if (!overlayBuffer) {
+        } else if (slot.kind === 'overlay' || slot.kind === 'staticGraphic') {
+          // Phase 9c: rename overlay → staticGraphic. Both kinds work
+          // (backward compat for any existing layout JSON). Both lookup
+          // paths are also supported: graphicKey (new) or overlayId
+          // (legacy). The buffer is supplied by the caller via
+          // tokens.overlays[key] — naming kept for compatibility.
+          const key = slot.graphicKey || slot.overlayId;
+          if (!key) {
             warnings.push({
-              type: 'missing_overlay',
-              overlayId: slot.overlayId,
-              message: `Overlay "${slot.overlayId}" not supplied`,
+              type: 'missing_graphic_key',
+              message: `Static graphic slot has no graphicKey`,
             });
             continue;
           }
-          const fitted = await sharp(overlayBuffer)
+          const graphicBuffer =
+            (tokens && tokens.overlays && tokens.overlays[key]) || null;
+          if (!graphicBuffer) {
+            warnings.push({
+              type: 'missing_graphic',
+              graphicKey: key,
+              message: `Static graphic "${key}" not supplied (file may be missing or layout.graphics out of sync)`,
+            });
+            continue;
+          }
+          const fitted = await sharp(graphicBuffer)
             .resize(w, h, {
               fit: slot.fit || 'contain',
               background: { r: 0, g: 0, b: 0, alpha: 0 },

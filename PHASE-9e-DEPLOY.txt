@@ -1,0 +1,164 @@
+Phase 9e — native PNG transparency + per-layer hide/lock
+
+═══════════════════════════════════════════════════════
+TWO CHANGES, BOTH DESIGNER-ONLY
+═══════════════════════════════════════════════════════
+
+CHANGE 1 — REVERTED 9d's GLOBAL OPACITY HACK
+  PNG transparency works natively in browsers. The "see through
+  graphics" toggle from 9d was solving a non-problem: it forced
+  every static graphic to render at 30% opacity in the designer,
+  which is unnecessary because PNG alpha channels already make
+  transparent regions transparent. Frame graphics with
+  transparent cutouts now show photo slots through the cutouts
+  without any tricks — the SVG <image> element respects PNG
+  alpha out of the box.
+
+  Removed: the see-through-graphics checkbox from the canvas
+  footer toolbar, the global opacity application, the page-
+  level state for it.
+
+CHANGE 2 — PER-LAYER HIDE / LOCK (Photoshop-style)
+  Each layer card has two new icon buttons before the up/down
+  arrows:
+
+    👁 / ⊘   Hide layer    Skips the slot from canvas rendering.
+                          Card dims to ~45% opacity so it's
+                          still findable in the panel.
+    🔓 / 🔒   Lock layer    Slot still renders normally, but you
+                          can't drag/resize it on the canvas, and
+                          its property editor is replaced with a
+                          "Click to unlock" notice.
+
+  Both states are designer-view-only:
+    - Not saved to the layout JSON (so they don't bleed into
+      production composite renders)
+    - Don't persist across page reloads
+    - Per-variant — vertical and horizontal have independent
+      hide/lock state
+
+  When slots are reordered (drag, ↑/↓) or deleted, the hide/lock
+  maps follow — so hiding "the third slot" stays hiding the same
+  underlying slot even after reordering.
+
+═══════════════════════════════════════════════════════
+PREREQUISITES
+═══════════════════════════════════════════════════════
+
+Phase 9c-hotfix2 must be deployed first.
+
+(9d is functionally rolled back as part of 9e — both files
+9d touched are replaced. You don't need to keep 9d deployed.)
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/components/LayoutCanvas.js              + hiddenSlots and
+                                                     lockedSlots props
+                                                     skip / disable
+                                                     interaction; full
+                                                     opacity restored
+                                                     for static graphics
+  client/src/pages/settings/LayoutDesignerPage.js    + per-variant hide/
+                                                     lock state, toggle
+                                                     handlers with
+                                                     reorder/delete
+                                                     remapping; new icon
+                                                     buttons on layer
+                                                     cards; lock notice
+                                                     in editor; removed
+                                                     see-through toggle
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-9e.tar.gz --strip-components=1
+  npm run dev
+
+═══════════════════════════════════════════════════════
+HOW IT FEELS NOW
+═══════════════════════════════════════════════════════
+
+Open a layout with a static graphic that fills the whole sheet
+(your frame-with-cutouts case):
+  - The graphic renders at full opacity, but the transparent
+    regions of the PNG are transparent. Photo slots positioned
+    in those transparent regions are visible through the holes.
+  - If your graphic is OPAQUE in some area where you need to
+    work on a slot underneath, click the 👁 icon on the
+    graphic's layer card to hide it temporarily. Click again
+    to bring it back.
+  - Once a slot is positioned correctly and you don't want to
+    bump it accidentally, click 🔓 on its layer card to lock
+    it. The slot stays visible in the canvas but mouse drags
+    do nothing. Property panel shows a lock notice instead of
+    editable fields.
+
+Hide / lock state resets every time you reload the layout. By
+design — these are transient view settings, not part of your
+layout's permanent definition.
+
+═══════════════════════════════════════════════════════
+TEST RESULTS
+═══════════════════════════════════════════════════════
+
+LayoutCanvas:
+  ✓ Static graphic renders at full opacity (PNG alpha respected)
+  ✓ Player and logo slots render normally underneath
+  ✓ hiddenSlots[idx]=true skips that slot from rendering
+  ✓ lockedSlots[idx]=true: slot renders but cursor is not-allowed,
+    no resize handles even when selected
+
+LayersPanel / LayerCard:
+  ✓ Each card shows the new 👁 and 🔓 icons
+  ✓ Hidden card shows ⊘ icon and dims to 45% opacity
+  ✓ Locked + selected card shows "🔒 This layer is locked"
+    notice in place of the editor
+
+Reorder bookkeeping:
+  ✓ Move up/down swaps hide/lock state with the moved slot
+  ✓ Drag-reorder remaps state correctly across all affected
+    indices (verified with manual trace of 5-slot reorder)
+  ✓ Delete shifts state for slots after the removed one
+
+═══════════════════════════════════════════════════════
+KNOWN GAPS
+═══════════════════════════════════════════════════════
+
+- HIDE / LOCK STATE NOT PERSISTED: every layout reload starts
+  with all slots visible and unlocked. If you want this to
+  persist (across reloads but NOT to production), localStorage
+  would do it. Easy add — tell me if you want it.
+
+- PRODUCTION RENDER ALWAYS USES ALL SLOTS: hidden slots are NOT
+  skipped during composite generation in processingService.
+  This is intentional — hide is a design-time view aid only.
+  If you want a "delete from production but keep in design"
+  feature, that's a separate concept (e.g. an "enabled: false"
+  flag on the slot itself).
+
+- LOCK ONLY BLOCKS THE CANVAS + EDITOR: arithmetic operations
+  like reordering and deleting still work on locked slots from
+  the layer-card buttons. Lock prevents accidental drag/resize
+  and field edits, not bulk operations. If you want stronger
+  lock semantics ("locked slots can't be deleted either"),
+  trivial to add.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 4.1-4.7      Production pipeline complete
+✓ 8a/8b        Composite engine end-to-end
+✓ 9a/9b        Visual layout designer
+✓ 9b-hotfix    Layers panel + new-layout flow
+✓ 9b-hotfix2   Drag-to-reorder + sticky add buttons
+✓ 9c           Static Graphics: rename + uploadable per-layout library
+✓ 9c-hotfix    Fix rules-of-hooks violation
+✓ 9c-hotfix2   Fix .toFixed crash
+✗ 9d           See-through-graphics toggle (rolled back as unnecessary)
+✓ 9e           Native PNG transparency + per-layer hide/lock ← here

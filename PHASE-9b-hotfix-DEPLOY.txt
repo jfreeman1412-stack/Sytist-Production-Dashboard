@@ -1,0 +1,161 @@
+Phase 9b-hotfix — layers panel + new-layout designer flow
+
+═══════════════════════════════════════════════════════
+PREREQUISITES
+═══════════════════════════════════════════════════════
+
+Phase 9b MUST be deployed first.
+
+═══════════════════════════════════════════════════════
+NO NEW DEPENDENCIES
+═══════════════════════════════════════════════════════
+
+Deploy:
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-9b-hotfix.tar.gz --strip-components=1
+  npm run dev
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/pages/settings/CompositesSettings.js   "+ New layout" → small dialog
+                                                    + navigate to designer
+  client/src/pages/settings/LayoutDesignerPage.js   Layers panel replaces
+                                                    SlotEditor + AddSlotToolbar
+
+NO server-side changes. NO change to LayoutCanvas.
+
+═══════════════════════════════════════════════════════
+WHAT THE HOTFIX ADDRESSES
+═══════════════════════════════════════════════════════
+
+ISSUE 1 — "+ New layout" landed in JSON editor.
+
+  Now: clicking "+ New layout" shows a small dialog asking for
+  name, ID (auto-suggested from name), sheet width, and height.
+  Submitting CREATES the layout via the API and immediately
+  navigates to the designer for it. Operator can start placing
+  slots visually right away — no JSON editing required.
+
+  The JSON editor is still there for advanced/repair use via
+  the per-row "JSON" button on existing layouts.
+
+ISSUE 2 — Layers / z-order management.
+
+  The right side of the designer is now a layers panel
+  (Photoshop-style). Every slot is a card; cards are listed in
+  reverse JSON-array order, so the topmost layer on the canvas
+  appears at the TOP of the panel.
+
+  Each card shows:
+    - Color swatch indicating slot kind
+    - Quick label (text content for text slots, kind for image
+      slots)
+    - Position + size summary on a second line
+    - ↑ ↓ ✕ buttons to reorder or delete
+    - ▶ / ▼ indicator for collapsed/expanded state
+
+  Click a card header to select that slot — its body expands
+  inline showing the full property editor. Selecting a slot on
+  the canvas (by clicking the SVG) ALSO expands the matching
+  card.
+
+  Up/down arrows work in CANVAS terms:
+    "Move up"   = move toward TOP of canvas (later in JSON array,
+                  drawn after = on top of other slots)
+    "Move down" = move toward BOTTOM of canvas (earlier in array,
+                  drawn first = under other slots)
+
+  The topmost card has ↑ disabled. The bottommost has ↓ disabled.
+
+ALSO IN THIS HOTFIX:
+
+  Layout properties (sheet name / width / height / DPI /
+  background) is now collapsible. It auto-collapses when a slot
+  is selected so the layers panel gets visual priority. Click
+  "Expand" to bring it back.
+
+═══════════════════════════════════════════════════════
+HOW TO TRY IT
+═══════════════════════════════════════════════════════
+
+NEW LAYOUT FLOW:
+  1. Settings → Composites → "+ New layout"
+  2. Fill in Name (e.g. "Memory Mate 8x10")
+     ID auto-fills as "memory-mate-8x10" — edit if you want
+     Width/Height — defaults are 5/7
+  3. Click "Create + open designer"
+  4. Designer opens with an empty canvas
+  5. Click "+ Player" in the layers panel header → new slot
+     appears centered on canvas, layer card appears in panel
+  6. Drag the slot to position it; resize via corners
+  7. Click "+ Logo", drag, resize, etc.
+  8. Click Save when satisfied
+
+LAYERS / Z-ORDER:
+  1. Open the seeded memory-mate-5x7-v1 in the designer
+  2. The layers panel shows 4 cards top-to-bottom:
+       Text "{subject.athleteName}"
+       Team photo
+       Player photo
+       Logo
+  3. Click the "Logo" card → it expands, showing the full
+     editor (kind picker, position, fit mode, etc.)
+  4. The canvas highlights the logo slot
+  5. Click ↑ on the Logo card → it moves up one position
+     in the list (Logo is now drawn LATER, so on top of
+     Player photo if they overlap)
+  6. The canvas re-renders showing the new z-order
+  7. Click ✕ on a card → confirms, then deletes that slot
+
+═══════════════════════════════════════════════════════
+SAFETY NOTES
+═══════════════════════════════════════════════════════
+
+- The hotfix is purely UI — no server-side changes, no
+  changes to the rendering pipeline. Existing layouts and
+  composite mappings continue to work exactly as before.
+
+- The display order of layer cards is REVERSED from the JSON
+  array order. The on-disk JSON still stores slots in
+  bottom-to-top order (first item drawn first). If you drop
+  to the JSON editor (advanced "JSON" button), you'll see
+  the original array order — this is correct.
+
+- Reordering a slot is undoable via "Discard" at the top of
+  the designer (reverts to last saved). Or just reorder back.
+
+- Deleting a slot prompts for confirmation. If you delete the
+  wrong one, "Discard" reverts.
+
+- The "Expand"/"Collapse" toggle on Layout properties is
+  cosmetic — it doesn't affect what gets saved. Just hides
+  fields you're not currently using.
+
+═══════════════════════════════════════════════════════
+KNOWN GAPS
+═══════════════════════════════════════════════════════
+
+- DRAG TO REORDER: layer cards don't support drag-and-drop
+  reordering — use the ↑ ↓ buttons. (Doable in a follow-up
+  if you'd find drag more natural.)
+
+- EXPAND ALL / COLLAPSE ALL: no bulk toggle. One card
+  expands at a time (whichever is selected).
+
+- KEYBOARD SHORTCUTS: no Ctrl+up/down to move layers,
+  no Delete key to remove. Use the buttons.
+
+- COPY LAYER: no "duplicate this slot" affordance. You'd
+  add a new slot of the same kind and adjust manually.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 4.1-4.7    Production pipeline complete
+✓ 8a/8b      Composite engine end-to-end
+✓ 9a/9b      Visual layout designer
+✓ 9b-hotfix  Layers panel + new-layout flow ← we are here

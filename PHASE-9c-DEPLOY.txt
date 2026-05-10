@@ -1,0 +1,233 @@
+Phase 9c — Static Graphics: rename + uploadable per-layout library
+
+═══════════════════════════════════════════════════════
+PREREQUISITES
+═══════════════════════════════════════════════════════
+
+Phase 9b-hotfix2 MUST be deployed first. Phases 8a/8b also required
+(the composite engine pipeline this depends on).
+
+═══════════════════════════════════════════════════════
+NO NEW DEPENDENCIES
+═══════════════════════════════════════════════════════
+
+Deploy:
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-9c.tar.gz --strip-components=1
+  npm run dev
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+NEW:
+  server/services/compositeGraphicsService.js       Per-layout file storage (325L)
+
+MODIFIED:
+  server/services/compositeService.js                + staticGraphic kind support
+                                                     + cleanup graphics on layout delete
+  server/services/processingService.js              Step 1.5 loads graphics from disk
+                                                     into tokens.overlays before render
+  server/routes/sytist.js                            + 4 new graphics endpoints
+                                                     + preview endpoint loads graphics
+  client/src/components/LayoutCanvas.js              + staticGraphic kind in SLOT_STYLES
+                                                     + renders uploaded graphics inline
+                                                     via SVG <image>
+  client/src/pages/settings/LayoutDesignerPage.js    + StaticGraphicSlotEditor
+                                                     (file picker, thumbnail, library
+                                                     picker)
+                                                     + GraphicsLibrarySection (manage
+                                                     uploads at layout level)
+                                                     + rename Overlay→Static graphic
+                                                     throughout
+
+7 files. No client deps. Server uses existing sharp + fs only.
+
+═══════════════════════════════════════════════════════
+WHAT 9c DELIVERS
+═══════════════════════════════════════════════════════
+
+The "Overlay" slot kind is now called "Static graphic" everywhere
+in the UI. More importantly, you can actually UPLOAD images for
+these slots without dropping files into server folders by hand.
+
+PER-LAYOUT GRAPHICS LIBRARY:
+  Each layout has its own library of uploaded graphics, indexed by
+  KEY (a short reference name, alphanumeric/hyphen/underscore).
+  Slots reference graphics by key — multiple slots can share one
+  graphic (e.g. vertical and horizontal variants both using
+  "frame-1"), and different layouts have completely independent
+  libraries.
+
+  Storage location:
+    server/config/composite-graphics/<layoutId>/<key>.{png|jpg}
+
+  Layout JSON gains a new field:
+    layout.graphics = {
+      "frame-1":  { filename, mimeType, sizeBytes, uploadedAt, ... },
+      "sponsor":  { ... }
+    }
+
+  Slot field changes:
+    OLD: { kind: "overlay", overlayId: "ov-..." }
+    NEW: { kind: "staticGraphic", graphicKey: "frame-1", fit: "contain" }
+  Both forms still work (backward compat).
+
+UPLOAD AFFORDANCES IN THE DESIGNER:
+  Two places to upload:
+
+  1. SLOT-LEVEL: When you click a Static Graphic layer card, the
+     editor shows an "Upload graphic" button. Picks a PNG or JPG,
+     uploads it, and references it from this slot. The slot's key
+     is auto-derived from the filename if you haven't set one.
+
+  2. LIBRARY-LEVEL: A new "Graphics library" section at the top of
+     the right panel (collapsed by default). Lists all uploaded
+     graphics for this layout as thumbnail tiles. Upload new ones
+     here, delete unused ones, refresh the listing.
+
+  Both write to the same on-disk location and both update the
+  layout JSON's graphics map.
+
+INLINE CANVAS RENDERING:
+  Static Graphic slots that have a file uploaded show the actual
+  image inline in the canvas — not just a colored placeholder
+  rectangle. You see exactly what your design will look like as
+  you position slots. Slots without uploads show a purple
+  placeholder labeled "Static graphic (no upload)".
+
+ORCHESTRATOR INTEGRATION:
+  When orders process, the Step 1.5 composite branch automatically
+  loads any static graphics referenced by the chosen variant's
+  slots and passes them to the rendering engine. No additional
+  configuration needed — once you upload graphics in the designer,
+  they just work in production.
+
+LIVE PREVIEW INTEGRATION:
+  The "Use real order data" preview also loads graphics, so what
+  you see during designer use matches what gets rendered for real
+  orders.
+
+LAYOUT DELETION CLEANUP:
+  Deleting a layout via the layouts table now also removes its
+  graphics directory. No orphaned files.
+
+═══════════════════════════════════════════════════════
+HOW TO TRY IT
+═══════════════════════════════════════════════════════
+
+UPLOAD A GRAPHIC FROM A SLOT:
+  1. Open the designer for any layout
+  2. Click "+ Graphic" in the layers panel header
+     (formerly "+ Overlay")
+  3. The new layer card appears, selected and expanded
+  4. In the layer's editor body, scroll to the Static graphic
+     section (purple box)
+  5. Click "Upload graphic"
+  6. Pick a PNG or JPG (must be <10 MB)
+  7. The image uploads, the slot's graphic key is set, and you
+     see the actual image rendered inline on the canvas
+  8. Drag and resize the slot to position the graphic
+
+REUSE AN EXISTING GRAPHIC:
+  1. With a Static Graphic slot selected, look in the editor for
+     "Pick from library" (only appears when graphics exist)
+  2. Pick any uploaded graphic — the slot now references it
+  3. Use this for placing the same frame in both vertical and
+     horizontal variants without re-uploading
+
+MANAGE THE WHOLE LIBRARY:
+  1. Expand "Graphics library" at the top of the right panel
+  2. See all uploaded graphics as thumbnails with their keys,
+     formats, and sizes
+  3. Upload new ones via the field at the top (specify a key or
+     leave blank to derive from filename)
+  4. Delete unused graphics with the Delete button on each thumb
+
+VERIFY ORCHESTRATOR PIPES IT THROUGH:
+  1. Create or edit a composite mapping for a real SKU pointing
+     at a layout that includes a Static Graphic slot with an
+     uploaded file
+  2. In TEST MODE, process an order containing that SKU
+  3. The composite output should include your uploaded graphic
+     overlaid at the slot's position
+
+═══════════════════════════════════════════════════════
+SAFETY NOTES
+═══════════════════════════════════════════════════════
+
+- Uploads commit IMMEDIATELY to the server. They are NOT part of
+  the unsaved-changes flow. Clicking "Discard" reverts slot
+  changes (including graphic key references) but does NOT remove
+  uploaded files. To clean up unused uploads, delete them via the
+  Graphics library section.
+
+- Slot graphic key references ARE part of the unsaved-changes
+  flow. So if you upload a new graphic and then change a slot to
+  reference it, only the slot change needs Save. The file itself
+  is already on disk.
+
+- File size cap: 10 MB. Type cap: PNG and JPG only. The server
+  sniffs magic bytes — claimed MIME type or extension is ignored.
+
+- Key validation: alphanumeric, hyphen, underscore only, max 64
+  chars. Both the layout ID and graphic key are validated this
+  way to prevent path traversal.
+
+- Backward compat: any existing layout JSON with `kind: "overlay"`
+  and `overlayId` still works. The renderer accepts both kinds and
+  both field names. The designer normalizes new edits to the new
+  names but doesn't migrate existing slots.
+
+- Layout deletion cascades: deleting a layout via Settings →
+  Composites also removes the on-disk graphics directory. There's
+  no "are you sure" beyond the existing layout-deletion confirm.
+
+═══════════════════════════════════════════════════════
+NEW SERVER ENDPOINTS
+═══════════════════════════════════════════════════════
+
+  GET    /api/sytist/composite/layouts/:id/graphics
+         Returns all graphics for the layout (merged with on-disk
+         state to detect drift)
+
+  POST   /api/sytist/composite/layouts/:id/graphics/:key   (admin)
+         Body: { dataBase64, filename }
+         Upload or replace a graphic at this key
+
+  DELETE /api/sytist/composite/layouts/:id/graphics/:key   (admin)
+         Remove the file + remove the entry from layout.graphics
+
+  GET    /api/sytist/composite/layouts/:id/graphics/:key/preview
+         Streams the image bytes — used by the designer for thumbs
+
+═══════════════════════════════════════════════════════
+KNOWN GAPS
+═══════════════════════════════════════════════════════
+
+- ORPHAN DETECTION: if you delete a slot that referenced a
+  graphic, the graphic stays in the library. There's no automatic
+  "this graphic is unused, want to delete it?" prompt. Use the
+  library section to clean up manually.
+
+- KEY RENAMING: if you change a graphic's key, slots that
+  referenced the old key won't auto-update. They'll show
+  "missing graphic" warnings until updated to the new key.
+  Workaround: upload at the new key as a fresh graphic, update
+  slots, delete the old key. (Or just keep the same key when
+  re-uploading.)
+
+- BROWSER CACHE: re-uploading at the same key bumps an internal
+  version counter so thumbnails refresh. If you ever see a stale
+  preview, hit the Refresh button in the Graphics library section.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 4.1-4.7      Production pipeline complete
+✓ 8a/8b        Composite engine end-to-end
+✓ 9a/9b        Visual layout designer
+✓ 9b-hotfix    Layers panel + new-layout flow
+✓ 9b-hotfix2   Drag-to-reorder + sticky add buttons
+✓ 9c           Static Graphics: rename + uploadable per-layout library ← here

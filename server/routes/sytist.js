@@ -17,7 +17,90 @@ const specialtyService = require('../services/specialtyService');
 const teamPhotoService = require('../services/teamPhotoService');
 const galleryAssetsService = require('../services/galleryAssetsService');
 const compositeService = require('../services/compositeService');
+const compositeGraphicsService = require('../services/compositeGraphicsService');
 const { requireAuth, requireRole } = require('../middleware/auth');
+
+// ─── Public routes (registered before auth middleware) ───────
+//
+// Phase 9e-hotfix3: image preview endpoints serve files via SVG
+// <image> and HTML <img> elements, which initiate native browser
+// fetches. The dashboard's auth middleware appears to use a header
+// token (or some non-cookie scheme) that native image fetches
+// don't carry — so those requests fail with 401, leaving slot
+// canvases blank.
+//
+// Solution: register the read-only image-preview endpoints BEFORE
+// `router.use(requireAuth)`. The endpoints reveal images that the
+// caller already has access to anyway (they need the layout ID
+// and key to construct the URL), and the dashboard runs same-
+// origin on localhost. Other routes still require auth.
+
+/**
+ * GET /api/sytist/composite/layouts/:layoutId/graphics/:key/preview
+ * (Public.) Stream the actual image bytes of a stored static graphic.
+ * Used by the designer canvas and library thumbnails.
+ */
+router.get(
+  '/composite/layouts/:layoutId/graphics/:key/preview',
+  async (req, res) => {
+    try {
+      const { layoutId, key } = req.params;
+      const layout = await compositeService.getLayout(layoutId);
+      if (!layout) {
+        return res.status(404).json({ error: 'Layout not found' });
+      }
+      const meta = layout.graphics ? layout.graphics[key] : null;
+      const opened = await compositeGraphicsService.openGraphicStream({
+        layoutId,
+        key,
+        filename: meta && meta.filename,
+      });
+      if (!opened) {
+        return res.status(404).json({ error: 'Graphic file not found' });
+      }
+      res.setHeader('Content-Type', opened.mimeType);
+      res.setHeader('Content-Length', opened.sizeBytes);
+      res.setHeader(
+        'Cache-Control',
+        'no-store, no-cache, must-revalidate, max-age=0'
+      );
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+      opened.stream.pipe(res);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+/**
+ * GET /api/sytist/gallery-assets/logos/:galleryId/preview
+ * (Public.) Same rationale as the composite-graphics preview.
+ */
+router.get('/gallery-assets/logos/:galleryId/preview', async (req, res) => {
+  try {
+    const galleryId = parseInt(req.params.galleryId, 10);
+    const meta = await galleryAssetsService.getLogo(galleryId);
+    if (!meta) return res.status(404).json({ error: 'No logo set' });
+    const buffer = await galleryAssetsService.readLogoBuffer(galleryId);
+    if (!buffer) return res.status(404).json({ error: 'Logo file missing' });
+    const ext = require('path').extname(meta.logoFilename || '').toLowerCase();
+    const ct =
+      ext === '.png' ? 'image/png' :
+      ext === '.webp' ? 'image/webp' :
+      'image/jpeg';
+    res.set('Content-Type', ct);
+    res.set(
+      'Cache-Control',
+      'no-store, no-cache, must-revalidate, max-age=0'
+    );
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    res.send(buffer);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 router.use(requireAuth);
 
@@ -2038,6 +2121,32 @@ router.post('/composite/preview', async (req, res) => {
 
     const tokens = compositeService.buildTokensFromOrder(order, lineItem);
 
+    // Phase 9c: load any static graphics referenced by the chosen
+    // variant's slots and pass them via tokens.overlays. Same logic
+    // as in processingService Step 1.5 — loads from disk under the
+    // layout's graphics dir.
+    const variantDef = layout.variants?.[variant] || { slots: [] };
+    const graphicsMap = {};
+    const seenKeys = new Set();
+    for (const s of variantDef.slots || []) {
+      if (s.kind !== 'staticGraphic' && s.kind !== 'overlay') continue;
+      const key = s.graphicKey || s.overlayId;
+      if (!key || seenKeys.has(key)) continue;
+      seenKeys.add(key);
+      const meta = layout.graphics ? layout.graphics[key] : null;
+      try {
+        const buf = await compositeGraphicsService.readGraphicBuffer({
+          layoutId: layout.id,
+          key,
+          filename: meta && meta.filename,
+        });
+        if (buf) graphicsMap[key] = buf;
+      } catch {
+        // Continue — render will warn per-slot
+      }
+    }
+    tokens.overlays = graphicsMap;
+
     const result = await compositeService.buildSheetBuffer({
       layout,
       variant,
@@ -2072,6 +2181,227 @@ router.post('/composite/preview', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ─── Composite graphics (Phase 9c) ────────────────────────
+//
+// Per-layout static graphics (formerly "overlays" in slot kind
+// terminology). Files live under server/config/composite-graphics/<layoutId>/
+// and are referenced by `graphicKey` from layout slots.
+//
+// CRUD lives here rather than embedded in compositeService because the
+// upload requires the request body (HTTP-aware) and the service stays
+// pure (filesystem only).
+
+/**
+ * GET /api/sytist/composite/layouts/:layoutId/graphics
+ * Returns metadata for all graphics in this layout's library.
+ * Reconciles the layout JSON's `graphics` map against the on-disk
+ * directory so callers see an accurate picture even if they ever
+ * drift apart.
+ */
+router.get(
+  '/composite/layouts/:layoutId/graphics',
+  async (req, res) => {
+    try {
+      const layout = await compositeService.getLayout(req.params.layoutId);
+      if (!layout) {
+        return res.status(404).json({ error: 'Layout not found' });
+      }
+      const onDisk = await compositeGraphicsService.listGraphicsOnDisk(
+        layout.id
+      );
+      const inJson = layout.graphics || {};
+
+      // Merge: prefer JSON metadata (has uploadedAt etc.), fall back to
+      // on-disk-only entries
+      const byKey = {};
+      for (const item of onDisk) {
+        byKey[item.key] = {
+          key: item.key,
+          filename: item.filename,
+          mimeType: item.mimeType,
+          sizeBytes: item.sizeBytes,
+          inJson: false,
+        };
+      }
+      for (const [key, meta] of Object.entries(inJson)) {
+        byKey[key] = {
+          ...byKey[key],
+          ...meta,
+          key,
+          inJson: true,
+          onDisk: !!byKey[key],
+        };
+      }
+      res.json({
+        layoutId: layout.id,
+        graphics: Object.values(byKey),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+/**
+ * POST /api/sytist/composite/layouts/:layoutId/graphics/:key
+ * Upload (or replace) a graphic file under the given key.
+ * Body: { dataBase64, filename }
+ *
+ * Updates layout.graphics[key] in the layout JSON to reflect the new
+ * file. Both writes happen in this handler — service stays decoupled.
+ *
+ * Phase 9e-hotfix: per-route body-parser with 15 MB limit. The default
+ * express.json() middleware caps at 100kb which silently truncates
+ * large image uploads. 15 MB = enough headroom for a 10 MB binary
+ * base64-encoded (~13.3 MB) plus JSON overhead. Without this, an 8×10
+ * @ 300 DPI PNG (3-7 MB raw, 4-9 MB base64) would either fail with a
+ * 413 or come through empty depending on Express version.
+ */
+const graphicUploadJsonParser = express.json({ limit: '15mb' });
+
+router.post(
+  '/composite/layouts/:layoutId/graphics/:key',
+  requireRole('admin'),
+  graphicUploadJsonParser,
+  async (req, res) => {
+    try {
+      const { layoutId, key } = req.params;
+      const { dataBase64, filename } = req.body || {};
+      if (!dataBase64) {
+        return res.status(400).json({ error: 'dataBase64 is required' });
+      }
+      const layout = await compositeService.getLayout(layoutId);
+      if (!layout) {
+        return res.status(404).json({ error: 'Layout not found' });
+      }
+      const fileBuffer = Buffer.from(dataBase64, 'base64');
+
+      // Phase 9e-hotfix: log byte counts so size mismatches are obvious
+      // in server logs. If the browser sent N bytes of base64 but we
+      // decoded < N * 0.75, the body got truncated somewhere.
+      console.log(
+        `[composite/graphics POST] layout=${layoutId} key=${key} base64Length=${dataBase64.length} decodedBytes=${fileBuffer.length} filename=${filename || '?'}`
+      );
+
+      // Save the file
+      const meta = await compositeGraphicsService.saveGraphic({
+        layoutId,
+        key,
+        fileBuffer,
+        uploadedBy: req.user?.username || null,
+      });
+
+      // Update layout.graphics map
+      const updatedLayout = {
+        ...layout,
+        graphics: {
+          ...(layout.graphics || {}),
+          [key]: {
+            filename: meta.filename,
+            mimeType: meta.mimeType,
+            sizeBytes: meta.sizeBytes,
+            uploadedAt: meta.uploadedAt,
+            uploadedBy: meta.uploadedBy,
+            originalFilename: filename || null,
+          },
+        },
+      };
+      await compositeService.updateLayout(layoutId, updatedLayout);
+
+      res.json({
+        success: true,
+        graphic: { key, ...updatedLayout.graphics[key] },
+      });
+    } catch (err) {
+      console.error('[sytist/composite/graphics POST]', err);
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+/**
+ * DELETE /api/sytist/composite/layouts/:layoutId/graphics/:key
+ * Remove a graphic from the library. Slots that referenced this
+ * key will render with a "missing_graphic" warning until updated.
+ */
+router.delete(
+  '/composite/layouts/:layoutId/graphics/:key',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const { layoutId, key } = req.params;
+      const layout = await compositeService.getLayout(layoutId);
+      if (!layout) {
+        return res.status(404).json({ error: 'Layout not found' });
+      }
+      await compositeGraphicsService.deleteGraphicFile({ layoutId, key });
+      const nextGraphics = { ...(layout.graphics || {}) };
+      delete nextGraphics[key];
+      await compositeService.updateLayout(layoutId, {
+        ...layout,
+        graphics: nextGraphics,
+      });
+      res.json({ success: true });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+// (Public composite-graphics preview lives at the top of this file —
+// before the auth middleware — see Phase 9e-hotfix3.)
+
+
+/**
+ * GET /api/sytist/composite/layouts/:layoutId/graphics/:key/info
+ * Phase 9e-hotfix diagnostic: return metadata about a stored graphic
+ * file — file size, mime type, JSON-recorded metadata. Used to debug
+ * upload pipeline issues. If saved file size doesn't match what was
+ * uploaded, the upload pipeline is corrupting bytes somewhere.
+ */
+router.get(
+  '/composite/layouts/:layoutId/graphics/:key/info',
+  async (req, res) => {
+    try {
+      const { layoutId, key } = req.params;
+      const layout = await compositeService.getLayout(layoutId);
+      if (!layout) {
+        return res.status(404).json({ error: 'Layout not found' });
+      }
+      const meta = layout.graphics ? layout.graphics[key] : null;
+      const opened = await compositeGraphicsService.openGraphicStream({
+        layoutId,
+        key,
+        filename: meta && meta.filename,
+      });
+      if (!opened) {
+        return res.status(404).json({
+          error: 'Graphic file not found on disk',
+          jsonMeta: meta,
+        });
+      }
+      // Drain the stream just to compute size; don't return the bytes
+      let actualSize = 0;
+      for await (const chunk of opened.stream) {
+        actualSize += chunk.length;
+      }
+      res.json({
+        layoutId,
+        key,
+        onDisk: {
+          mimeType: opened.mimeType,
+          headerSizeBytes: opened.sizeBytes,
+          streamedBytes: actualSize,
+        },
+        jsonMeta: meta,
+        sizeMatches: meta ? meta.sizeBytes === actualSize : null,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
 
 // ─── Gallery assets (logos + overlays) ───────────────────
 
@@ -2142,28 +2472,11 @@ router.delete(
 /**
  * GET /api/sytist/gallery-assets/logos/:galleryId/preview
  *
- * Streams the logo bytes back so the Settings UI can show a preview.
- * 404 if not set.
+ * (Public — see Phase 9e-hotfix3. Duplicate registration above the
+ * auth middleware takes precedence over this one. Left here as
+ * dead code documentation; can be removed in a future cleanup.)
  */
-router.get('/gallery-assets/logos/:galleryId/preview', async (req, res) => {
-  try {
-    const galleryId = parseInt(req.params.galleryId, 10);
-    const meta = await galleryAssetsService.getLogo(galleryId);
-    if (!meta) return res.status(404).json({ error: 'No logo set' });
-    const buffer = await galleryAssetsService.readLogoBuffer(galleryId);
-    if (!buffer) return res.status(404).json({ error: 'Logo file missing' });
-    const ext = require('path').extname(meta.logoFilename).toLowerCase();
-    const ct =
-      ext === '.png' ? 'image/png' :
-      ext === '.webp' ? 'image/webp' :
-      'image/jpeg';
-    res.set('Content-Type', ct);
-    res.set('Cache-Control', 'no-store');
-    res.send(buffer);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+// router.get('/gallery-assets/logos/:galleryId/preview', ...) — handled above
 
 router.get('/gallery-assets/overlays', async (req, res) => {
   try {

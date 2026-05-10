@@ -65,6 +65,7 @@ const qrcodeService = require('./qrcodeService');
 const compositeService = require('./compositeService');
 const teamPhotoService = require('./teamPhotoService');
 const galleryAssetsService = require('./galleryAssetsService');
+const compositeGraphicsService = require('./compositeGraphicsService');
 const sytistDb = require('./sytistDbService');
 
 const SETTINGS_PATH = path.join(
@@ -648,6 +649,48 @@ class ProcessingService {
 
         // Build tokens from the order
         const tokens = compositeService.buildTokensFromOrder(order, li);
+
+        // Phase 9c: load any static graphics the layout references.
+        // Walk the chosen variant's slots, find every staticGraphic
+        // (or legacy 'overlay') slot, read the bytes from disk via
+        // compositeGraphicsService, and pass them as tokens.overlays.
+        // Misses are non-fatal — the renderer will warn per-slot
+        // and skip the placement.
+        const variantDef = layout.variants?.[variant] || { slots: [] };
+        const graphicsMap = {};
+        const seenKeys = new Set();
+        for (const s of variantDef.slots || []) {
+          if (s.kind !== 'staticGraphic' && s.kind !== 'overlay') continue;
+          const key = s.graphicKey || s.overlayId;
+          if (!key || seenKeys.has(key)) continue;
+          seenKeys.add(key);
+          const meta = layout.graphics ? layout.graphics[key] : null;
+          try {
+            const buf = await compositeGraphicsService.readGraphicBuffer({
+              layoutId: layout.id,
+              key,
+              filename: meta && meta.filename,
+            });
+            if (buf) {
+              graphicsMap[key] = buf;
+            } else {
+              subResult.warnings.push({
+                type: 'graphic_missing',
+                cartId: li.cartId,
+                message: `Static graphic "${key}" referenced by layout "${layout.id}" but file not found on disk`,
+              });
+            }
+          } catch (err) {
+            subResult.warnings.push({
+              type: 'graphic_load_error',
+              cartId: li.cartId,
+              message: `Loading graphic "${key}": ${err.message}`,
+            });
+          }
+        }
+        // The renderer expects buffers under tokens.overlays (naming
+        // kept for backward compat with the existing render path).
+        tokens.overlays = graphicsMap;
 
         const result = await compositeService.buildSheetBuffer({
           layout,

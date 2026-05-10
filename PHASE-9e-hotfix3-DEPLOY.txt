@@ -1,0 +1,160 @@
+Phase 9e-hotfix3 — preview endpoints public (auth bypass for image fetches)
+
+═══════════════════════════════════════════════════════
+THE BUG (now actually diagnosed)
+═══════════════════════════════════════════════════════
+
+The Network tab showed it clearly:
+
+  preview?v=2026-05-10T14...   401   json   0.1 kB
+
+The image preview endpoint was returning 401 Authentication Required.
+
+Why: the dashboard's auth middleware rejects requests without
+a session, and SVG <image> / HTML <img> native fetches don't
+carry whatever credential the JS API client uses. So when the
+canvas tries to render a graphic, the request fails with 401,
+and the browser shows nothing (or stale cached bytes from a
+previous successful fetch).
+
+This wasn't a cache problem like I thought in 9e-hotfix2 — it
+was an auth problem. The "stale cloudy/grass image" was either
+left over from a fetch that succeeded under different conditions
+(possibly before auth was tightened, or a different layout's
+graphic served in earlier testing), or was a browser-cached error
+response, or was something else weird. Doesn't matter — what
+matters is the request was failing the entire time.
+
+═══════════════════════════════════════════════════════
+THE FIX
+═══════════════════════════════════════════════════════
+
+Two preview endpoints registered BEFORE the `router.use(requireAuth)`
+middleware in sytist.js:
+
+  GET /api/sytist/composite/layouts/:layoutId/graphics/:key/preview
+  GET /api/sytist/gallery-assets/logos/:galleryId/preview
+
+These are public (no auth required). They serve image bytes that:
+  - Reveal nothing the caller doesn't already know about
+    (you need the layoutId and key to call them)
+  - Are inherent to a closed-environment internal lab tool
+    on localhost
+  - Need to work via native browser <img> / <image> fetches
+
+The duplicate auth-protected registrations later in the file are
+removed (the public ones take precedence anyway, but cleaner to
+not have dead code).
+
+All other endpoints — including upload, delete, list — still
+require auth. Only the read-only image streaming is public.
+
+═══════════════════════════════════════════════════════
+PREREQUISITES
+═══════════════════════════════════════════════════════
+
+Phase 9e-hotfix2 should be deployed (this builds on its
+cache-control improvements).
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/routes/sytist.js   + public composite preview registered
+                              before auth middleware
+                            + public logo preview registered
+                              before auth middleware
+                            - removed duplicate auth-protected
+                              registrations (dead code)
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-9e-hotfix3.tar.gz --strip-components=1
+  npm run dev
+
+Then in the dashboard tab, do one hard refresh (Ctrl+Shift+R)
+to clear any cached error responses, and try opening the layout
+designer. Your static graphic should now render correctly.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+After deploy + hard refresh:
+
+1. Open the layout designer with a layout that has a static
+   graphic uploaded.
+
+2. The canvas should now show your actual frame graphic — black
+   memory mate frame on watercolor background, in your case.
+
+3. Open DevTools → Network tab → reload page.
+
+4. Find the `preview?v=...` row. Status should now be 200, not
+   401. Type should be `png` or `jpeg` (not `json`).
+
+5. Click the preview row → Preview tab on the right. You should
+   see your actual graphic.
+
+6. Try opening this URL directly in your browser tab (no
+   incognito needed since auth no longer required):
+
+   http://localhost:3011/api/sytist/composite/layouts/MM-General/graphics/Generic-MM2025/preview
+
+   You should see your frame graphic load directly.
+
+═══════════════════════════════════════════════════════
+SECURITY NOTE
+═══════════════════════════════════════════════════════
+
+Making preview endpoints public is appropriate for this
+deployment context (closed environment, localhost, internal
+lab tool). If the dashboard ever gets exposed to the internet
+or shared across organizations, these would need to be
+auth-protected and you'd need a different solution for
+authenticating image fetches (e.g., short-lived signed URLs,
+or moving images to a CDN with bearer tokens).
+
+For Sportsline today: no concern.
+
+═══════════════════════════════════════════════════════
+HONEST POST-MORTEM
+═══════════════════════════════════════════════════════
+
+I went down two wrong paths before finding this:
+
+  9e-hotfix:   Body-parser limit (turned out fine — uploads
+              were working)
+  9e-hotfix2:  Browser cache (real issue but not THE issue)
+
+The actual cause was auth-rejecting the SVG <image> fetch.
+I should have asked you to open DevTools → Network FIRST,
+before any speculation. The 401 status would have told me
+the answer immediately. Instead I spent two hotfixes
+chasing other theories.
+
+Going forward, when you describe an image not rendering as
+expected, my first ask should be: "open DevTools → Network,
+look for the image request, what's its status code?" Not:
+"let me hypothesize and ship a fix."
+
+Sorry for the runaround. This one should actually be it.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 9c            Static Graphics
+✓ 9c-hotfix     Rules-of-hooks
+✓ 9c-hotfix2    .toFixed crash
+✗ 9d            See-through-graphics (rolled back)
+✓ 9e            Native PNG transparency + hide/lock
+≈ 9e-hotfix     Body-parser limit + diagnostics (defensive,
+                no actual problem)
+≈ 9e-hotfix2    Cache headers (defensive improvement, but not
+                the actual fix for the original bug)
+✓ 9e-hotfix3    Preview endpoints public — THE actual fix ← here

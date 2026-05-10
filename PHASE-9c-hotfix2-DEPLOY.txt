@@ -1,0 +1,114 @@
+Phase 9c-hotfix2 — runtime crash from non-numeric slot dimensions
+
+═══════════════════════════════════════════════════════
+THE BUG
+═══════════════════════════════════════════════════════
+
+After 9c-hotfix made the build compile, the dashboard threw at
+runtime when rendering layer cards:
+
+  TypeError: (intermediate value).toFixed is not a function
+  at LayerCard
+
+Diagnosis: the layer card's collapsed-state header shows a quick
+position/size summary like "1.50″,2.00″ · 3.00×4.00". That display
+called `.toFixed(2)` on `slot.x`, `slot.y`, `slot.w`, `slot.h`
+with `(slot.x ?? 0)` as the fallback.
+
+The `??` fallback only catches `null` and `undefined`. It does NOT
+catch the empty string. The base SettingsForm NumberInput emits an
+empty string when the user clears a numeric field — and that empty
+string passed straight through `??` into `.toFixed`, which doesn't
+exist on String.prototype.
+
+Hand-edited layout JSONs with string-quoted numbers (e.g.
+`"x": "1.5"`) would also hit this. Strings have no `.toFixed`.
+
+═══════════════════════════════════════════════════════
+THE FIX
+═══════════════════════════════════════════════════════
+
+Three layers of defense:
+
+1. NEW HELPER `fmt(n)` — Number-coerces the input then `.toFixed(2)`.
+   Returns "0.00" for any non-finite value (empty string, NaN,
+   undefined, null, garbage). Used wherever the layer card displays
+   a dimension.
+
+2. `update()` IN SLOTEDITORBODY — when the user types into a numeric
+   field (x/y/w/h/fontSize), coerce the value to a number (or 0)
+   BEFORE storing in the slot. Empty inputs become 0, garbage becomes
+   0, valid numbers pass through. Stops the empty-string-into-state
+   path at the source.
+
+3. LAYOUTMETAEDITOR — same coercion for sheet width/height and DPI
+   onChange handlers. Prevents the same crash from the layout-level
+   metadata side.
+
+4. LAYOUTCANVAS DRAG START — also coerce the slot's x/y/w/h when
+   capturing the drag-start snapshot. Defends against any path where
+   string values made it into the slot (e.g. legacy JSON files with
+   `"x": "1.5"` instead of `"x": 1.5`). Without this, drag math
+   would do `"1.5" + 0.1` = "1.50.1" — broken.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/pages/settings/LayoutDesignerPage.js   fmt helper, update
+                                                    coercion, hint text
+                                                    fix, meta editor
+                                                    coercion
+  client/src/components/LayoutCanvas.js              coerceSlotDims at
+                                                    drag/resize start
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-9c-hotfix2.tar.gz --strip-components=1
+  npm run dev
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+Tested LayersPanel with five different pathological slot shapes:
+  - Slot with all empty-string dimensions
+  - Slot with undefined dimensions
+  - Slot with string-quoted numbers (e.g. x: "1.5")
+  - Valid slot with proper numbers
+  - Completely empty slot object {}
+
+All 5 rendered without crashing. String "1.5" is correctly coerced
+and displayed as "1.50″". Missing fields default to "0.00".
+
+═══════════════════════════════════════════════════════
+HONEST NOTE
+═══════════════════════════════════════════════════════
+
+This is a class of bug that's only catchable at runtime: ESLint
+doesn't know `slot.x` is sometimes an empty string, the parser
+sees `(slot.x ?? 0).toFixed(2)` as syntactically valid code. The
+React DOM server-side smoke test I ran initially used valid number
+inputs and so didn't exercise the empty-string path.
+
+Going forward I'll add a "throw pathological inputs at it" pass
+to my smoke tests for any component doing arithmetic on user-
+supplied numbers — this is the second time in two days a typing
+issue hit production.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 4.1-4.7      Production pipeline complete
+✓ 8a/8b        Composite engine end-to-end
+✓ 9a/9b        Visual layout designer
+✓ 9b-hotfix    Layers panel + new-layout flow
+✓ 9b-hotfix2   Drag-to-reorder + sticky add buttons
+✓ 9c           Static Graphics: rename + uploadable per-layout library
+✓ 9c-hotfix    Fix rules-of-hooks violation (build-time)
+✓ 9c-hotfix2   Fix .toFixed crash (runtime) ← this

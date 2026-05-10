@@ -1,0 +1,120 @@
+Phase 9e-hotfix2 — fix browser cache showing stale graphics
+
+═══════════════════════════════════════════════════════
+THE BUG (now diagnosed)
+═══════════════════════════════════════════════════════
+
+Your most recent screenshot shows the canvas rendering a cloudy-
+gray-and-green image. But the file you uploaded (Generic_MM2025.png)
+is a black memory-mate frame on a watercolor background. They don't
+match.
+
+Diagnosis: the browser is showing a cached PREVIOUS upload's pixel
+data at the URL `/preview?v=N`, even after you re-uploaded a
+different image at the same key. Two contributing factors:
+
+1. The preview endpoint set 'Cache-Control: no-cache', which —
+   confusingly — does NOT mean "don't cache." It means "you may
+   cache, but you must revalidate before serving." With no
+   Last-Modified or ETag headers on the response, the browser
+   may decide to serve the cached copy without revalidating.
+
+2. The client used a render-counter `graphicsBust` as the URL's
+   cache-buster. The counter increments after every library
+   refresh, but if the render hasn't completed when the counter
+   bumps, the URL might not actually change between renders.
+
+═══════════════════════════════════════════════════════
+THE FIX
+═══════════════════════════════════════════════════════
+
+SERVER:
+  Cache-Control: 'no-store, no-cache, must-revalidate, max-age=0'
+  + Pragma: 'no-cache' + Expires: '0'
+  Browsers are required to make a network request every time —
+  no shortcut to a cached copy ever.
+
+CLIENT:
+  Cache-buster URL is now built from the file's `uploadedAt`
+  timestamp and `sizeBytes` from the library metadata. So the
+  URL changes if and only if the file on disk actually changed.
+  Re-uploads at the same key get a new URL automatically.
+
+═══════════════════════════════════════════════════════
+PREREQUISITES
+═══════════════════════════════════════════════════════
+
+Phases up through 9e-hotfix should be deployed.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/routes/sytist.js                            Cache-Control:
+                                                     no-store on preview
+                                                     endpoint
+  client/src/pages/settings/LayoutDesignerPage.js    Use uploadedAt+size
+                                                     as cache buster in
+                                                     all 3 places
+                                                     graphics URLs are
+                                                     built (canvas,
+                                                     slot editor thumb,
+                                                     library thumbs)
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-9e-hotfix2.tar.gz --strip-components=1
+  npm run dev
+
+═══════════════════════════════════════════════════════
+ALSO: DO A HARD REFRESH AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+The cache headers don't retroactively clear what's already in
+the browser cache from BEFORE this fix. After deploying:
+
+  1. Reload the dashboard
+  2. Press Ctrl+Shift+R to force a full reload (bypassing cache)
+  3. Or open DevTools → Network tab → check "Disable cache" while
+     DevTools is open
+
+After that one-time hard refresh, future re-uploads will refresh
+correctly without manual intervention.
+
+═══════════════════════════════════════════════════════
+BEFORE OR AFTER DEPLOY: VERIFY DISK FILE
+═══════════════════════════════════════════════════════
+
+To confirm what's actually on disk (vs what's cached in your
+browser), open these URLs in a fresh Incognito window where no
+cache exists:
+
+  http://localhost:3011/api/sytist/composite/layouts/MM-Generic/graphics/Generic-MM2025/preview
+
+This is the raw file streamed from disk. If it shows the BLACK
+MEMORY MATE FRAME, the disk is correct and the bug was indeed
+just browser cache. If it shows the cloudy/grass image, then
+that's what's actually on disk and the upload pipeline put the
+wrong file there somehow (we'd need to dig more).
+
+  http://localhost:3011/api/sytist/composite/layouts/MM-Generic/graphics/Generic-MM2025/info
+
+The diagnostic endpoint added in 9e-hotfix. Returns the file
+size on disk. If `streamedBytes` is around 2,161,695 (matching
+your earlier upload log), the right file is on disk.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 9c            Static Graphics
+✓ 9c-hotfix     Rules-of-hooks
+✓ 9c-hotfix2    .toFixed crash
+✗ 9d            See-through-graphics (rolled back)
+✓ 9e            Native PNG transparency + hide/lock
+✓ 9e-hotfix     Body-parser limit + diagnostics
+✓ 9e-hotfix2    Browser cache: no-store + uploadedAt cache-bust ← here

@@ -59,6 +59,22 @@ export default function LayoutDesignerPage() {
   const [selectedIndex, setSelectedIndex] = useState(null);
   const [snapEnabled, setSnapEnabled] = useState(true);
 
+  // Phase 9e: per-slot designer-only view state. Hide skips the slot
+  // from canvas rendering; lock disables interaction (mouse drag,
+  // resize, selection from canvas — though the layer card click still
+  // works). Both transient — reset every time the layout opens.
+  // Stored as { variantName: { slotIndex: true, ... } } so vertical
+  // and horizontal variants have independent state. Per-variant
+  // because slot indices have different meanings across variants.
+  const [hiddenSlotsByVariant, setHiddenSlotsByVariant] = useState({
+    vertical: {},
+    horizontal: {},
+  });
+  const [lockedSlotsByVariant, setLockedSlotsByVariant] = useState({
+    vertical: {},
+    horizontal: {},
+  });
+
   // Preview state
   const [previewMode, setPreviewMode] = useState('placeholder'); // 'placeholder' | 'order'
   const [previewOrderId, setPreviewOrderId] = useState('');
@@ -66,6 +82,28 @@ export default function LayoutDesignerPage() {
   const [previewImageDataUrl, setPreviewImageDataUrl] = useState(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState(null);
+
+  // Phase 9c: graphics library for this layout. Loaded from
+  // GET /composite/layouts/:id/graphics. Refreshed after every upload
+  // or delete. graphicsBust is a counter that increments on each
+  // refresh so <img> URLs include a cache-busting suffix and re-uploads
+  // at the same key show fresh.
+  const [graphicsLibrary, setGraphicsLibrary] = useState([]);
+  const [graphicsBust, setGraphicsBust] = useState(0);
+  const [graphicsError, setGraphicsError] = useState(null);
+
+  async function loadGraphicsLibrary() {
+    try {
+      const r = await api.get(
+        `/api/sytist/composite/layouts/${encodeURIComponent(layoutId)}/graphics`
+      );
+      setGraphicsLibrary(r.graphics || []);
+      setGraphicsBust((b) => b + 1);
+      setGraphicsError(null);
+    } catch (err) {
+      setGraphicsError(err.message);
+    }
+  }
 
   // ─── Load layout from server ─────────────────────────────
 
@@ -82,6 +120,10 @@ export default function LayoutDesignerPage() {
         if (!data.variants?.vertical && data.variants?.horizontal) {
           setVariant('horizontal');
         }
+        // Phase 9c: also load the graphics library. Non-fatal if it
+        // fails — the page still works, static graphics just won't
+        // render their thumbnails.
+        loadGraphicsLibrary().catch(() => {});
       })
       .catch((err) => {
         if (!cancelled) setError(err.message);
@@ -92,6 +134,7 @@ export default function LayoutDesignerPage() {
     return () => {
       cancelled = true;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [layoutId]);
 
   // Reset selection when variant changes (slot indices are per-variant)
@@ -147,6 +190,86 @@ export default function LayoutDesignerPage() {
   function handleSlotDelete(index) {
     updateVariantSlots((slots) => slots.filter((_, i) => i !== index));
     setSelectedIndex(null);
+    // Phase 9e: when a slot is deleted, every later index shifts down
+    // by one. Re-key the visibility/lock maps to match.
+    remapVariantStateOnDelete(index);
+  }
+
+  // ─── Phase 9e: hide/lock per-slot state helpers ─────────
+  //
+  // Both maps are keyed by slot index within a variant. When slots
+  // are reordered or deleted, indices shift, so we must remap the
+  // state to keep the right slots hidden/locked. These helpers
+  // encapsulate that bookkeeping so the call sites don't need to
+  // know about it.
+
+  const hiddenSlots = hiddenSlotsByVariant[variant] || {};
+  const lockedSlots = lockedSlotsByVariant[variant] || {};
+
+  function toggleSlotHidden(index) {
+    setHiddenSlotsByVariant((prev) => {
+      const cur = prev[variant] || {};
+      const next = { ...cur };
+      if (next[index]) delete next[index];
+      else next[index] = true;
+      return { ...prev, [variant]: next };
+    });
+  }
+
+  function toggleSlotLocked(index) {
+    setLockedSlotsByVariant((prev) => {
+      const cur = prev[variant] || {};
+      const next = { ...cur };
+      if (next[index]) delete next[index];
+      else next[index] = true;
+      return { ...prev, [variant]: next };
+    });
+  }
+
+  // After a slot at `removedIndex` is deleted, remap the maps so
+  // indices > removedIndex shift down by one.
+  function remapVariantStateOnDelete(removedIndex) {
+    const remap = (m) => {
+      const out = {};
+      for (const [kStr, v] of Object.entries(m || {})) {
+        const k = Number(kStr);
+        if (k === removedIndex) continue;
+        const newKey = k > removedIndex ? k - 1 : k;
+        out[newKey] = v;
+      }
+      return out;
+    };
+    setHiddenSlotsByVariant((prev) => ({
+      ...prev,
+      [variant]: remap(prev[variant]),
+    }));
+    setLockedSlotsByVariant((prev) => ({
+      ...prev,
+      [variant]: remap(prev[variant]),
+    }));
+  }
+
+  // After slots are reordered (drag, ↑/↓), remap state to follow the
+  // moved slot's new position. mapping is { oldIndex: newIndex } for
+  // every slot whose index changed.
+  function remapVariantStateOnReorder(mapping) {
+    const remap = (m) => {
+      const out = {};
+      for (const [kStr, v] of Object.entries(m || {})) {
+        const k = Number(kStr);
+        const newKey = mapping[k] !== undefined ? mapping[k] : k;
+        out[newKey] = v;
+      }
+      return out;
+    };
+    setHiddenSlotsByVariant((prev) => ({
+      ...prev,
+      [variant]: remap(prev[variant]),
+    }));
+    setLockedSlotsByVariant((prev) => ({
+      ...prev,
+      [variant]: remap(prev[variant]),
+    }));
   }
 
   function handleAddSlot(kind) {
@@ -162,9 +285,117 @@ export default function LayoutDesignerPage() {
     updateVariantSlots((slots) => {
       const nextSlots = [...slots, newSlot];
       // Select the newly added slot so the property panel shows it
-      // immediately
+      // immediately. New slot is appended → it's at the end of the
+      // array → drawn last → on top of canvas → top of layers panel.
       setTimeout(() => setSelectedIndex(nextSlots.length - 1), 0);
       return nextSlots;
+    });
+  }
+
+  // Phase 9b-hotfix: layer reorder helpers.
+  //
+  // The layers panel displays slots in REVERSED array order — the
+  // last slot in the JSON is shown FIRST in the panel, because that's
+  // the topmost layer on the canvas. Photoshop convention.
+  //
+  // "Move up" in the panel means "move toward the top of the canvas"
+  //   = move the slot LATER in the JSON array.
+  // "Move down" means the opposite.
+  //
+  // These functions take the JSON array index (not display index).
+
+  function handleSlotMoveUp(index) {
+    // Swap with slots[index + 1] — same slot just gets drawn later
+    // (more on top in the canvas, which is "up" in the layers panel).
+    updateVariantSlots((slots) => {
+      if (index >= slots.length - 1) return slots; // already on top
+      const next = [...slots];
+      [next[index], next[index + 1]] = [next[index + 1], next[index]];
+      // Update selection to follow the moved slot to its new index
+      setTimeout(() => setSelectedIndex(index + 1), 0);
+      // Phase 9e: swap visibility/lock state along with the slots
+      remapVariantStateOnReorder({
+        [index]: index + 1,
+        [index + 1]: index,
+      });
+      return next;
+    });
+  }
+
+  function handleSlotMoveDown(index) {
+    updateVariantSlots((slots) => {
+      if (index <= 0) return slots; // already at bottom
+      const next = [...slots];
+      [next[index], next[index - 1]] = [next[index - 1], next[index]];
+      setTimeout(() => setSelectedIndex(index - 1), 0);
+      remapVariantStateOnReorder({
+        [index]: index - 1,
+        [index - 1]: index,
+      });
+      return next;
+    });
+  }
+
+  // Phase 9b-hotfix2: drag-and-drop reorder.
+  //
+  // Inputs are in JSON-array space (NOT display space):
+  //   fromJsonIdx — the slot being dragged
+  //   targetJsonIdx — the slot it was dropped onto
+  //   position — 'above' or 'below', interpreted in PANEL display terms
+  //              (panel is reversed from JSON, so 'above target in
+  //              panel' = 'after target in JSON array')
+  //
+  // The math:
+  //   panel "above" → JSON insert position is `targetJsonIdx + 1`
+  //   panel "below" → JSON insert position is `targetJsonIdx`
+  //   then splice(fromJsonIdx, 1) and splice(insertPos, 0, item),
+  //   adjusting insertPos if fromJsonIdx < insertPos (because the
+  //   removal shifted later indices down by one).
+  function handleSlotReorder(fromJsonIdx, targetJsonIdx, position) {
+    if (fromJsonIdx === targetJsonIdx) return;
+    updateVariantSlots((slots) => {
+      if (fromJsonIdx < 0 || fromJsonIdx >= slots.length) return slots;
+      if (targetJsonIdx < 0 || targetJsonIdx >= slots.length) return slots;
+
+      // Compute insert position in the original array
+      let insertPos = position === 'above'
+        ? targetJsonIdx + 1   // panel-above = JSON-after
+        : targetJsonIdx;      // panel-below = JSON-at-target
+
+      // If we already are at the destination, nothing to do
+      if (insertPos === fromJsonIdx || insertPos === fromJsonIdx + 1) {
+        // Inserting just before or just after current position is a no-op
+        return slots;
+      }
+
+      const next = [...slots];
+      const [item] = next.splice(fromJsonIdx, 1);
+      // After splice, indices > fromJsonIdx shifted down by 1
+      const adjustedInsert = fromJsonIdx < insertPos ? insertPos - 1 : insertPos;
+      next.splice(adjustedInsert, 0, item);
+
+      // Selection follows the dragged item to its new position
+      setTimeout(() => setSelectedIndex(adjustedInsert), 0);
+
+      // Phase 9e: build a {oldIndex: newIndex} mapping for the reorder
+      // and apply it to visibility/lock state.
+      const mapping = {};
+      // The moved item went from fromJsonIdx → adjustedInsert
+      mapping[fromJsonIdx] = adjustedInsert;
+      // Other slots' indices shift based on the splice direction
+      const N = slots.length;
+      for (let i = 0; i < N; i++) {
+        if (i === fromJsonIdx) continue;
+        let newI = i;
+        // Removal step: indices > fromJsonIdx shift down by 1
+        if (i > fromJsonIdx) newI = i - 1;
+        // Insertion step: indices >= adjustedInsert shift up by 1
+        if (newI >= adjustedInsert) newI += 1;
+        if (newI !== i) mapping[i] = newI;
+      }
+      remapVariantStateOnReorder(mapping);
+
+      return next;
     });
   }
 
@@ -206,6 +437,94 @@ export default function LayoutDesignerPage() {
     }
     setLayout(JSON.parse(originalJson));
     setSelectedIndex(null);
+  }
+
+  // ─── Phase 9c: graphics CRUD ────────────────────────────
+  //
+  // Upload writes file + updates layout.graphics on the server, then
+  // refreshes the layout (server-side already merged it) and the
+  // library list. The local "originalJson" updates too because the
+  // server-side write is the canonical persistence — uploads are
+  // intentionally not part of the unsaved-changes flow. The slot's
+  // graphicKey field IS part of unsaved changes, but the file upload
+  // itself is committed immediately.
+  //
+  // This deliberate split means: if you upload a graphic and then
+  // click Discard, the file STAYS on the server (you can re-reference
+  // it later), but any slot field changes (key references) revert.
+  // Deleting an unused graphic to clean up requires explicit action
+  // via the library section.
+
+  async function handleUploadGraphic({ key, filename, dataBase64 }) {
+    const r = await api.post(
+      `/api/sytist/composite/layouts/${encodeURIComponent(layoutId)}/graphics/${encodeURIComponent(key)}`,
+      { dataBase64, filename }
+    );
+    // The server already updated layout.graphics — refresh the layout
+    // so our in-memory copy includes the new entry. We MERGE rather
+    // than replace so any unsaved slot edits aren't blown away.
+    try {
+      const fresh = await api.get(
+        `/api/sytist/composite/layouts/${encodeURIComponent(layoutId)}`
+      );
+      setLayout((prev) => {
+        if (!prev) return fresh;
+        // Keep the local slots/variants/meta — only adopt the new
+        // graphics map from the server
+        return { ...prev, graphics: fresh.graphics || {} };
+      });
+      // The originalJson should reflect the post-upload state of the
+      // graphics map. Otherwise, isDirty would flip true just because
+      // the graphics entry got added.
+      setOriginalJson((prev) => {
+        if (!prev) return JSON.stringify(fresh);
+        try {
+          const o = JSON.parse(prev);
+          o.graphics = fresh.graphics || {};
+          return JSON.stringify(o);
+        } catch {
+          return JSON.stringify(fresh);
+        }
+      });
+    } catch {
+      // Non-fatal — library list refresh below still works
+    }
+    await loadGraphicsLibrary();
+    return r;
+  }
+
+  async function handleDeleteGraphic(key) {
+    if (
+      !window.confirm(
+        `Delete graphic "${key}" from this layout? Any slots that reference it will show a "missing graphic" warning until updated.`
+      )
+    ) {
+      return;
+    }
+    await api.del(
+      `/api/sytist/composite/layouts/${encodeURIComponent(layoutId)}/graphics/${encodeURIComponent(key)}`
+    );
+    // Same merge pattern — adopt the server's graphics map, keep local
+    // slot edits
+    try {
+      const fresh = await api.get(
+        `/api/sytist/composite/layouts/${encodeURIComponent(layoutId)}`
+      );
+      setLayout((prev) =>
+        prev ? { ...prev, graphics: fresh.graphics || {} } : fresh
+      );
+      setOriginalJson((prev) => {
+        if (!prev) return JSON.stringify(fresh);
+        try {
+          const o = JSON.parse(prev);
+          o.graphics = fresh.graphics || {};
+          return JSON.stringify(o);
+        } catch {
+          return JSON.stringify(fresh);
+        }
+      });
+    } catch {}
+    await loadGraphicsLibrary();
   }
 
   // ─── Live preview (debounced) ────────────────────────────
@@ -266,6 +585,35 @@ export default function LayoutDesignerPage() {
 
   // ─── Render ──────────────────────────────────────────────
 
+  // Phase 9c: build a map of { graphicKey → preview URL } from the
+  // library so the canvas can render uploaded graphics inline.
+  //
+  // Phase 9e-hotfix2: include the graphic's uploadedAt timestamp in
+  // the URL as a cache buster. This is stronger than a render-counter
+  // because the URL changes if and only if the file actually changed
+  // — so re-uploads at the same key always force a fresh fetch, and
+  // unchanged graphics keep their cache hit (faster).
+  //
+  // CRITICAL: this useMemo MUST be above the early returns below.
+  // React's rules-of-hooks require hooks to run in the same order
+  // every render — putting it below `if (loading) return` would
+  // skip the hook on the first render but call it on subsequent
+  // ones, breaking React's internal hook tracking.
+  const graphicsUrls = useMemo(() => {
+    const out = {};
+    for (const g of graphicsLibrary || []) {
+      if (g.onDisk === false) continue;
+      // Use uploadedAt + size as the buster; fall back to graphicsBust
+      // counter if the metadata isn't present
+      const bust = g.uploadedAt
+        ? encodeURIComponent(g.uploadedAt) + '-' + (g.sizeBytes || 0)
+        : graphicsBust;
+      out[g.key] =
+        `/api/sytist/composite/layouts/${encodeURIComponent(layoutId)}/graphics/${encodeURIComponent(g.key)}/preview?v=${bust}`;
+    }
+    return out;
+  }, [graphicsLibrary, graphicsBust, layoutId]);
+
   if (loading) {
     return (
       <div>
@@ -286,7 +634,6 @@ export default function LayoutDesignerPage() {
 
   const variantDef = layout.variants?.[variant];
   const slots = variantDef?.slots || [];
-  const selectedSlot = selectedIndex !== null ? slots[selectedIndex] : null;
 
   // Canvas dimensions: keep the longer side at 504
   const TARGET_LONG_SIDE = 504;
@@ -386,6 +733,9 @@ export default function LayoutDesignerPage() {
             backgroundImageDataUrl={
               previewMode === 'order' ? previewImageDataUrl : null
             }
+            graphicsUrls={graphicsUrls}
+            hiddenSlots={hiddenSlots}
+            lockedSlots={lockedSlots}
           />
           <CanvasFooterToolbar
             snapEnabled={snapEnabled}
@@ -401,28 +751,46 @@ export default function LayoutDesignerPage() {
           />
         </div>
 
-        {/* RIGHT: property panel */}
+        {/* RIGHT: layers panel + layout meta editor */}
         <div>
-          {selectedSlot ? (
-            <SlotEditor
-              slot={selectedSlot}
-              slotIndex={selectedIndex}
-              variantName={variant}
-              totalSlots={slots.length}
-              sheetWidth={layout.sheetWidth}
-              sheetHeight={layout.sheetHeight}
-              onChange={(newSlot) =>
-                handleSlotChange(selectedIndex, newSlot)
-              }
-              onDelete={() => handleSlotDelete(selectedIndex)}
-            />
-          ) : (
-            <LayoutMetaEditor
-              layout={layout}
-              onChange={handleLayoutMetaChange}
-            />
-          )}
-          <AddSlotToolbar onAdd={handleAddSlot} disabled={!variantDef} />
+          <LayoutMetaEditor
+            layout={layout}
+            onChange={handleLayoutMetaChange}
+            collapsed={selectedIndex !== null}
+          />
+          <GraphicsLibrarySection
+            layoutId={layoutId}
+            graphicsLibrary={graphicsLibrary}
+            graphicsBust={graphicsBust}
+            graphicsError={graphicsError}
+            onUpload={handleUploadGraphic}
+            onDelete={handleDeleteGraphic}
+            onRefresh={loadGraphicsLibrary}
+            collapsedDefault={true}
+          />
+          <LayersPanel
+            slots={slots}
+            selectedIndex={selectedIndex}
+            variantName={variant}
+            sheetWidth={layout.sheetWidth}
+            sheetHeight={layout.sheetHeight}
+            onSelect={setSelectedIndex}
+            onChange={handleSlotChange}
+            onDelete={handleSlotDelete}
+            onMoveUp={handleSlotMoveUp}
+            onMoveDown={handleSlotMoveDown}
+            onReorder={handleSlotReorder}
+            onAdd={handleAddSlot}
+            disabled={!variantDef}
+            layoutId={layoutId}
+            graphicsLibrary={graphicsLibrary}
+            onUploadGraphic={handleUploadGraphic}
+            graphicsBust={graphicsBust}
+            hiddenSlots={hiddenSlots}
+            lockedSlots={lockedSlots}
+            onToggleHidden={toggleSlotHidden}
+            onToggleLocked={toggleSlotLocked}
+          />
         </div>
       </div>
     </div>
@@ -637,42 +1005,46 @@ function CanvasFooterToolbar({
 
 // ─── Slot editor (right panel when slot selected) ──────────
 
-function SlotEditor({
+function SlotEditorBody({
   slot,
-  slotIndex,
-  variantName,
-  totalSlots,
   sheetWidth,
   sheetHeight,
   onChange,
-  onDelete,
+  // Phase 9c: graphics library context for staticGraphic slots
+  layoutId,
+  graphicsLibrary,
+  onUploadGraphic,
+  graphicsBust,
 }) {
   function update(field, value) {
-    onChange({ ...slot, [field]: value });
+    // Phase 9c-hotfix2: coerce numeric slot fields. NumberInput emits
+    // an empty string when the user clears a field; if we stored that,
+    // downstream code (drag math, .toFixed displays, SVG attributes)
+    // would break. For numeric fields, an empty input means "0".
+    const numericFields = new Set(['x', 'y', 'w', 'h', 'fontSize']);
+    let v = value;
+    if (numericFields.has(field)) {
+      const n = Number(v);
+      v = Number.isFinite(n) ? n : 0;
+    }
+    onChange({ ...slot, [field]: v });
   }
 
   const isText = slot.kind === 'text';
-  const isImage = ['playerPhoto', 'teamPhoto', 'logo', 'overlay'].includes(slot.kind);
+  const isStaticGraphic = slot.kind === 'staticGraphic' || slot.kind === 'overlay';
+  const isImage = ['playerPhoto', 'teamPhoto', 'logo', 'staticGraphic', 'overlay'].includes(slot.kind);
 
   return (
-    <Section
-      title={`Slot ${slotIndex + 1} of ${totalSlots} (${variantName})`}
-      description="Edit selected slot. Changes preview immediately on the canvas; click Save to persist."
-      actions={
-        <Button variant="danger" onClick={onDelete}>
-          Delete slot
-        </Button>
-      }
-    >
+    <div>
       <FormRow label="Kind">
         <Select
-          value={slot.kind}
+          value={slot.kind === 'overlay' ? 'staticGraphic' : slot.kind}
           onChange={(v) => update('kind', v)}
           options={[
             { value: 'playerPhoto', label: 'Player photo' },
             { value: 'teamPhoto', label: 'Team photo' },
             { value: 'logo', label: 'Logo' },
-            { value: 'overlay', label: 'Overlay' },
+            { value: 'staticGraphic', label: 'Static graphic' },
             { value: 'text', label: 'Text' },
           ]}
         />
@@ -685,14 +1057,14 @@ function SlotEditor({
           gap: 8,
         }}
       >
-        <FormRow label="X (in)" hint={`0 to ${(sheetWidth - (slot.w || 0)).toFixed(2)}`}>
+        <FormRow label="X (in)" hint={`0 to ${fmt((Number(sheetWidth) || 0) - (Number(slot.w) || 0))}`}>
           <NumberInput
             value={slot.x ?? 0}
             onChange={(v) => update('x', v)}
             step="0.05"
           />
         </FormRow>
-        <FormRow label="Y (in)" hint={`0 to ${(sheetHeight - (slot.h || 0)).toFixed(2)}`}>
+        <FormRow label="Y (in)" hint={`0 to ${fmt((Number(sheetHeight) || 0) - (Number(slot.h) || 0))}`}>
           <NumberInput
             value={slot.y ?? 0}
             onChange={(v) => update('y', v)}
@@ -734,15 +1106,15 @@ function SlotEditor({
         </FormRow>
       )}
 
-      {slot.kind === 'overlay' && (
-        <FormRow label="Overlay ID" hint="ID from gallery-assets">
-          <TextInput
-            value={slot.overlayId || ''}
-            onChange={(v) => update('overlayId', v)}
-            monospace
-            placeholder="ov-..."
-          />
-        </FormRow>
+      {isStaticGraphic && (
+        <StaticGraphicSlotEditor
+          slot={slot}
+          layoutId={layoutId}
+          graphicsLibrary={graphicsLibrary}
+          onUploadGraphic={onUploadGraphic}
+          onChange={update}
+          graphicsBust={graphicsBust}
+        />
       )}
 
       {isText && (
@@ -844,92 +1216,1263 @@ function SlotEditor({
           {JSON.stringify(slot, null, 2)}
         </pre>
       </details>
+    </div>
+  );
+}
+
+// ─── Static graphic slot editor (Phase 9c) ─────────────────
+//
+// Embedded inside SlotEditorBody when the selected slot is a Static
+// Graphic. Three controls:
+//   1. Graphic key — text input. The reference name. Kept short and
+//      filename-safe (alphanumeric + hyphen + underscore). Operators
+//      can change it; if they pick a key that already exists in the
+//      library, the slot just references it (no upload needed).
+//   2. Pick from library — dropdown of existing keys in this layout.
+//      Quick way to reuse a graphic that's already been uploaded.
+//   3. Upload button — file picker. Reads the file as base64 and
+//      POSTs to the layout's graphics endpoint. On success, the
+//      library refreshes and this slot's key is set automatically.
+//
+// Thumbnail of the currently-referenced graphic appears below if a
+// file exists. Uses the preview endpoint with a cache-busting suffix
+// so re-uploads at the same key show fresh.
+
+function StaticGraphicSlotEditor({
+  slot,
+  layoutId,
+  graphicsLibrary,
+  onUploadGraphic,
+  onChange,
+  graphicsBust,
+}) {
+  // Backward compat: accept legacy overlayId as the source of truth
+  // when graphicKey isn't set
+  const currentKey = slot.graphicKey || slot.overlayId || '';
+  const fileInputRef = useRef(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState(null);
+
+  function handleKeyChange(v) {
+    // Sanitize key inline as the operator types — same rules as the
+    // server-side validator
+    const safe = String(v || '').replace(/[^A-Za-z0-9_-]/g, '');
+    onChange('graphicKey', safe);
+    // If they had a legacy overlayId, drop it now that we have a fresh
+    // graphicKey set
+    if (slot.overlayId) onChange('overlayId', undefined);
+  }
+
+  function handleLibraryPick(v) {
+    if (!v) return;
+    onChange('graphicKey', v);
+    if (slot.overlayId) onChange('overlayId', undefined);
+  }
+
+  async function handleFileChange(e) {
+    setUploadError(null);
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+
+    const isPng = file.type === 'image/png';
+    const isJpg = file.type === 'image/jpeg';
+    if (!isPng && !isJpg) {
+      setUploadError('Only PNG and JPG files are accepted');
+      e.target.value = '';
+      return;
+    }
+
+    // Derive a key if the slot doesn't have one yet — use the filename
+    // base (sanitized). Operator can rename later via the key field.
+    let key = currentKey;
+    if (!key) {
+      const base = file.name.replace(/\.[^.]+$/, '');
+      key = base.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 60) || 'graphic';
+    }
+
+    setUploading(true);
+    try {
+      // Read file as base64 (matches the server's dataBase64 contract)
+      const dataBase64 = await new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => {
+          const result = r.result || '';
+          const comma = String(result).indexOf(',');
+          resolve(comma >= 0 ? String(result).slice(comma + 1) : String(result));
+        };
+        r.onerror = () => reject(new Error('Failed to read file'));
+        r.readAsDataURL(file);
+      });
+
+      await onUploadGraphic({
+        key,
+        filename: file.name,
+        dataBase64,
+      });
+
+      // Set the slot's graphic key to whatever we just uploaded
+      onChange('graphicKey', key);
+      if (slot.overlayId) onChange('overlayId', undefined);
+    } catch (err) {
+      setUploadError(err.message || 'Upload failed');
+    } finally {
+      setUploading(false);
+      // Allow re-uploading the same file
+      if (e.target) e.target.value = '';
+    }
+  }
+
+  // Build the preview URL for the currently-referenced graphic.
+  // Phase 9e-hotfix2: cache-bust with the file's uploadedAt+size from
+  // the library entry, falling back to the graphicsBust counter.
+  const currentLibEntry = (graphicsLibrary || []).find(
+    (g) => g.key === currentKey
+  );
+  const previewBust =
+    currentLibEntry && currentLibEntry.uploadedAt
+      ? encodeURIComponent(currentLibEntry.uploadedAt) +
+        '-' +
+        (currentLibEntry.sizeBytes || 0)
+      : graphicsBust;
+  const previewUrl =
+    layoutId && currentKey
+      ? `/api/sytist/composite/layouts/${encodeURIComponent(layoutId)}/graphics/${encodeURIComponent(currentKey)}/preview?v=${previewBust}`
+      : null;
+
+  // Library entries — exclude the currently-selected one from the
+  // dropdown options for clarity (but show it as "current" if set)
+  const libraryEntries = (graphicsLibrary || []).filter(
+    (g) => g.onDisk !== false
+  );
+
+  return (
+    <div
+      style={{
+        marginTop: 8,
+        padding: 10,
+        background: 'rgba(184, 136, 208, 0.08)',
+        border: '1px solid rgba(184, 136, 208, 0.3)',
+        borderRadius: 6,
+      }}
+    >
+      <div
+        style={{
+          fontSize: 11,
+          fontWeight: 600,
+          textTransform: 'uppercase',
+          letterSpacing: 0.5,
+          color: '#b888d0',
+          marginBottom: 8,
+        }}
+      >
+        Static graphic
+      </div>
+
+      <FormRow
+        label="Graphic key"
+        hint="Reference name. Letters, digits, hyphen, underscore only."
+      >
+        <TextInput
+          value={currentKey}
+          onChange={handleKeyChange}
+          placeholder="frame-1"
+          monospace
+        />
+      </FormRow>
+
+      {libraryEntries.length > 0 && (
+        <FormRow
+          label="Pick from library"
+          hint="Quickly reference an already-uploaded graphic in this layout."
+        >
+          <Select
+            value=""
+            onChange={handleLibraryPick}
+            options={[
+              { value: '', label: '— pick a graphic —' },
+              ...libraryEntries.map((g) => ({
+                value: g.key,
+                label: `${g.key} (${g.mimeType?.replace('image/', '') || '?'}, ${formatBytes(g.sizeBytes)})`,
+              })),
+            ]}
+          />
+        </FormRow>
+      )}
+
+      <div style={{ marginTop: 8 }}>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/png,image/jpeg"
+          onChange={handleFileChange}
+          style={{ display: 'none' }}
+        />
+        <Button
+          variant="ghost"
+          onClick={() => fileInputRef.current && fileInputRef.current.click()}
+          disabled={uploading}
+        >
+          {uploading
+            ? 'Uploading…'
+            : currentKey
+              ? `Upload / replace "${currentKey}"`
+              : 'Upload graphic'}
+        </Button>
+        <span
+          style={{
+            marginLeft: 8,
+            fontSize: 10,
+            color: 'var(--text-muted)',
+          }}
+        >
+          PNG or JPG · max 10 MB
+        </span>
+      </div>
+
+      {uploadError && (
+        <div
+          style={{
+            marginTop: 6,
+            padding: 6,
+            background: 'rgba(220,53,69,0.08)',
+            border: '1px solid rgba(220,53,69,0.3)',
+            borderRadius: 4,
+            color: '#dc3545',
+            fontSize: 11,
+          }}
+        >
+          {uploadError}
+        </div>
+      )}
+
+      {previewUrl && (
+        <div
+          style={{
+            marginTop: 8,
+            padding: 6,
+            background: 'rgba(0,0,0,0.15)',
+            border: '1px solid var(--border-color)',
+            borderRadius: 4,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+          }}
+        >
+          <img
+            src={previewUrl}
+            alt={`Graphic ${currentKey}`}
+            style={{
+              maxWidth: 80,
+              maxHeight: 80,
+              objectFit: 'contain',
+              background:
+                'repeating-conic-gradient(#444 0% 25%, #333 0% 50%) 50% / 12px 12px',
+            }}
+            onError={(e) => {
+              // Hide if file doesn't exist (key references a missing file)
+              e.currentTarget.style.display = 'none';
+            }}
+          />
+          <div
+            style={{
+              fontSize: 10,
+              color: 'var(--text-muted)',
+            }}
+          >
+            <div>
+              Currently referenced: <code>{currentKey}</code>
+            </div>
+            <div>
+              {libraryEntries.find((g) => g.key === currentKey)
+                ? '✓ File on disk'
+                : '⚠ File not found — upload one'}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function formatBytes(n) {
+  if (typeof n !== 'number') return '?';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+// Safe numeric formatter for slot dimensions. Layer card summaries
+// display position/size at 2 decimal places. Anywhere these values
+// could be undefined, null, or transiently '' (NumberInput emits the
+// empty string when the user clears a field), fall back to 0.
+function fmt(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return '0.00';
+  return x.toFixed(2);
+}
+
+// ─── Graphics library section (Phase 9c) ──────────────────
+//
+// Layout-wide list of uploaded static graphics. Lives at the top of
+// the right panel above the layers stack. Collapsed by default — the
+// per-slot editor is the primary way operators interact with graphics
+// (upload directly while editing a slot). This section is for
+// management: see what's uploaded, delete unused ones, refresh the
+// listing if something looks off.
+
+function GraphicsLibrarySection({
+  layoutId,
+  graphicsLibrary,
+  graphicsBust,
+  graphicsError,
+  onUpload,
+  onDelete,
+  onRefresh,
+  collapsedDefault,
+}) {
+  const [collapsed, setCollapsed] = useState(!!collapsedDefault);
+  const fileInputRef = useRef(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState(null);
+  const [pendingKey, setPendingKey] = useState('');
+
+  async function handleFile(e) {
+    setUploadError(null);
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    if (file.type !== 'image/png' && file.type !== 'image/jpeg') {
+      setUploadError('Only PNG and JPG accepted');
+      e.target.value = '';
+      return;
+    }
+    let key = (pendingKey || '').trim();
+    if (!key) {
+      const base = file.name.replace(/\.[^.]+$/, '');
+      key = base.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 60) || 'graphic';
+    }
+    setUploading(true);
+    try {
+      const dataBase64 = await new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => {
+          const result = r.result || '';
+          const comma = String(result).indexOf(',');
+          resolve(comma >= 0 ? String(result).slice(comma + 1) : String(result));
+        };
+        r.onerror = () => reject(new Error('Failed to read file'));
+        r.readAsDataURL(file);
+      });
+      await onUpload({ key, filename: file.name, dataBase64 });
+      setPendingKey('');
+    } catch (err) {
+      setUploadError(err.message || 'Upload failed');
+    } finally {
+      setUploading(false);
+      if (e.target) e.target.value = '';
+    }
+  }
+
+  return (
+    <Section
+      title={`Graphics library (${(graphicsLibrary || []).length})`}
+      description={
+        collapsed
+          ? null
+          : 'Uploaded graphics for this layout. Slots reference them by key.'
+      }
+      actions={
+        <Button variant="ghost" onClick={() => setCollapsed((v) => !v)}>
+          {collapsed ? 'Expand' : 'Collapse'}
+        </Button>
+      }
+    >
+      {!collapsed && (
+        <>
+          {graphicsError && (
+            <div
+              style={{
+                padding: 8,
+                background: 'rgba(220,53,69,0.08)',
+                border: '1px solid rgba(220,53,69,0.3)',
+                borderRadius: 4,
+                color: '#dc3545',
+                fontSize: 11,
+                marginBottom: 8,
+              }}
+            >
+              {graphicsError}
+            </div>
+          )}
+
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: '2fr 1fr auto',
+              gap: 8,
+              alignItems: 'end',
+              marginBottom: 8,
+            }}
+          >
+            <FormRow label="Upload as key" hint="Leave blank to derive from filename">
+              <TextInput
+                value={pendingKey}
+                onChange={setPendingKey}
+                placeholder="frame-1"
+                monospace
+              />
+            </FormRow>
+            <FormRow label="">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/png,image/jpeg"
+                onChange={handleFile}
+                style={{ display: 'none' }}
+              />
+              <Button
+                variant="primary"
+                onClick={() => fileInputRef.current && fileInputRef.current.click()}
+                disabled={uploading}
+              >
+                {uploading ? 'Uploading…' : 'Upload'}
+              </Button>
+            </FormRow>
+            <FormRow label="">
+              <Button variant="ghost" onClick={onRefresh}>
+                ↻ Refresh
+              </Button>
+            </FormRow>
+          </div>
+
+          {uploadError && (
+            <div
+              style={{
+                padding: 6,
+                background: 'rgba(220,53,69,0.08)',
+                border: '1px solid rgba(220,53,69,0.3)',
+                borderRadius: 4,
+                color: '#dc3545',
+                fontSize: 11,
+                marginBottom: 8,
+              }}
+            >
+              {uploadError}
+            </div>
+          )}
+
+          {(graphicsLibrary || []).length === 0 ? (
+            <div
+              style={{
+                padding: 12,
+                textAlign: 'center',
+                color: 'var(--text-muted)',
+                fontSize: 12,
+              }}
+            >
+              No graphics uploaded yet.
+            </div>
+          ) : (
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns:
+                  'repeat(auto-fill, minmax(120px, 1fr))',
+                gap: 8,
+              }}
+            >
+              {graphicsLibrary.map((g) => (
+                <GraphicLibraryThumb
+                  key={g.key}
+                  layoutId={layoutId}
+                  graphic={g}
+                  bust={graphicsBust}
+                  onDelete={() => onDelete(g.key)}
+                />
+              ))}
+            </div>
+          )}
+        </>
+      )}
     </Section>
   );
 }
 
-// ─── Layout meta editor (right panel when nothing selected) ──
+function GraphicLibraryThumb({ layoutId, graphic, bust, onDelete }) {
+  // Phase 9e-hotfix2: prefer uploadedAt+size as cache buster — changes
+  // only when the file changes. Falls back to the bust counter.
+  const effectiveBust = graphic.uploadedAt
+    ? encodeURIComponent(graphic.uploadedAt) + '-' + (graphic.sizeBytes || 0)
+    : bust;
+  const url = `/api/sytist/composite/layouts/${encodeURIComponent(layoutId)}/graphics/${encodeURIComponent(graphic.key)}/preview?v=${effectiveBust}`;
+  return (
+    <div
+      style={{
+        padding: 6,
+        background: 'var(--bg-input)',
+        border: '1px solid var(--border-color)',
+        borderRadius: 4,
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        gap: 4,
+      }}
+    >
+      <img
+        src={url}
+        alt={graphic.key}
+        style={{
+          width: '100%',
+          height: 60,
+          objectFit: 'contain',
+          background:
+            'repeating-conic-gradient(#444 0% 25%, #333 0% 50%) 50% / 10px 10px',
+        }}
+        onError={(e) => {
+          e.currentTarget.style.opacity = 0.3;
+        }}
+      />
+      <div
+        style={{
+          fontSize: 10,
+          fontFamily: 'var(--font-mono, monospace)',
+          color: 'var(--text-primary)',
+          textAlign: 'center',
+          width: '100%',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        }}
+        title={graphic.key}
+      >
+        {graphic.key}
+      </div>
+      <div
+        style={{
+          fontSize: 9,
+          color: 'var(--text-muted)',
+        }}
+      >
+        {graphic.mimeType?.replace('image/', '') || '?'} · {formatBytes(graphic.sizeBytes)}
+      </div>
+      <Button variant="danger" onClick={onDelete}>
+        Delete
+      </Button>
+    </div>
+  );
+}
 
-function LayoutMetaEditor({ layout, onChange }) {
+function LayoutMetaEditor({ layout, onChange, collapsed: collapsedDefault }) {
+  // Local state, but seeded from the prop so the parent can hint at
+  // initial collapse state (collapsed=true when a slot is selected and
+  // we want to give the layers panel visual priority).
+  const [collapsed, setCollapsed] = useState(!!collapsedDefault);
+
+  // When the prop transitions from false → true (slot selected), auto-
+  // collapse. But don't fight the user — if they manually expand it,
+  // a subsequent slot selection won't re-collapse it.
+  // Actually, simplest: just sync to the prop on change. Most operators
+  // won't be obsessing over this.
+  useEffect(() => {
+    setCollapsed(!!collapsedDefault);
+  }, [collapsedDefault]);
+
   return (
     <Section
       title="Layout properties"
-      description="Click a slot to edit it, or edit layout-wide settings here."
+      description={collapsed ? null : 'Layout-wide settings. These apply to both variants.'}
+      actions={
+        <Button
+          variant="ghost"
+          onClick={() => setCollapsed((v) => !v)}
+        >
+          {collapsed ? 'Expand' : 'Collapse'}
+        </Button>
+      }
     >
-      <FormRow label="Name">
-        <TextInput
-          value={layout.name || ''}
-          onChange={(v) => onChange({ name: v })}
-        />
-      </FormRow>
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns: '1fr 1fr',
-          gap: 8,
-        }}
-      >
-        <FormRow label="Sheet width (in)">
-          <NumberInput
-            value={layout.sheetWidth || 0}
-            onChange={(v) => onChange({ sheetWidth: v })}
-            step="0.25"
-          />
-        </FormRow>
-        <FormRow label="Sheet height (in)">
-          <NumberInput
-            value={layout.sheetHeight || 0}
-            onChange={(v) => onChange({ sheetHeight: v })}
-            step="0.25"
-          />
-        </FormRow>
-        <FormRow label="DPI" hint="300 is typical for print">
-          <NumberInput
-            value={layout.dpi || 300}
-            onChange={(v) => onChange({ dpi: v })}
-            step="50"
-          />
-        </FormRow>
-        <FormRow label="Background">
-          <TextInput
-            value={layout.backgroundColor || '#ffffff'}
-            onChange={(v) => onChange({ backgroundColor: v })}
-            monospace
-          />
-        </FormRow>
-      </div>
+      {collapsed ? (
+        <div
+          style={{
+            fontSize: 11,
+            color: 'var(--text-muted)',
+            display: 'flex',
+            gap: 12,
+            flexWrap: 'wrap',
+          }}
+        >
+          <span>{layout.name || '(unnamed)'}</span>
+          <span>·</span>
+          <span>
+            {layout.sheetWidth}″ × {layout.sheetHeight}″
+          </span>
+          <span>·</span>
+          <span>{layout.dpi || 300}dpi</span>
+        </div>
+      ) : (
+        <>
+          <FormRow label="Name">
+            <TextInput
+              value={layout.name || ''}
+              onChange={(v) => onChange({ name: v })}
+            />
+          </FormRow>
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: '1fr 1fr',
+              gap: 8,
+            }}
+          >
+            <FormRow label="Sheet width (in)">
+              <NumberInput
+                value={layout.sheetWidth || 0}
+                onChange={(v) => onChange({ sheetWidth: Number(v) || 0 })}
+                step="0.25"
+              />
+            </FormRow>
+            <FormRow label="Sheet height (in)">
+              <NumberInput
+                value={layout.sheetHeight || 0}
+                onChange={(v) => onChange({ sheetHeight: Number(v) || 0 })}
+                step="0.25"
+              />
+            </FormRow>
+            <FormRow label="DPI" hint="300 is typical for print">
+              <NumberInput
+                value={layout.dpi || 300}
+                onChange={(v) => onChange({ dpi: Number(v) || 300 })}
+                step="50"
+              />
+            </FormRow>
+            <FormRow label="Background">
+              <TextInput
+                value={layout.backgroundColor || '#ffffff'}
+                onChange={(v) => onChange({ backgroundColor: v })}
+                monospace
+              />
+            </FormRow>
+          </div>
+        </>
+      )}
     </Section>
   );
 }
 
-// ─── Add slot toolbar ──────────────────────────────────────
+// ─── Layers panel ──────────────────────────────────────────
+//
+// Photoshop-style stack of slot cards. Each card represents one slot;
+// cards are listed in REVERSE JSON-array order, so the topmost slot in
+// the canvas (last in JSON) appears at the top of the panel.
+//
+// Each card:
+//   - Header: kind icon + label + up/down/delete buttons (always visible)
+//   - Body: the full property editor (only when card is selected/expanded)
+//
+// Selection ↔ canvas: clicking a card header selects the slot on the
+// canvas and vice versa. The selected card is the only expanded one.
+//
+// Add buttons sit in the panel header so operators can build up a
+// layout with one obvious "where do new slots come from?" affordance.
 
-function AddSlotToolbar({ onAdd, disabled }) {
+function LayersPanel({
+  slots,
+  selectedIndex,
+  variantName,
+  sheetWidth,
+  sheetHeight,
+  onSelect,
+  onChange,
+  onDelete,
+  onMoveUp,
+  onMoveDown,
+  onReorder,
+  onAdd,
+  disabled,
+  // Phase 9c: graphics library for staticGraphic slot editing
+  layoutId,
+  graphicsLibrary,
+  onUploadGraphic,
+  graphicsBust,
+  // Phase 9e: per-slot hide/lock state + togglers
+  hiddenSlots,
+  lockedSlots,
+  onToggleHidden,
+  onToggleLocked,
+}) {
   const slotTypes = [
-    { kind: 'playerPhoto', label: 'Player photo' },
-    { kind: 'teamPhoto', label: 'Team photo' },
+    { kind: 'playerPhoto', label: 'Player' },
+    { kind: 'teamPhoto', label: 'Team' },
     { kind: 'logo', label: 'Logo' },
-    { kind: 'overlay', label: 'Overlay' },
+    { kind: 'staticGraphic', label: 'Graphic' },
     { kind: 'text', label: 'Text' },
   ];
 
+  // Display order = reverse of JSON array order. We map over the
+  // reversed array but pass the ORIGINAL JSON index to handlers.
+  // displayOrder[0] = slots[slots.length - 1] → top of canvas.
+  const displayList = slots
+    .map((slot, idx) => ({ slot, jsonIndex: idx }))
+    .reverse();
+
+  // Drag state: which jsonIdx is currently being dragged, and which
+  // jsonIdx (+ position 'above'/'below') is the current drop target.
+  // The drop indicator (a colored bar) renders based on these values.
+  const [dragJsonIdx, setDragJsonIdx] = useState(null);
+  const [dropTarget, setDropTarget] = useState(null);
+  // dropTarget: { jsonIdx, position: 'above'|'below' } | null
+
+  function handleDragStart(jsonIdx) {
+    setDragJsonIdx(jsonIdx);
+  }
+
+  function handleDragOver(e, targetJsonIdx) {
+    if (dragJsonIdx === null) return;
+    e.preventDefault(); // allow drop
+    e.dataTransfer.dropEffect = 'move';
+
+    // Compute "above" or "below" based on cursor Y vs target's
+    // bounding box midpoint
+    const rect = e.currentTarget.getBoundingClientRect();
+    const midpoint = rect.top + rect.height / 2;
+    const position = e.clientY < midpoint ? 'above' : 'below';
+
+    // Avoid no-op state updates that would re-render every mousemove
+    setDropTarget((prev) => {
+      if (prev && prev.jsonIdx === targetJsonIdx && prev.position === position) {
+        return prev;
+      }
+      return { jsonIdx: targetJsonIdx, position };
+    });
+  }
+
+  function handleDragEnd() {
+    setDragJsonIdx(null);
+    setDropTarget(null);
+  }
+
+  function handleDrop(e, targetJsonIdx) {
+    e.preventDefault();
+    if (dragJsonIdx === null) {
+      handleDragEnd();
+      return;
+    }
+    const rect = e.currentTarget.getBoundingClientRect();
+    const midpoint = rect.top + rect.height / 2;
+    const position = e.clientY < midpoint ? 'above' : 'below';
+    onReorder && onReorder(dragJsonIdx, targetJsonIdx, position);
+    handleDragEnd();
+  }
+
   return (
-    <Section title="Add slot" description="New slot lands centered on the sheet at 30% size — drag to position.">
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        {slotTypes.map((t) => (
-          <Button
-            key={t.kind}
-            variant="ghost"
-            onClick={() => onAdd(t.kind)}
-            disabled={disabled}
+    <div style={{ marginTop: 16 }}>
+      {/* Panel header — title + add buttons. Sticky so the "Add" buttons
+          stay visible even when the cards body grows tall (selected card
+          expands inline showing the full editor). */}
+      <div
+        style={{
+          padding: '12px 16px',
+          background: 'var(--bg-card)',
+          border: '1px solid var(--border-color)',
+          borderRadius: '6px 6px 0 0',
+          borderBottom: 'none',
+          position: 'sticky',
+          top: 0,
+          zIndex: 5,
+        }}
+      >
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'baseline',
+            marginBottom: 8,
+          }}
+        >
+          <h3
+            style={{
+              margin: 0,
+              fontSize: 13,
+              fontWeight: 600,
+              color: 'var(--text-primary)',
+            }}
           >
-            + {t.label}
-          </Button>
-        ))}
+            Layers ({slots.length})
+            <span
+              style={{
+                marginLeft: 8,
+                fontSize: 10,
+                color: 'var(--text-muted)',
+                fontWeight: 400,
+                textTransform: 'uppercase',
+                letterSpacing: 0.5,
+              }}
+            >
+              {variantName}
+            </span>
+          </h3>
+        </div>
+        <div
+          style={{
+            fontSize: 11,
+            color: 'var(--text-muted)',
+            marginBottom: 8,
+          }}
+        >
+          Top of list = top layer on canvas. Drag the ⋮⋮ handle to reorder, or use ↑/↓.
+        </div>
+        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+          {slotTypes.map((t) => (
+            <Button
+              key={t.kind}
+              variant="ghost"
+              onClick={() => onAdd(t.kind)}
+              disabled={disabled}
+            >
+              + {t.label}
+            </Button>
+          ))}
+        </div>
       </div>
-    </Section>
+
+      {/* Layer cards */}
+      <div
+        style={{
+          background: 'var(--bg-card)',
+          border: '1px solid var(--border-color)',
+          borderRadius: '0 0 6px 6px',
+        }}
+      >
+        {displayList.length === 0 ? (
+          <div
+            style={{
+              padding: 24,
+              textAlign: 'center',
+              color: 'var(--text-muted)',
+              fontSize: 12,
+            }}
+          >
+            No layers yet — use the buttons above to add one.
+          </div>
+        ) : (
+          displayList.map(({ slot, jsonIndex }, displayIdx) => {
+            const isDropAbove =
+              dropTarget &&
+              dropTarget.jsonIdx === jsonIndex &&
+              dropTarget.position === 'above';
+            const isDropBelow =
+              dropTarget &&
+              dropTarget.jsonIdx === jsonIndex &&
+              dropTarget.position === 'below';
+            const isDragging = dragJsonIdx === jsonIndex;
+            return (
+              <LayerCard
+                key={jsonIndex}
+                slot={slot}
+                jsonIndex={jsonIndex}
+                displayIndex={displayIdx}
+                isLast={displayIdx === displayList.length - 1}
+                isFirst={displayIdx === 0}
+                isSelected={selectedIndex === jsonIndex}
+                isDragging={isDragging}
+                isDropAbove={isDropAbove}
+                isDropBelow={isDropBelow}
+                sheetWidth={sheetWidth}
+                sheetHeight={sheetHeight}
+                onSelect={() => onSelect(jsonIndex)}
+                onChange={(newSlot) => onChange(jsonIndex, newSlot)}
+                onDelete={() => onDelete(jsonIndex)}
+                onMoveUp={() => onMoveUp(jsonIndex)}
+                onMoveDown={() => onMoveDown(jsonIndex)}
+                onDragStart={() => handleDragStart(jsonIndex)}
+                onDragOver={(e) => handleDragOver(e, jsonIndex)}
+                onDragEnd={handleDragEnd}
+                onDrop={(e) => handleDrop(e, jsonIndex)}
+                layoutId={layoutId}
+                graphicsLibrary={graphicsLibrary}
+                onUploadGraphic={onUploadGraphic}
+                graphicsBust={graphicsBust}
+                isHidden={!!(hiddenSlots && hiddenSlots[jsonIndex])}
+                isLocked={!!(lockedSlots && lockedSlots[jsonIndex])}
+                onToggleHidden={() =>
+                  onToggleHidden && onToggleHidden(jsonIndex)
+                }
+                onToggleLocked={() =>
+                  onToggleLocked && onToggleLocked(jsonIndex)
+                }
+              />
+            );
+          })
+        )}
+      </div>
+    </div>
   );
 }
+
+function LayerCard({
+  slot,
+  jsonIndex,
+  displayIndex,
+  isFirst,
+  isLast,
+  isSelected,
+  isDragging,
+  isDropAbove,
+  isDropBelow,
+  sheetWidth,
+  sheetHeight,
+  onSelect,
+  onChange,
+  onDelete,
+  onMoveUp,
+  onMoveDown,
+  onDragStart,
+  onDragOver,
+  onDragEnd,
+  onDrop,
+  // Phase 9c
+  layoutId,
+  graphicsLibrary,
+  onUploadGraphic,
+  graphicsBust,
+  // Phase 9e
+  isHidden,
+  isLocked,
+  onToggleHidden,
+  onToggleLocked,
+}) {
+  // HTML5 drag-and-drop only fires when the element has draggable=true
+  // at dragstart time. To restrict drag to the handle (vs anywhere on
+  // the card), we toggle the draggable attribute via a ref that's set
+  // when the user mousedowns on the handle and cleared on mouseup or
+  // dragend. The `draggable` attribute is read fresh on dragstart so
+  // a transient state flag works.
+  const dragArmedRef = useRef(false);
+
+  function handleDragHandleMouseDown() {
+    dragArmedRef.current = true;
+  }
+
+  function handleCardDragStart(e) {
+    if (!dragArmedRef.current) {
+      e.preventDefault();
+      return;
+    }
+    // Most browsers need *some* data on the drag for it to fire.
+    e.dataTransfer.setData('text/plain', String(jsonIndex));
+    e.dataTransfer.effectAllowed = 'move';
+    onDragStart && onDragStart();
+  }
+
+  function handleCardDragEnd() {
+    dragArmedRef.current = false;
+    onDragEnd && onDragEnd();
+  }
+
+  // Compute a quick label for the collapsed card. Text slots show their
+  // text content (truncated); image slots show their kind name.
+  const label = (() => {
+    if (slot.kind === 'text') {
+      const t = slot.text || '(empty)';
+      return t.length > 30 ? t.slice(0, 27) + '…' : t;
+    }
+    return SLOT_KIND_LABELS[slot.kind] || slot.kind;
+  })();
+
+  const swatchColor = SLOT_KIND_COLORS[slot.kind] || '#888';
+
+  return (
+    <div
+      // Draggable card. Drag-init is gated by dragArmedRef which is
+      // only true when the user mousedown'd on the ⋮⋮ handle.
+      draggable
+      onDragStart={handleCardDragStart}
+      onDragOver={onDragOver}
+      onDragEnd={handleCardDragEnd}
+      onDrop={onDrop}
+      style={{
+        borderTop: displayIndex > 0 ? '1px solid var(--border-color)' : 'none',
+        background: isSelected ? 'rgba(74,127,193,0.05)' : 'transparent',
+        // Phase 9e: hidden cards dim noticeably. Locked cards keep
+        // their normal background (the lock icon makes the state
+        // obvious enough). Dragging takes precedence over both.
+        opacity: isDragging ? 0.4 : isHidden ? 0.45 : 1,
+        position: 'relative',
+      }}
+    >
+      {/* Drop indicator lines — colored bars that show where the
+          dragged card will land. Rendered as absolutely-positioned
+          divs at the top or bottom edge of the target card. */}
+      {isDropAbove && (
+        <div
+          style={{
+            position: 'absolute',
+            top: -1,
+            left: 0,
+            right: 0,
+            height: 2,
+            background: '#4a7fc1',
+            zIndex: 2,
+            pointerEvents: 'none',
+          }}
+        />
+      )}
+      {isDropBelow && (
+        <div
+          style={{
+            position: 'absolute',
+            bottom: -1,
+            left: 0,
+            right: 0,
+            height: 2,
+            background: '#4a7fc1',
+            zIndex: 2,
+            pointerEvents: 'none',
+          }}
+        />
+      )}
+
+      {/* Card header — always visible */}
+      <div
+        onClick={onSelect}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          padding: '8px 12px',
+          cursor: 'pointer',
+          borderLeft: isSelected ? '3px solid #4a7fc1' : '3px solid transparent',
+        }}
+      >
+        {/* Drag handle. Mousedown here arms the drag-init. Click event
+            still fires through to the card header (selecting the slot)
+            unless an actual drag begins. */}
+        <span
+          onMouseDown={handleDragHandleMouseDown}
+          onClick={(e) => e.stopPropagation()}
+          title="Drag to reorder"
+          style={{
+            cursor: 'grab',
+            color: 'var(--text-muted)',
+            fontSize: 14,
+            fontWeight: 700,
+            userSelect: 'none',
+            padding: '0 4px',
+            lineHeight: 1,
+            flexShrink: 0,
+          }}
+        >
+          ⋮⋮
+        </span>
+
+        {/* Color swatch indicating the slot kind */}
+        <div
+          style={{
+            width: 16,
+            height: 16,
+            background: swatchColor,
+            border: '1px solid rgba(255,255,255,0.2)',
+            borderRadius: 3,
+            flexShrink: 0,
+          }}
+        />
+
+        {/* Kind + label */}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div
+            style={{
+              fontSize: 12,
+              fontWeight: 600,
+              color: 'var(--text-primary)',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {label}
+          </div>
+          <div
+            style={{
+              fontSize: 10,
+              color: 'var(--text-muted)',
+              fontFamily: 'var(--font-mono, monospace)',
+            }}
+          >
+            {slot.kind} · {fmt(slot.x)}″,{fmt(slot.y)}″ · {fmt(slot.w)}×{fmt(slot.h)}
+          </div>
+        </div>
+
+        {/* Reorder + delete buttons. Stop propagation so clicking these
+            doesn't also select the card (which would expand it after
+            clicking up/down — confusing). */}
+        <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+          {/* Phase 9e: hide/lock toggles. Visible per-card icons that
+              flip designer-only view state. */}
+          <IconButton
+            label={isHidden ? 'Show this layer' : 'Hide this layer'}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleHidden && onToggleHidden();
+            }}
+          >
+            {isHidden ? '⊘' : '👁'}
+          </IconButton>
+          <IconButton
+            label={isLocked ? 'Unlock this layer' : 'Lock this layer'}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleLocked && onToggleLocked();
+            }}
+          >
+            {isLocked ? '🔒' : '🔓'}
+          </IconButton>
+          <IconButton
+            label="Move up"
+            disabled={isFirst}
+            onClick={(e) => {
+              e.stopPropagation();
+              onMoveUp();
+            }}
+          >
+            ↑
+          </IconButton>
+          <IconButton
+            label="Move down"
+            disabled={isLast}
+            onClick={(e) => {
+              e.stopPropagation();
+              onMoveDown();
+            }}
+          >
+            ↓
+          </IconButton>
+          <IconButton
+            label="Delete"
+            danger
+            onClick={(e) => {
+              e.stopPropagation();
+              if (
+                window.confirm(
+                  `Delete this ${slot.kind} layer? You can also press Discard at the top of the page to revert.`
+                )
+              ) {
+                onDelete();
+              }
+            }}
+          >
+            ✕
+          </IconButton>
+          <span
+            style={{
+              fontSize: 9,
+              color: 'var(--text-muted)',
+              marginLeft: 4,
+              minWidth: 18,
+              textAlign: 'center',
+              fontFamily: 'var(--font-mono, monospace)',
+            }}
+            title={isSelected ? 'Expanded' : 'Click to expand'}
+          >
+            {isSelected ? '▼' : '▶'}
+          </span>
+        </div>
+      </div>
+
+      {/* Card body — full editor, only when selected. Phase 9e: when
+          the slot is locked, show a notice instead of the editor.
+          Property-level changes are blocked while locked; the operator
+          must unlock first. This matches the canvas behavior (locked
+          slots can't be dragged) for consistency. */}
+      {isSelected && (
+        <div
+          style={{
+            padding: '8px 16px 16px 16px',
+            borderTop: '1px solid var(--border-color)',
+          }}
+        >
+          {isLocked ? (
+            <div
+              style={{
+                padding: 12,
+                background: 'rgba(255,255,255,0.04)',
+                border: '1px dashed var(--border-color)',
+                borderRadius: 4,
+                textAlign: 'center',
+                color: 'var(--text-muted)',
+                fontSize: 12,
+              }}
+            >
+              🔒 This layer is locked. Click the unlock icon above to
+              edit its properties.
+            </div>
+          ) : (
+            <SlotEditorBody
+              slot={slot}
+              sheetWidth={sheetWidth}
+              sheetHeight={sheetHeight}
+              onChange={onChange}
+              layoutId={layoutId}
+              graphicsLibrary={graphicsLibrary}
+              onUploadGraphic={onUploadGraphic}
+              graphicsBust={graphicsBust}
+            />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function IconButton({ children, onClick, disabled, danger, label }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      title={label}
+      aria-label={label}
+      style={{
+        background: 'transparent',
+        border: '1px solid var(--border-color)',
+        color: disabled
+          ? 'var(--text-muted)'
+          : danger
+          ? '#dc3545'
+          : 'var(--text-primary)',
+        width: 26,
+        height: 26,
+        borderRadius: 4,
+        cursor: disabled ? 'default' : 'pointer',
+        fontSize: 12,
+        fontFamily: 'inherit',
+        opacity: disabled ? 0.4 : 1,
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: 0,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+const SLOT_KIND_LABELS = {
+  playerPhoto: 'Player photo',
+  teamPhoto: 'Team photo',
+  logo: 'Logo',
+  // Phase 9c: rename Overlay → Static graphic. Persist legacy 'overlay'
+  // → same label so existing layouts still display correctly.
+  staticGraphic: 'Static graphic',
+  overlay: 'Static graphic',
+  text: 'Text',
+};
+
+const SLOT_KIND_COLORS = {
+  playerPhoto: '#5d8fc4',
+  teamPhoto: '#c46060',
+  logo: '#7cc46d',
+  staticGraphic: '#b888d0',
+  overlay: '#b888d0',
+  text: '#888888',
+};
 
 // ─── Slot factories ────────────────────────────────────────
 
@@ -941,8 +2484,12 @@ function makeDefaultSlot(kind, x, y, w, h) {
       return { ...base, fit: 'cover' };
     case 'logo':
       return { ...base, fit: 'contain' };
-    case 'overlay':
-      return { ...base, overlayId: '' };
+    case 'staticGraphic':
+      // Phase 9c: replaces 'overlay'. graphicKey is initially empty
+      // — operator picks an existing graphic from the layout's library
+      // or uploads a new one via the slot editor. Empty key renders
+      // a placeholder rect labeled "Static graphic (no upload)".
+      return { ...base, fit: 'contain', graphicKey: '' };
     case 'text':
       return {
         ...base,
