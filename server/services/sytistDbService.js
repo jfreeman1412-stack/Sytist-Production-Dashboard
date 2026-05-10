@@ -481,8 +481,14 @@ class SytistDbService {
     );
 
     // ─── Query 3: photos referenced by cart lines ──────────
+    // Phase 10: also pull background photos referenced via
+    // cart_photo_bg. Same ms_photos table, same query — just
+    // expand the IN list to include both pic IDs. One round trip.
     const picIds = [
-      ...new Set(cartRows.map((r) => r.cart_pic_id).filter((id) => id > 0)),
+      ...new Set([
+        ...cartRows.map((r) => r.cart_pic_id).filter((id) => id > 0),
+        ...cartRows.map((r) => r.cart_photo_bg).filter((id) => id > 0),
+      ]),
     ];
     let photosById = new Map();
     if (picIds.length > 0) {
@@ -554,6 +560,12 @@ class SytistDbService {
 
       const lineItems = lines.map((c) => {
         const photoRow = c.cart_pic_id > 0 ? photosById.get(c.cart_pic_id) : null;
+        // Phase 10: pull the background photo when cart_photo_bg points
+        // at a real ms_photos row. Same shape as `photo`, just a
+        // separate field on the line item. processingService picks this
+        // up for layouts that have a `playerBackground` slot.
+        const bgPhotoRow =
+          c.cart_photo_bg > 0 ? photosById.get(c.cart_photo_bg) : null;
         return {
           cartId: c.cart_id,
           productName: c.cart_product_name || '',
@@ -574,6 +586,13 @@ class SytistDbService {
             ? buildPhotoUrls({
                 ...photoRow,
                 pic_id: c.cart_pic_id,
+              })
+            : null,
+
+          backgroundPhoto: bgPhotoRow
+            ? buildPhotoUrls({
+                ...bgPhotoRow,
+                pic_id: c.cart_photo_bg,
               })
             : null,
 
@@ -771,8 +790,12 @@ class SytistDbService {
     );
 
     // Photos.
+    // Phase 10: include both player and background pic IDs.
     const picIds = [
-      ...new Set(cartRows.map((r) => r.cart_pic_id).filter((p) => p > 0)),
+      ...new Set([
+        ...cartRows.map((r) => r.cart_pic_id).filter((p) => p > 0),
+        ...cartRows.map((r) => r.cart_photo_bg).filter((p) => p > 0),
+      ]),
     ];
     let photosById = new Map();
     if (picIds.length > 0) {
@@ -830,6 +853,9 @@ class SytistDbService {
     // Stitch line items.
     const lineItems = cartRows.map((c) => {
       const photoRow = c.cart_pic_id > 0 ? photosById.get(c.cart_pic_id) : null;
+      // Phase 10: background photo (cart_photo_bg → ms_photos)
+      const bgPhotoRow =
+        c.cart_photo_bg > 0 ? photosById.get(c.cart_photo_bg) : null;
       return {
         cartId: c.cart_id,
         productName: c.cart_product_name || '',
@@ -846,6 +872,10 @@ class SytistDbService {
 
         photo: photoRow
           ? buildPhotoUrls({ ...photoRow, pic_id: c.cart_pic_id })
+          : null,
+
+        backgroundPhoto: bgPhotoRow
+          ? buildPhotoUrls({ ...bgPhotoRow, pic_id: c.cart_photo_bg })
           : null,
 
         flags: {

@@ -83,6 +83,21 @@ export default function LayoutDesignerPage() {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState(null);
 
+  // Phase 10a: order line-item picker state. After the operator types
+  // an order ID and clicks "Load," we fetch the order via
+  // GET /api/sytist/orders/:orderId and show its line items as a
+  // selectable list with thumbnails. Picking a line item sets
+  // previewCartId, which triggers the existing preview render flow.
+  // orderLineItems is null when nothing is loaded, [] when an order
+  // was loaded but had no photo line items, or an array of items
+  // when valid.
+  const [orderLineItems, setOrderLineItems] = useState(null);
+  const [orderLoading, setOrderLoading] = useState(false);
+  const [orderError, setOrderError] = useState(null);
+  // Track which order ID's items are currently in `orderLineItems`,
+  // so changing the order ID doesn't keep showing the old order's items.
+  const [loadedOrderId, setLoadedOrderId] = useState('');
+
   // Phase 9c: graphics library for this layout. Loaded from
   // GET /composite/layouts/:id/graphics. Refreshed after every upload
   // or delete. graphicsBust is a counter that increments on each
@@ -102,6 +117,44 @@ export default function LayoutDesignerPage() {
       setGraphicsError(null);
     } catch (err) {
       setGraphicsError(err.message);
+    }
+  }
+
+  // Phase 10a: load an order's line items so the operator can pick
+  // one to preview against. Existing /api/sytist/orders/:id endpoint
+  // returns the canonical order shape with line items including
+  // photo URLs. We filter to line items that have a photo (skip
+  // downloads, gift certs, etc. — they'd never preview meaningfully).
+  async function loadOrderLineItems(orderId) {
+    if (!orderId) return;
+    setOrderLoading(true);
+    setOrderError(null);
+    setOrderLineItems(null);
+    try {
+      const r = await api.get(
+        `/api/sytist/orders/${encodeURIComponent(orderId)}`
+      );
+      const order = r.order;
+      if (!order) {
+        setOrderError('Order not found');
+        return;
+      }
+      const items = (order.lineItems || []).filter(
+        (li) => li.photo && li.photo.fullUrl
+      );
+      setOrderLineItems(items);
+      setLoadedOrderId(String(orderId));
+      // If exactly one photo line item, auto-select it. Saves a click
+      // on simple single-photo orders.
+      if (items.length === 1) {
+        setPreviewCartId(String(items[0].cartId));
+      } else if (items.length === 0) {
+        setOrderError('Order has no photo line items');
+      }
+    } catch (err) {
+      setOrderError(err.message);
+    } finally {
+      setOrderLoading(false);
     }
   }
 
@@ -555,10 +608,29 @@ export default function LayoutDesignerPage() {
       setPreviewLoading(true);
       setPreviewError(null);
       try {
+        // Phase 10c: respect hidden-slot state in real-data preview.
+        // Strip hidden slots from each variant's slots array before
+        // sending the layout to the server. The server renders only
+        // what it sees, so the backdrop will reflect the hidden state.
+        // (Hide is still designer-only — never written to the saved
+        // layout JSON. We're only filtering the in-flight preview
+        // request payload.)
+        const filteredLayout = {
+          ...layout,
+          variants: Object.fromEntries(
+            Object.entries(layout.variants || {}).map(([vName, vDef]) => {
+              const hideMap = hiddenSlotsByVariant[vName] || {};
+              const filteredSlots = (vDef.slots || []).filter(
+                (_, idx) => !hideMap[idx]
+              );
+              return [vName, { ...vDef, slots: filteredSlots }];
+            })
+          ),
+        };
         const r = await api.post('/api/sytist/composite/preview', {
           orderId: previewOrderId,
           cartId: parseInt(previewCartId, 10),
-          layout, // inline — server uses this instead of saved version
+          layout: filteredLayout, // inline — server uses this instead of saved version
         });
         // Only apply if this is still the latest request (otherwise an
         // older slow request could overwrite a newer fast one)
@@ -581,7 +653,7 @@ export default function LayoutDesignerPage() {
         clearTimeout(previewTimerRef.current);
       }
     };
-  }, [layout, previewMode, previewOrderId, previewCartId]);
+  }, [layout, previewMode, previewOrderId, previewCartId, hiddenSlotsByVariant]);
 
   // ─── Render ──────────────────────────────────────────────
 
@@ -747,10 +819,25 @@ export default function LayoutDesignerPage() {
             onPreviewModeChange={setPreviewMode}
             previewOrderId={previewOrderId}
             previewCartId={previewCartId}
-            onPreviewOrderIdChange={setPreviewOrderId}
+            onPreviewOrderIdChange={(v) => {
+              // When the typed order ID changes, drop any previously
+              // loaded line items — they were for the old order.
+              setPreviewOrderId(v);
+              if (String(v) !== loadedOrderId) {
+                setOrderLineItems(null);
+                setOrderError(null);
+                setPreviewCartId('');
+              }
+            }}
             onPreviewCartIdChange={setPreviewCartId}
             previewLoading={previewLoading}
             previewError={previewError}
+            // Phase 10a: line-item picker
+            orderLineItems={orderLineItems}
+            orderLoading={orderLoading}
+            orderError={orderError}
+            loadedOrderId={loadedOrderId}
+            onLoadOrder={() => loadOrderLineItems(previewOrderId)}
           />
         </div>
 
@@ -860,6 +947,12 @@ function CanvasFooterToolbar({
   onPreviewCartIdChange,
   previewLoading,
   previewError,
+  // Phase 10a: order line-item picker
+  orderLineItems,
+  orderLoading,
+  orderError,
+  loadedOrderId,
+  onLoadOrder,
 }) {
   return (
     <div
@@ -952,30 +1045,71 @@ function CanvasFooterToolbar({
       </div>
 
       {previewMode === 'order' && (
-        <div
-          style={{
-            marginTop: 8,
-            display: 'grid',
-            gridTemplateColumns: '1fr 1fr',
-            gap: 8,
-          }}
-        >
-          <FormRow label="Order ID" hint="A real order with a player photo">
-            <TextInput
-              value={previewOrderId}
-              onChange={onPreviewOrderIdChange}
-              placeholder="e.g. 110855"
-              monospace
+        <div style={{ marginTop: 8 }}>
+          {/* Order ID input + Load button. Phase 10a: cart ID is no
+              longer typed — it's selected from the loaded order's
+              line items below. */}
+          <div
+            style={{
+              display: 'flex',
+              gap: 8,
+              alignItems: 'flex-end',
+            }}
+          >
+            <div style={{ flex: 1 }}>
+              <FormRow label="Order ID" hint="Enter an order, then click Load">
+                <TextInput
+                  value={previewOrderId}
+                  onChange={onPreviewOrderIdChange}
+                  placeholder="e.g. 110855"
+                  monospace
+                />
+              </FormRow>
+            </div>
+            <button
+              type="button"
+              onClick={onLoadOrder}
+              disabled={!previewOrderId || orderLoading}
+              style={{
+                padding: '8px 14px',
+                background: 'var(--accent, #4a7fc1)',
+                color: 'white',
+                border: 'none',
+                borderRadius: 4,
+                cursor: orderLoading || !previewOrderId ? 'default' : 'pointer',
+                fontFamily: 'inherit',
+                fontSize: 13,
+                fontWeight: 600,
+                opacity: orderLoading || !previewOrderId ? 0.5 : 1,
+                marginBottom: 18,  // align with input baseline (FormRow has hint below)
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {orderLoading ? 'Loading…' : 'Load'}
+            </button>
+          </div>
+
+          {orderError && (
+            <div
+              style={{
+                marginTop: 4,
+                fontSize: 11,
+                color: '#dc3545',
+              }}
+            >
+              {orderError}
+            </div>
+          )}
+
+          {/* Line items picker. Renders only when an order has been
+              successfully loaded and has photo line items. */}
+          {orderLineItems && orderLineItems.length > 0 && (
+            <LineItemsPicker
+              items={orderLineItems}
+              selectedCartId={previewCartId}
+              onSelect={(cartId) => onPreviewCartIdChange(String(cartId))}
             />
-          </FormRow>
-          <FormRow label="Cart ID" hint="Line item within the order">
-            <TextInput
-              value={previewCartId}
-              onChange={onPreviewCartIdChange}
-              placeholder="e.g. 12345"
-              monospace
-            />
-          </FormRow>
+          )}
         </div>
       )}
 
@@ -1002,6 +1136,132 @@ function CanvasFooterToolbar({
           {previewError}
         </div>
       )}
+    </div>
+  );
+}
+
+// ─── Line items picker (Phase 10a) ────────────────────────
+//
+// Renders a scrollable list of an order's photo line items.
+// Each row shows a small photo thumbnail, the product name,
+// SKU, and (subtly) the cart ID for operator reference.
+// Click anywhere in a row to select that line item — sets
+// previewCartId, which triggers the existing preview render.
+
+function LineItemsPicker({ items, selectedCartId, onSelect }) {
+  const selectedNum = parseInt(selectedCartId, 10);
+  return (
+    <div
+      style={{
+        marginTop: 10,
+        border: '1px solid var(--border-color)',
+        borderRadius: 4,
+        background: 'var(--bg-input)',
+        maxHeight: 240,
+        overflowY: 'auto',
+      }}
+    >
+      <div
+        style={{
+          padding: '6px 10px',
+          fontSize: 11,
+          fontWeight: 600,
+          color: 'var(--text-muted)',
+          borderBottom: '1px solid var(--border-color)',
+          background: 'var(--bg-card)',
+          position: 'sticky',
+          top: 0,
+        }}
+      >
+        Line items ({items.length}) — click one to preview
+      </div>
+      {items.map((li) => {
+        const isSelected = li.cartId === selectedNum;
+        const thumbUrl = li.photo?.thumbUrl || li.photo?.largeUrl || null;
+        return (
+          <div
+            key={li.cartId}
+            onClick={() => onSelect(li.cartId)}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 10,
+              padding: '8px 10px',
+              cursor: 'pointer',
+              borderBottom: '1px solid var(--border-color)',
+              background: isSelected
+                ? 'rgba(74,127,193,0.15)'
+                : 'transparent',
+              borderLeft: isSelected
+                ? '3px solid #4a7fc1'
+                : '3px solid transparent',
+            }}
+          >
+            {/* Thumbnail */}
+            {thumbUrl ? (
+              <img
+                src={thumbUrl}
+                alt=""
+                style={{
+                  width: 48,
+                  height: 48,
+                  objectFit: 'cover',
+                  borderRadius: 3,
+                  background: '#222',
+                  flexShrink: 0,
+                }}
+                onError={(e) => {
+                  // If thumb fails, fall back to a colored placeholder
+                  e.target.style.display = 'none';
+                }}
+              />
+            ) : (
+              <div
+                style={{
+                  width: 48,
+                  height: 48,
+                  background: '#444',
+                  borderRadius: 3,
+                  flexShrink: 0,
+                }}
+              />
+            )}
+            {/* Text */}
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div
+                style={{
+                  fontSize: 12,
+                  fontWeight: 600,
+                  color: 'var(--text-primary)',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {li.productName || '(unnamed product)'}
+              </div>
+              <div
+                style={{
+                  fontSize: 10,
+                  color: 'var(--text-muted)',
+                  fontFamily: 'var(--font-mono, monospace)',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {li.sku || '(no SKU)'}
+                {li.photo?.originalFilename
+                  ? ` · ${li.photo.originalFilename}`
+                  : ''}
+                {' · cart '}
+                {li.cartId}
+                {li.backgroundPhoto ? ' · 🖼️ has BG' : ''}
+              </div>
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -1035,7 +1295,7 @@ function SlotEditorBody({
 
   const isText = slot.kind === 'text';
   const isStaticGraphic = slot.kind === 'staticGraphic' || slot.kind === 'overlay';
-  const isImage = ['playerPhoto', 'teamPhoto', 'logo', 'staticGraphic', 'overlay'].includes(slot.kind);
+  const isImage = ['playerPhoto', 'playerBackground', 'teamPhoto', 'logo', 'staticGraphic', 'overlay'].includes(slot.kind);
 
   return (
     <div>
@@ -2060,6 +2320,11 @@ function LayersPanel({
 }) {
   const slotTypes = [
     { kind: 'playerPhoto', label: 'Player' },
+    // Phase 10: per-order customer-selected background photo.
+    // Drawn behind the player photo (added later in array → drawn
+    // earlier → on bottom). Operators add this BEFORE the player
+    // for correct stacking, OR add it after and use the down arrow.
+    { kind: 'playerBackground', label: 'BG' },
     { kind: 'teamPhoto', label: 'Team' },
     { kind: 'logo', label: 'Logo' },
     { kind: 'staticGraphic', label: 'Graphic' },
@@ -2238,6 +2503,7 @@ function LayersPanel({
                 sheetWidth={sheetWidth}
                 sheetHeight={sheetHeight}
                 onSelect={() => onSelect(jsonIndex)}
+                onCollapse={() => onSelect(null)}
                 onChange={(newSlot) => onChange(jsonIndex, newSlot)}
                 onDelete={() => onDelete(jsonIndex)}
                 onMoveUp={() => onMoveUp(jsonIndex)}
@@ -2280,6 +2546,7 @@ function LayerCard({
   sheetWidth,
   sheetHeight,
   onSelect,
+  onCollapse,
   onChange,
   onDelete,
   onMoveUp,
@@ -2522,19 +2789,19 @@ function LayerCard({
           >
             ✕
           </IconButton>
-          <span
-            style={{
-              fontSize: 9,
-              color: 'var(--text-muted)',
-              marginLeft: 4,
-              minWidth: 18,
-              textAlign: 'center',
-              fontFamily: 'var(--font-mono, monospace)',
+          <IconButton
+            label={isSelected ? 'Collapse layer details' : 'Expand layer details'}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (isSelected) {
+                onCollapse && onCollapse();
+              } else {
+                onSelect && onSelect();
+              }
             }}
-            title={isSelected ? 'Expanded' : 'Click to expand'}
           >
             {isSelected ? '▼' : '▶'}
-          </span>
+          </IconButton>
         </div>
       </div>
 
@@ -2621,6 +2888,8 @@ function IconButton({ children, onClick, disabled, danger, label }) {
 
 const SLOT_KIND_LABELS = {
   playerPhoto: 'Player photo',
+  // Phase 10: customer-selected background photo, layered behind player.
+  playerBackground: 'Player background',
   teamPhoto: 'Team photo',
   logo: 'Logo',
   // Phase 9c: rename Overlay → Static graphic. Persist legacy 'overlay'
@@ -2632,6 +2901,8 @@ const SLOT_KIND_LABELS = {
 
 const SLOT_KIND_COLORS = {
   playerPhoto: '#5d8fc4',
+  // Phase 10
+  playerBackground: '#5dc4b8',
   teamPhoto: '#c46060',
   logo: '#7cc46d',
   staticGraphic: '#b888d0',
@@ -2646,6 +2917,9 @@ function makeDefaultSlot(kind, x, y, w, h) {
   switch (kind) {
     case 'playerPhoto':
     case 'teamPhoto':
+    case 'playerBackground':
+      // Phase 10: backgrounds default to cover — they're meant to
+      // fill behind the player photo.
       return { ...base, fit: 'cover' };
     case 'logo':
       return { ...base, fit: 'contain' };

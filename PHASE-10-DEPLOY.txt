@@ -1,0 +1,221 @@
+Phase 10 — playerBackground slot kind (per-order green-screen backgrounds)
+
+═══════════════════════════════════════════════════════
+WHAT THIS DELIVERS
+═══════════════════════════════════════════════════════
+
+A new first-class slot kind: `playerBackground`. When a cart line
+references a customer-selected background photo via
+ms_cart.cart_photo_bg, the composite engine pulls that image and
+layers it BEHIND the player photo at processing time.
+
+Same template handles both cases:
+  - Order has cart_photo_bg → background renders in the slot
+  - Order has no cart_photo_bg (regular JPG photo) → slot renders
+    nothing; the player photo (which has its own baked background)
+    covers the slot area
+
+The slot is operator-positionable like any other photo slot —
+fit modes, x/y/w/h, hide/lock, etc.
+
+═══════════════════════════════════════════════════════
+DESIGNER WORKFLOW
+═══════════════════════════════════════════════════════
+
+In the layout designer, the slot-add row now has a "+ BG" button
+between Player and Team. Click it to add a Player background slot.
+Default fit is "cover" (background fills the area); change to
+contain/fill etc. via the Fit mode dropdown if needed.
+
+Stacking order matters. The layout's slot array is rendered
+bottom-to-top — earlier in the array = drawn first = lower in
+the stack. For green-screen orders to look right:
+
+  Position playerBackground BEFORE playerPhoto in the layer order
+  (layers panel: playerBackground appears LOWER in the panel,
+   since the panel is reversed from JSON).
+
+If you click + BG after + Player, you'll need to use the down-arrow
+in the layers panel to push the background underneath. Or add
+the background slot first.
+
+═══════════════════════════════════════════════════════
+HOW IT WORKS UNDER THE HOOD
+═══════════════════════════════════════════════════════
+
+1. SYTIST DB SERVICE — line items now expose backgroundPhoto:
+   When ms_cart.cart_photo_bg references a real ms_photos row,
+   the line item gets a `backgroundPhoto` field with the same
+   shape as `photo` (S3 URLs etc.). When cart_photo_bg is 0 or
+   null, backgroundPhoto is null. One bulk photos query loads
+   both player and background pic IDs at once (no extra round
+   trip).
+
+2. PROCESSING SERVICE — fetch background buffer:
+   Before calling compositeService.buildSheetBuffer, processingService
+   checks whether the layout has a playerBackground slot AND the
+   line item has a backgroundPhoto. If yes, it downloads the
+   background photo and passes it as `playerBackground` to the
+   composite call. If no, it passes null and the slot silently skips.
+
+   Optimization: the fetch only happens when a layout has a
+   playerBackground slot. Layouts without that slot never download
+   the background bytes even if the cart references one.
+
+3. COMPOSITE SERVICE — render the slot:
+   New branch in buildSheetBuffer's slot dispatch. Same resize/fit
+   logic as playerPhoto. When playerBackground buffer is null,
+   `continue` the loop without warning — silent skip is the
+   intended behavior.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+⚠ This tarball ALSO INCLUDES Phase 9g changes:
+  - LayoutCanvas.js is the 9g version (backdrop preview at full
+    opacity + slot imagery suppressed when backdrop is active).
+  - If you haven't deployed 9g yet, this gives you both 9g and 10
+    in one go. That's fine — they don't conflict.
+  - If you've already deployed 9g, no change there beyond the
+    Phase 10 SLOT_STYLES additions.
+
+MODIFIED:
+  server/services/sytistDbService.js          + cart_photo_bg pulled
+                                               + backgroundPhoto in line
+                                                 item shape (both
+                                                 getOrders and getOrder)
+  server/services/processingService.js        + fetch background buffer
+                                                 (gated on layout having
+                                                 a playerBackground slot)
+                                               + pass to compositor as
+                                                 playerBackground
+  server/services/compositeService.js         + buildSheetBuffer accepts
+                                                 playerBackground param
+                                               + new playerBackground
+                                                 slot dispatch (silent
+                                                 skip when missing)
+  client/src/components/LayoutCanvas.js       + SLOT_STYLES.playerBackground
+                                                 (teal #5dc4b8)
+                                               + (also: 9g backdrop fix)
+  client/src/pages/settings/LayoutDesignerPage.js
+                                              + "+ BG" button in slot
+                                                 type picker
+                                               + SLOT_KIND_LABELS entry
+                                               + SLOT_KIND_COLORS entry
+                                               + makeDefaultSlot case
+                                               + isImage includes
+                                                 playerBackground (so
+                                                 fit mode dropdown works)
+
+═══════════════════════════════════════════════════════
+PREREQUISITES
+═══════════════════════════════════════════════════════
+
+Phase 9f deployed (the canvas + designer baseline this builds on).
+9g not separately required — its changes are bundled into this
+phase's LayoutCanvas.js.
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-10.tar.gz --strip-components=1
+  npm run dev
+
+Then Ctrl+Shift+R in the dashboard to reload the JS bundle.
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+Server-side composite engine:
+  ✓ With background buffer: bottom area renders background red,
+    center renders player green (correct layering)
+  ✓ Without background buffer: no warnings emitted, sheet white
+    shows through (correct silent-skip behavior)
+  ✓ All pixel values exactly match expected (within 1 unit)
+
+Client-side designer:
+  ✓ Canvas renders teal swatch (#5dc4b8) for playerBackground slot
+  ✓ Canvas renders player blue (#5d8fc4) for playerPhoto slot
+  ✓ "Player background" label appears
+  ✓ Layers panel has new "+ BG" button alongside existing "+ Player"
+
+All 5 modified files parse cleanly.
+
+═══════════════════════════════════════════════════════
+HOW TO TEST WITH A REAL ORDER
+═══════════════════════════════════════════════════════
+
+Find an order in your Sytist DB with cart_photo_bg > 0. Easiest way:
+look at recent green-screen sales or query:
+
+  SELECT cart_id, cart_order, cart_pic_id, cart_photo_bg
+  FROM ms_cart
+  WHERE cart_photo_bg > 0
+  ORDER BY cart_id DESC
+  LIMIT 10;
+
+Pick one of those orders, note its order ID and cart ID. Then:
+
+1. In the layout designer, open a memory-mate layout.
+2. Click "+ BG" to add a player background slot.
+3. Position it (e.g., 0, 0, 8×10 if the background should fill
+   the whole sheet behind everything).
+4. In the layers panel, drag the background DOWN so it's below
+   the player photo (lower in the panel = earlier in array =
+   rendered first = behind).
+5. Switch preview to "Use real order data" with the order ID +
+   cart ID from the query above.
+6. The preview should show the customer's selected background
+   filling the slot, with the player photo cut-out on top.
+
+For an order WITHOUT cart_photo_bg, the same layout should still
+work — you just won't see anything in the background slot, and
+the player photo (a JPG with its own background) will cover the
+slot area normally.
+
+═══════════════════════════════════════════════════════
+KNOWN GAPS
+═══════════════════════════════════════════════════════
+
+- BACKGROUND SLOT DOESN'T SHOW REAL IMAGE IN PLACEHOLDER MODE:
+  The designer canvas in placeholder mode just shows a teal-tinted
+  rectangle as a positioning placeholder. To see the actual
+  customer background, switch to "Use real order data" mode with
+  a real order ID. Future: pull a sample background image into
+  the designer for placeholder mode.
+
+- NO LAYOUT-WIDE WARNING IF BACKGROUND IS REFERENCED BUT FAILS
+  TO DOWNLOAD: if the S3 fetch fails (network blip, dead link),
+  a warning IS emitted at the line-item level. But if the fetch
+  silently returns 0 bytes for some reason, the slot just renders
+  nothing. Pretty edge-case, leaving it as-is for now.
+
+- NO AUTO-MIGRATION FOR EXISTING LAYOUTS: existing layouts don't
+  automatically get a playerBackground slot. Operators add them
+  manually to each layout where they want the green-screen
+  capability. Most layouts probably don't need one — flat
+  memory mates without green-screen are still common.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 9c            Static Graphics
+✓ 9c-hotfix(2)  Rules-of-hooks + .toFixed
+✗ 9d            See-through (rolled back)
+✓ 9e            Native PNG transparency + hide/lock
+✓ 9e-hotfix(3)  Body-parser + cache + auth fixes
+✓ 9f            Designer polish: tokens, autoFit, larger canvas
+✓ 9g            Backdrop preview at full opacity (bundled into 10)
+✓ 10            playerBackground slot kind ← here
+
+ROADMAP (pending):
+  - SQLite migration (replace JSON file storage with proper DB
+    for multi-user concurrency)
+  - Per-order overrides (operator adjustments without modifying
+    the layout)
+  - Lint cleanup of pre-existing warnings

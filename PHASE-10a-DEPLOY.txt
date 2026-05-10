@@ -1,0 +1,143 @@
+Phase 10a — line-items picker for live preview
+
+═══════════════════════════════════════════════════════
+THE PROBLEM
+═══════════════════════════════════════════════════════
+
+To preview a layout against a real order, the previous workflow
+required you to type both an Order ID AND a Cart ID. The cart
+ID is an internal database PK with no operator-facing UI to
+look it up — you'd have to query MySQL directly. Practically
+unusable.
+
+═══════════════════════════════════════════════════════
+THE FIX
+═══════════════════════════════════════════════════════
+
+Replaced the Cart ID text input with a clickable line-items
+picker:
+
+1. Type an Order ID
+2. Click "Load"
+3. The order's photo line items appear as a scrollable list
+   with thumbnails, product names, SKUs, photo filenames,
+   and (subtly) cart IDs for reference
+4. Click a row → that line item is selected
+5. Preview renders against that selection
+
+If an order has only one photo line item, it's auto-selected.
+Saves one click on simple orders.
+
+If an order has no photo line items (e.g., gift cert only,
+download only), the picker shows an error.
+
+If an order doesn't exist at all, the Load button reports
+"Order not found."
+
+═══════════════════════════════════════════════════════
+WHAT THE LIST SHOWS
+═══════════════════════════════════════════════════════
+
+Each row:
+  [thumb 48×48]  Memory Mate 8x10
+                 MM-001 · sarah_pitch.jpg · cart 482996
+
+Plus a subtle 🖼️ indicator on rows that have a green-screen
+background photo, so you can quickly find a green-screen line
+item to preview the new playerBackground slot against.
+
+Selected row gets a blue-tinted background and left border.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/pages/settings/LayoutDesignerPage.js
+    + line items state (orderLineItems, orderLoading, orderError,
+      loadedOrderId)
+    + loadOrderLineItems() function — calls existing
+      GET /api/sytist/orders/:orderId, filters to photo line items
+    + Cart ID text input removed
+    + "Load" button added next to Order ID
+    + LineItemsPicker component for the line items list
+    + Auto-clear cart selection when order ID changes
+    + Auto-select cart when order has exactly one photo line item
+
+No server-side changes — uses existing /orders/:orderId endpoint
+which already returns line items with photo URLs (and now,
+thanks to Phase 10, with backgroundPhoto too).
+
+═══════════════════════════════════════════════════════
+PREREQUISITES
+═══════════════════════════════════════════════════════
+
+Phase 10 deployed (introduces backgroundPhoto on line items,
+which the picker uses for the 🖼️ indicator).
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-10a.tar.gz --strip-components=1
+  npm run dev
+
+Ctrl+Shift+R in the dashboard.
+
+═══════════════════════════════════════════════════════
+HOW IT FEELS NOW
+═══════════════════════════════════════════════════════
+
+Open the layout designer. Click "Use real order data."
+
+Type an order ID (the same ones you'd see in the Orders page).
+Click Load. A list of that order's photo line items appears
+below the input. Click whichever line item you want to preview
+against. The preview canvas renders.
+
+If the order has just one photo line item, you don't even
+need to click — it auto-selects.
+
+To preview against a different order: type a new order ID.
+The list of line items disappears (since they were for the
+old order). Click Load again.
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+✓ LineItemsPicker renders all items with thumbnails
+✓ Product names, SKUs, filenames, cart IDs all visible
+✓ Selected row highlighted with tinted background + blue border
+✓ 🖼️ "has BG" indicator on green-screen line items
+✓ Toolbar before Load: shows input + Load button only
+✓ Toolbar after Load: shows picker with line items
+✓ Order errors render correctly
+✓ Placeholder mode hides all order UI
+
+═══════════════════════════════════════════════════════
+KNOWN GAPS
+═══════════════════════════════════════════════════════
+
+- THUMBNAILS ARE FETCHED FROM S3 SAME WAY AS THE EXISTING
+  LOGO/PHOTO SYSTEM: thumb URLs come from buildPhotoUrls().
+  If S3 is slow or thumbnails are missing, the picker shows
+  empty placeholders. The list itself still works.
+
+- NO ORDER SEARCH/AUTOCOMPLETE: you still need to know an
+  order ID to load. Future: type-ahead from recent orders or
+  a "find order" lookup. For now, operators copy IDs from the
+  Orders list page.
+
+- LINE ITEMS LIST DOESN'T REFRESH AUTOMATICALLY: if you load
+  order X, then someone else modifies order X's cart in the
+  background, you'd need to re-click Load to see the change.
+  Acceptable for a single-operator preview tool.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 10            playerBackground slot kind
+✓ 10a           Line items picker for preview ← here

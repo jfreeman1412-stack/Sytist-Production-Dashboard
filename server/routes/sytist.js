@@ -2119,13 +2119,38 @@ router.post('/composite/preview', async (req, res) => {
       logoBuffer = await galleryAssetsService.readLogoBuffer(galleryId);
     }
 
+    // Phase 10b: resolve customer-selected background photo if the
+    // layout has a playerBackground slot AND the line item has a
+    // backgroundPhoto from cart_photo_bg. Mirrors the logic in
+    // processingService for the production pipeline.
+    const variantDef = layout.variants?.[variant] || { slots: [] };
+    let playerBackgroundBuffer = null;
+    const layoutHasBackgroundSlot = (variantDef.slots || []).some(
+      (s) => s.kind === 'playerBackground'
+    );
+    if (layoutHasBackgroundSlot && lineItem.backgroundPhoto?.fullUrl) {
+      try {
+        const bgResp = await fetch(lineItem.backgroundPhoto.fullUrl);
+        if (bgResp.ok) {
+          playerBackgroundBuffer = Buffer.from(await bgResp.arrayBuffer());
+        } else {
+          console.warn(
+            `[Composite preview] background photo HTTP ${bgResp.status}`
+          );
+        }
+      } catch (err) {
+        console.warn(
+          `[Composite preview] background photo fetch: ${err.message}`
+        );
+      }
+    }
+
     const tokens = compositeService.buildTokensFromOrder(order, lineItem);
 
     // Phase 9c: load any static graphics referenced by the chosen
     // variant's slots and pass them via tokens.overlays. Same logic
     // as in processingService Step 1.5 — loads from disk under the
     // layout's graphics dir.
-    const variantDef = layout.variants?.[variant] || { slots: [] };
     const graphicsMap = {};
     const seenKeys = new Set();
     for (const s of variantDef.slots || []) {
@@ -2153,6 +2178,7 @@ router.post('/composite/preview', async (req, res) => {
       playerPhoto,
       teamPhoto: teamPhotoBuffer,
       logo: logoBuffer,
+      playerBackground: playerBackgroundBuffer,
       tokens,
     });
 

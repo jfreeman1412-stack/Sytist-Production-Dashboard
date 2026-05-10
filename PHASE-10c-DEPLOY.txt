@@ -1,0 +1,118 @@
+Phase 10c — fix hide-layer in real-data preview + collapsible cards
+
+═══════════════════════════════════════════════════════
+THE BUGS
+═══════════════════════════════════════════════════════
+
+BUG 1: Eyeball toggle didn't hide the layer
+  In real-data preview mode, clicking the eyeball icon updated
+  state correctly but the layer kept showing. Root cause: the
+  preview canvas displays a server-rendered backdrop image that
+  has all layers BAKED IN. Hiding a layer in the designer only
+  affected what the canvas drew ON TOP of the backdrop (slot
+  outlines), not the backdrop itself. The actual rendered
+  imagery in the backdrop kept showing the hidden layer.
+
+BUG 2: Triangle indicator (▼/▶) didn't toggle properly
+  Clicking the card header expanded a card. Clicking the same
+  header again did nothing — already-selected cards stayed
+  selected. The triangle was a passive text indicator, not
+  a real button. Plus it was 9px font — barely visible.
+
+═══════════════════════════════════════════════════════
+THE FIXES
+═══════════════════════════════════════════════════════
+
+FIX 1: Filter hidden slots before sending to preview endpoint
+  When the designer fires off /composite/preview to render the
+  real-data backdrop, it now filters out slots that are marked
+  hidden for each variant. The server only sees the visible
+  slots, so the rendered backdrop reflects the hidden state.
+
+  Hide remains designer-only — never persisted to the saved
+  layout JSON. We're only filtering the in-flight payload.
+  Edit hidden state again → layout effect re-fires → new
+  preview rendered with updated visibility.
+
+  Both vertical and horizontal variants get filtered using
+  their own hide maps, so it works regardless of which
+  orientation the player photo triggers.
+
+FIX 2: Triangle is now a real IconButton with toggle behavior
+  - Replaced the 9px static span with a proper IconButton
+    (30×30, fontSize 15) — same size as the other layer-card
+    icons (eye, lock, up, down, delete)
+  - Click handler: if the card is already selected (▼),
+    deselects it (collapses). If collapsed (▶), selects it
+    (expands).
+  - Header click STILL just selects (no toggle there). Only
+    the triangle button toggles. Less surprising for operators
+    who click around in the editor.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/pages/settings/LayoutDesignerPage.js
+    + Filter hidden slots from layout sent to /composite/preview
+    + Effect deps include hiddenSlotsByVariant so toggling
+      triggers a re-render
+    + Static triangle span → IconButton with toggle handler
+    + Pass onCollapse from parent to LayerCard
+    + LayerCard: new onCollapse prop
+
+═══════════════════════════════════════════════════════
+PREREQUISITES
+═══════════════════════════════════════════════════════
+
+Phases 10, 10a, 10b deployed.
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-10c.tar.gz --strip-components=1
+  npm run dev
+
+Ctrl+Shift+R in the dashboard to reload the JS bundle.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+HIDE LAYER:
+1. Open layout designer with several slots
+2. Click "Use real order data" with a valid order
+3. Click the eyeball on a slot's layer card
+4. The slot should disappear from the rendered backdrop
+   (after a short re-render delay — the preview is debounced
+   500ms)
+5. Click eyeball again to bring it back
+
+EXPAND/COLLAPSE:
+1. Click the ▶ triangle on a collapsed card → expands (shows ▼)
+2. Click the ▼ triangle on an expanded card → collapses (shows ▶)
+3. Triangle should be visibly larger than before — same size
+   as the eye/lock/arrow icons
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+✓ ▶ icon renders inside an IconButton (30×30) when collapsed
+✓ ▼ icon renders inside an IconButton when expanded
+✓ aria-labels distinguish "Expand layer details" / "Collapse"
+✓ Filter math: hidden slots removed for the right variant only
+✓ Filter doesn't mutate the original layout object
+✓ Other variants unaffected by hide state in current variant
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 10            playerBackground slot kind
+✓ 10a           Line items picker
+✓ 10b           Preview endpoint fetches BG photo
+✓ 10c           Hide-in-preview + collapsible cards ← here

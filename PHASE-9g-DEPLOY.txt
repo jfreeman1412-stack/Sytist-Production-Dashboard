@@ -1,0 +1,138 @@
+Phase 9g — backdrop preview at full opacity, no duplicate slot rendering
+
+═══════════════════════════════════════════════════════
+THE BUG (logo half-transparent in real-data preview)
+═══════════════════════════════════════════════════════
+
+When you click "Use real order data," the canvas shows the
+server-rendered preview as a backdrop. In that screenshot the
+THUNDER FASTPITCH logo looked faded/half-transparent. The
+logo's PNG alpha channel was fine — the canvas was rendering
+the entire backdrop at opacity="0.85", which faded everything
+including the logo.
+
+The 0.85 was originally there so slot outlines could show
+through over real photos. But that's wrong: when you've
+clicked "Use real order data," you want to verify what the
+print will actually look like, at full fidelity. Slot outlines
+are useful when you're POSITIONING things — i.e. in placeholder
+mode. Real-data mode is for VERIFYING.
+
+Same logic applies to canvas-side rendering of slot imagery:
+when the backdrop is showing the server's rendered composite,
+the canvas's own static-graphic image / text rendering would
+just stack a second copy on top. Doubled rendering. Worse,
+client-side text fonts and metrics differ from server-side
+sharp rendering, so the doubled text doesn't even align.
+
+═══════════════════════════════════════════════════════
+THE FIX
+═══════════════════════════════════════════════════════
+
+Two changes, both in LayoutCanvas.js:
+
+1. BACKDROP RENDERS AT 100% OPACITY (was 85%)
+   When backgroundImageDataUrl is set, the SVG <image>
+   showing it now uses opacity="1". Logos, photos, graphics
+   all show at full fidelity.
+
+2. SLOTS DON'T RE-RENDER THEIR IMAGERY OVER THE BACKDROP
+   In backdrop mode (hasBackdrop===true), each slot draws
+   only a thin colored outline for positioning reference.
+   The actual image/text/graphic content is suppressed
+   because it's already baked into the backdrop.
+
+   Specifically:
+   - Static graphic slots: skip the inline <image>; draw
+     dashed outline only (selected slots get a solid outline)
+   - Text slots: skip the SlotText render; keep dashed outline
+   - Other slots: thin colored outline (was a translucent
+     filled rect before)
+
+In placeholder mode (no backdrop), nothing changes —
+operators see slot fills, placeholder graphics, sample text,
+exactly as before.
+
+═══════════════════════════════════════════════════════
+PREREQUISITES
+═══════════════════════════════════════════════════════
+
+Phase 9f deployed. (9g is a single-file client change on top
+of 9f — no server changes.)
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/components/LayoutCanvas.js   - backdrop opacity 0.85 → 1
+                                           - slot imagery suppressed
+                                             when backdrop active
+                                           - slot outline-only render
+                                             path for backdrop mode
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-9g.tar.gz --strip-components=1
+  npm run dev
+
+Then hit Ctrl+Shift+R in the dashboard tab to bypass the
+client bundle cache.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+1. Open the layout designer with a layout that has a real
+   order ID + cart ID set up.
+
+2. Click "Use real order data."
+
+3. The preview should now render at full opacity. Logo,
+   photos, text, frame graphic — all at full fidelity, no
+   washed-out look.
+
+4. Slot outlines still visible (thin colored strokes) so
+   you can see positioning. Click a slot in the layers
+   panel to select it; the outline goes solid blue.
+
+5. Switch back to "Placeholder" — slot fills and placeholder
+   graphics return. Use this mode for positioning work.
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+Placeholder mode:
+  ✓ Static graphic image renders normally
+  ✓ Text content renders normally
+  ✓ No backdrop image present
+
+Backdrop mode (Use real order data):
+  ✓ Backdrop image rendered at opacity="1"
+  ✓ Static graphic NOT duplicated over backdrop
+  ✓ Text content NOT duplicated over backdrop
+  ✓ Slot outlines still drawn (positioning reference preserved)
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 9c            Static Graphics
+✓ 9c-hotfix     Rules-of-hooks
+✓ 9c-hotfix2    .toFixed crash
+✗ 9d            See-through (rolled back)
+✓ 9e            Native PNG transparency + hide/lock
+✓ 9e-hotfix     Body-parser limit + diagnostics
+✓ 9e-hotfix2    Cache headers
+✓ 9e-hotfix3    Public preview endpoints
+✓ 9f            Token chips, autoFit, larger canvas, fit hints
+✓ 9g            Backdrop preview at full opacity ← here
+
+PENDING (still need your input):
+  - "Pull background images in player photos if they exist"
+    Need to clarify which interpretation matches your workflow
+    before I can build it. See chat for the question.

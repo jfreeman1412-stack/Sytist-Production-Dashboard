@@ -388,7 +388,7 @@ class CompositeService {
    *
    * Returns: { buffer, variant, dimensions, warnings }
    */
-  async buildSheetBuffer({ layout, variant, playerPhoto, teamPhoto, logo, tokens }) {
+  async buildSheetBuffer({ layout, variant, playerPhoto, teamPhoto, logo, playerBackground, tokens }) {
     if (!layout) throw new Error('layout is required');
     const variantDef = layout.variants[variant];
     if (!variantDef) {
@@ -429,6 +429,24 @@ class CompositeService {
             continue;
           }
           const fitted = await sharp(playerPhoto)
+            .resize(w, h, { fit: slot.fit || 'cover' })
+            .toBuffer();
+          composites.push({ input: fitted, top: y, left: x });
+        } else if (slot.kind === 'playerBackground') {
+          // Phase 10: customer-selected background photo (from
+          // ms_cart.cart_photo_bg). When absent, render NOTHING — the
+          // sheet's own background or whatever's drawn behind shows
+          // through the player photo's alpha. No placeholder, no warning.
+          //
+          // When present, behaves like a photo slot: resize/fit, place
+          // at the slot's coordinates. Order matters — the layout's
+          // slot order should put playerBackground BEFORE playerPhoto
+          // so the background draws under the player.
+          if (!playerBackground) {
+            // Cart didn't reference a background — just skip this slot.
+            continue;
+          }
+          const fitted = await sharp(playerBackground)
             .resize(w, h, { fit: slot.fit || 'cover' })
             .toBuffer();
           composites.push({ input: fitted, top: y, left: x });

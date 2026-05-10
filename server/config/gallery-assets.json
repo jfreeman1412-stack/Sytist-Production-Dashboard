@@ -1,4 +1,11 @@
 {
-  "galleries": {},
+  "galleries": {
+    "6397": {
+      "logoFilename": "gallery-6397.png",
+      "uploadedAt": "2026-05-10T15:05:03.828Z",
+      "uploadedBy": "joey",
+      "sizeBytes": 82287
+    }
+  },
   "overlays": []
 }

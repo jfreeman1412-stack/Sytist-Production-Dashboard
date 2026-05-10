@@ -27,6 +27,11 @@ import React, { useEffect, useRef, useState } from 'react';
 
 const SLOT_STYLES = {
   playerPhoto: { fill: '#5d8fc4', stroke: '#3c6a9a', label: 'Player photo' },
+  // Phase 10: customer-selected background photo. Drawn behind the
+  // player photo (slot order in the layout puts it earlier in the
+  // array → drawn first → underneath). Teal swatch distinguishes
+  // from player blue and team red.
+  playerBackground: { fill: '#5dc4b8', stroke: '#3c9a8c', label: 'Player background' },
   teamPhoto:   { fill: '#c46060', stroke: '#9a3c3c', label: 'Team photo' },
   logo:        { fill: '#7cc46d', stroke: '#4a9a3c', label: 'Logo' },
   // Phase 9c: rename overlay → staticGraphic (more obvious to non-
@@ -334,13 +339,19 @@ export default function LayoutCanvas({
           strokeWidth={Math.min(sheetW, sheetH) * 0.005}
         />
 
-        {/* Optional preview backdrop image (for live preview mode) */}
+        {/* Optional preview backdrop image (for live preview mode).
+            Phase 9g: render at FULL opacity. Previously was 85% so
+            slot outlines could show through, but that made the
+            preview look washed out. Slot outlines still draw on top
+            of this — they're thin colored strokes that remain
+            visible. To see only the print without outlines, the
+            operator deselects whatever was selected. */}
         {backgroundImageDataUrl && (
           <image
             href={backgroundImageDataUrl}
             x="0" y="0" width={sheetW} height={sheetH}
             preserveAspectRatio="none"
-            opacity="0.85"
+            opacity="1"
             pointerEvents="none"
           />
         )}
@@ -473,7 +484,14 @@ function SlotShape({ slot, sampleTokens, isSelected, interactive, isLocked, hasB
           strokeWidth={strokeWidth}
           strokeDasharray="0.06 0.04"
         />
-        <SlotText slot={slot} sampleTokens={sampleTokens} x={x} y={y} w={w} h={h} />
+        {/* Phase 9g: skip the rendered text in backdrop mode. The
+            backdrop already contains the real text from the server-
+            rendered preview, so drawing the placeholder text here
+            would just stack two copies. The dashed outline still
+            shows where the slot is positioned. */}
+        {!hasBackdrop && (
+          <SlotText slot={slot} sampleTokens={sampleTokens} x={x} y={y} w={w} h={h} />
+        )}
       </g>
     );
   }
@@ -482,10 +500,14 @@ function SlotShape({ slot, sampleTokens, isSelected, interactive, isLocked, hasB
   // URL for its uploaded image, render the actual image inline so the
   // operator sees what they're working with. Falls back to the colored
   // placeholder rect when no upload exists yet.
+  //
+  // Phase 9g: when a backdrop preview is active, suppress the inline
+  // static-graphic image — it'd duplicate what's already baked into
+  // the backdrop. Slot outline still renders for positioning ref.
   const isStaticGraphic = slot.kind === 'staticGraphic' || slot.kind === 'overlay';
   const graphicKey = slot.graphicKey || slot.overlayId;
   const graphicUrl =
-    isStaticGraphic && graphicKey && graphicsUrls
+    isStaticGraphic && graphicKey && graphicsUrls && !hasBackdrop
       ? graphicsUrls[graphicKey]
       : null;
 
@@ -507,9 +529,6 @@ function SlotShape({ slot, sampleTokens, isSelected, interactive, isLocked, hasB
         // respected natively by the browser's <image> element, so
         // graphics with transparent cutouts (e.g. frames) just work
         // — the transparent regions show through to slots beneath.
-        // We slightly lower opacity only when there's a preview
-        // backdrop image (real-order photos) so the graphic doesn't
-        // completely occlude the photos in that view.
         <>
           <image
             href={graphicUrl}
@@ -519,7 +538,7 @@ function SlotShape({ slot, sampleTokens, isSelected, interactive, isLocked, hasB
                 ? 'xMidYMid slice'
                 : 'xMidYMid meet'
             }
-            opacity={hasBackdrop ? 0.85 : 1}
+            opacity={1}
           />
           <rect
             x={x} y={y} width={w} height={h}
@@ -528,6 +547,19 @@ function SlotShape({ slot, sampleTokens, isSelected, interactive, isLocked, hasB
             strokeWidth={strokeWidth}
           />
         </>
+      ) : hasBackdrop ? (
+        // Phase 9g: backdrop mode — render only a thin slot outline.
+        // The actual photo/logo/graphic is baked into the backdrop
+        // already, so there's nothing else to show here. Outline
+        // helps the operator see where slots are positioned over
+        // the rendered image.
+        <rect
+          x={x} y={y} width={w} height={h}
+          fill="transparent"
+          stroke={strokeColor}
+          strokeWidth={strokeWidth}
+          strokeDasharray={isSelected ? '0' : '0.04 0.03'}
+        />
       ) : (
         <>
           <rect

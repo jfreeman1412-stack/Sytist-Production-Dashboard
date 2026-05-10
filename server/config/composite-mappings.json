@@ -1,3 +1,9 @@
 {
-  "mappings": []
+  "mappings": [
+    {
+      "externalId": "6",
+      "layoutId": "MM-General",
+      "chainToImposition": false
+    }
+  ]
 }

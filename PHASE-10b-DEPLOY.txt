@@ -1,0 +1,121 @@
+Phase 10b — fix background photo not pulling in designer preview
+
+═══════════════════════════════════════════════════════
+THE BUG
+═══════════════════════════════════════════════════════
+
+You added a playerBackground slot, picked a green-screen line
+item, and the slot rendered white instead of the customer's
+selected background image.
+
+Why: the designer's "Use real order data" preview goes through
+the dedicated `/api/sytist/composite/preview` endpoint, which
+is a SEPARATE code path from the production processingService
+pipeline. Phase 10's background-fetch logic only made it into
+processingService — the preview endpoint was untouched.
+
+So:
+  - Production pipeline (processingService): correctly fetches
+    and composites the background. Will work in real orders.
+  - Designer live preview (/composite/preview): never fetched
+    the background, never passed it to buildSheetBuffer. The
+    slot fell through to its silent-skip branch and the sheet's
+    white background showed through.
+
+The two code paths shouldn't have diverged in the first place.
+A future refactor should extract the asset-fetching dance
+(player photo, team photo, logo, background, static graphics)
+into a shared helper. For now, copy-fix.
+
+═══════════════════════════════════════════════════════
+THE FIX
+═══════════════════════════════════════════════════════
+
+In server/routes/sytist.js, the /composite/preview route now:
+
+1. Checks whether the layout has a playerBackground slot
+2. If yes AND the line item has a backgroundPhoto (from
+   cart_photo_bg), fetches the background bytes from S3
+3. Passes the buffer as `playerBackground` to
+   compositeService.buildSheetBuffer
+
+Same shape as processingService's logic. Same silent-skip when
+either condition is false.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/routes/sytist.js   + background photo fetch in
+                              /composite/preview endpoint
+                            + pass playerBackground buffer to
+                              buildSheetBuffer
+                            (also includes a small refactor:
+                             reuse the existing variantDef
+                             declaration rather than declaring
+                             twice)
+
+═══════════════════════════════════════════════════════
+PREREQUISITES
+═══════════════════════════════════════════════════════
+
+Phases 10 and 10a deployed.
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-10b.tar.gz --strip-components=1
+  npm run dev
+
+No client cache concern this time — server-only change. Just
+restart the server (nodemon does it automatically on file save).
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+1. Open the layout designer with a layout that has a
+   playerBackground slot.
+
+2. Click "Use real order data."
+
+3. Type the order ID of a known green-screen order. Click Load.
+
+4. In the line items picker, look for the 🖼️ "has BG" indicator
+   and click that line item.
+
+5. The preview should now show the customer's selected
+   background image filling the playerBackground slot, with
+   the player photo composited on top.
+
+If you select a line item WITHOUT a 🖼️ indicator (no
+cart_photo_bg), the slot stays white as designed.
+
+═══════════════════════════════════════════════════════
+HONEST POST-MORTEM
+═══════════════════════════════════════════════════════
+
+Phase 10 had two code paths that needed updating:
+  - processingService.js (production pipeline) — updated ✓
+  - routes/sytist.js /composite/preview (designer preview) — MISSED ✗
+
+I should have grep'd for every call site of
+buildSheetBuffer when adding the new parameter. Two minutes
+would have caught this. Instead, one of the two calls was
+silently passing undefined for the new param.
+
+Lesson for future signature changes to compositeService:
+treat them like API breaking changes. Find all callers,
+update all of them, smoke test all paths. Don't trust that
+"the only place this gets called is X."
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 10            playerBackground slot kind
+✓ 10a           Line items picker for preview
+✓ 10b           Fix preview endpoint to fetch background ← here

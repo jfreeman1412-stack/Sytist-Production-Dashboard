@@ -638,6 +638,42 @@ class ProcessingService {
           });
         }
 
+        // Phase 10: resolve background photo when the cart references one.
+        // li.backgroundPhoto is populated by sytistDbService when
+        // cart_photo_bg > 0. Only fetch when the layout actually has a
+        // playerBackground slot — otherwise we'd download bytes that
+        // never get used.
+        let playerBackgroundBuffer = null;
+        const layoutHasBackgroundSlot = (
+          (layout.variants?.vertical?.slots || [])
+            .concat(layout.variants?.horizontal?.slots || [])
+        ).some((s) => s.kind === 'playerBackground');
+
+        if (layoutHasBackgroundSlot && li.backgroundPhoto?.fullUrl) {
+          try {
+            const bgResp = await fetch(li.backgroundPhoto.fullUrl);
+            if (bgResp.ok) {
+              const bgArrayBuffer = await bgResp.arrayBuffer();
+              playerBackgroundBuffer = Buffer.from(bgArrayBuffer);
+            } else {
+              subResult.warnings.push({
+                type: 'background_photo_fetch_failed',
+                cartId: li.cartId,
+                message: `Background photo HTTP ${bgResp.status} from ${li.backgroundPhoto.fullUrl}`,
+              });
+            }
+          } catch (err) {
+            subResult.warnings.push({
+              type: 'background_photo_fetch_error',
+              cartId: li.cartId,
+              message: err.message,
+            });
+          }
+        }
+        // Note: when the layout has a playerBackground slot but the cart
+        // didn't reference a background, we DON'T warn. Some orders just
+        // don't have green-screen backgrounds; the slot silently skips.
+
         // Pick variant from the player photo's orientation
         const playerWidth = li.photo?.width || 0;
         const playerHeight = li.photo?.height || 0;
@@ -698,6 +734,7 @@ class ProcessingService {
           playerPhoto: playerBuffer,
           teamPhoto: teamBuffer,
           logo: logoBuffer,
+          playerBackground: playerBackgroundBuffer,
           tokens,
         });
 
