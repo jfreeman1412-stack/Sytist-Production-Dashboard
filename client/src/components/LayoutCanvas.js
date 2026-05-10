@@ -557,10 +557,36 @@ function SlotShape({ slot, sampleTokens, isSelected, interactive, isLocked, hasB
 function SlotText({ slot, sampleTokens, x, y, w, h }) {
   const resolvedText = substituteTokens(slot.text || '', sampleTokens);
   const dpi = sampleTokens.__dpi || 300;
-  const inchFontSize = (slot.fontSize || 24) / dpi;
   const align = slot.align || 'center';
   const anchor = align === 'left' ? 'start' : align === 'right' ? 'end' : 'middle';
   const textX = align === 'left' ? x : align === 'right' ? x + w : x + w / 2;
+
+  // Phase 9f: mirror server-side autoFit so the designer matches what
+  // production will render. The math is the same — see compositeService
+  // _textSvg for the rationale on the avgCharWidthRatio constants.
+  // Both server and client work in the same units (inches in canvas
+  // viewBox, pixels in production sharp render), so the relative
+  // proportions match.
+  const requestedFontSize = slot.fontSize || 24;
+  const charCount = (resolvedText || '(empty text)').length || 1;
+  const padding = 0.95;
+  const weight = slot.weight || 'normal';
+  const avgCharWidthRatio = weight === 'bold' ? 0.6 : 0.55;
+  // Convert from font-size-in-pixels (at 300 DPI) to font-size-in-inches
+  // for the SVG canvas. We compute the cap in inch units directly.
+  const maxFontByWidthIn = (w * padding) / (charCount * avgCharWidthRatio);
+  const maxFontByHeightIn = h * padding;
+  const maxFitFontSizeIn = Math.min(maxFontByWidthIn, maxFontByHeightIn);
+
+  const requestedFontSizeIn = requestedFontSize / dpi;
+  let inchFontSize = requestedFontSizeIn;
+  if (slot.autoFit) {
+    inchFontSize = Math.min(requestedFontSizeIn, maxFitFontSizeIn);
+  } else if (requestedFontSizeIn > maxFitFontSizeIn * 1.5) {
+    inchFontSize = maxFitFontSizeIn;
+  }
+  // Floor at 6px-equivalent in inches
+  inchFontSize = Math.max(inchFontSize, 6 / dpi);
 
   return (
     <text
@@ -568,7 +594,7 @@ function SlotText({ slot, sampleTokens, x, y, w, h }) {
       textAnchor={anchor} dominantBaseline="middle"
       fontSize={inchFontSize}
       fontFamily={slot.fontFamily || 'Arial, sans-serif'}
-      fontWeight={slot.weight || 'normal'}
+      fontWeight={weight}
       fill={slot.color || '#000000'}
       pointerEvents="none"
     >

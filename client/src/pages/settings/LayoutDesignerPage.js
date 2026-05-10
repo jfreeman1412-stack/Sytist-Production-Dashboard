@@ -635,8 +635,11 @@ export default function LayoutDesignerPage() {
   const variantDef = layout.variants?.[variant];
   const slots = variantDef?.slots || [];
 
-  // Canvas dimensions: keep the longer side at 504
-  const TARGET_LONG_SIDE = 504;
+  // Canvas dimensions: keep the longer side at the target.
+  // Phase 9f: bumped from 504 → 700. Operators design at slot-level
+  // detail and need to see the canvas clearly. The grid below also
+  // gets adjusted to give the canvas more room.
+  const TARGET_LONG_SIDE = 700;
   const aspect = layout.sheetWidth / layout.sheetHeight;
   const canvasWidth =
     aspect >= 1 ? TARGET_LONG_SIDE : TARGET_LONG_SIDE * aspect;
@@ -1090,17 +1093,29 @@ function SlotEditorBody({
       {isImage && (
         <FormRow
           label="Fit mode"
-          hint="cover = fills slot, may crop. contain = entire image visible, may letterbox."
+          hint={
+            slot.fit === 'cover' || !slot.fit
+              ? 'Cover: image FILLS the slot. Crops edges if aspect ratios differ. Use for photos.'
+              : slot.fit === 'contain'
+                ? 'Contain: image FITS ENTIRELY in the slot. May leave empty bars on the sides. Use for logos and frames.'
+                : slot.fit === 'fill'
+                  ? 'Fill: stretches the image to fill the slot exactly. Distorts if aspect ratios differ.'
+                  : slot.fit === 'inside'
+                    ? 'Inside: like contain, but never enlarges a smaller image.'
+                    : slot.fit === 'outside'
+                      ? 'Outside: like cover, but never enlarges a smaller image.'
+                      : ''
+          }
         >
           <Select
             value={slot.fit || 'cover'}
             onChange={(v) => update('fit', v)}
             options={[
-              { value: 'cover', label: 'cover' },
-              { value: 'contain', label: 'contain' },
-              { value: 'fill', label: 'fill' },
-              { value: 'inside', label: 'inside' },
-              { value: 'outside', label: 'outside' },
+              { value: 'cover', label: 'cover — fill (may crop)' },
+              { value: 'contain', label: 'contain — fit (may letterbox)' },
+              { value: 'fill', label: 'fill — stretch (may distort)' },
+              { value: 'inside', label: 'inside — fit, don\'t enlarge' },
+              { value: 'outside', label: 'outside — fill, don\'t enlarge' },
             ]}
           />
         </FormRow>
@@ -1119,15 +1134,10 @@ function SlotEditorBody({
 
       {isText && (
         <>
-          <FormRow
-            label="Text content"
-            hint="Use {tokens} like {subject.athleteName} or {customer.firstName}"
-          >
-            <TextInput
-              value={slot.text || ''}
-              onChange={(v) => update('text', v)}
-            />
-          </FormRow>
+          <TextSlotContent
+            slot={slot}
+            update={update}
+          />
           <div
             style={{
               display: 'grid',
@@ -1181,6 +1191,28 @@ function SlotEditorBody({
                   { value: 'right', label: 'right' },
                 ]}
               />
+            </FormRow>
+            <FormRow
+              label="Auto-fit"
+              hint="Shrink font to fit width if needed"
+            >
+              <label
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  fontSize: 12,
+                  cursor: 'pointer',
+                  paddingTop: 8,
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={!!slot.autoFit}
+                  onChange={(e) => update('autoFit', e.target.checked)}
+                />
+                Shrink to fit
+              </label>
             </FormRow>
           </div>
         </>
@@ -1237,6 +1269,134 @@ function SlotEditorBody({
 // Thumbnail of the currently-referenced graphic appears below if a
 // file exists. Uses the preview endpoint with a cache-busting suffix
 // so re-uploads at the same key show fresh.
+
+// ─── Text slot content editor (Phase 9f) ──────────────────
+//
+// Wraps a plain text input with a row of token-insert buttons. Clicks
+// on a token chip insert the {token.path} string at the input's
+// current cursor position (or at the end if the input has never been
+// focused). Operators don't have to memorize token names.
+//
+// The token catalog mirrors PLACEHOLDER_TOKENS from LayoutCanvas —
+// kept in sync manually for now since it's a small, stable list.
+
+const TEXT_TOKEN_CATALOG = [
+  { token: '{subject.athleteName}', label: 'Athlete' },
+  { token: '{subject.coachName}', label: 'Coach' },
+  { token: '{subject.teamAndLevel}', label: 'Team' },
+  { token: '{subject.jerseyNumber}', label: 'Jersey #' },
+  { token: '{customer.firstName}', label: 'First name' },
+  { token: '{customer.lastName}', label: 'Last name' },
+  { token: '{galleryName}', label: 'Gallery' },
+  { token: '{subGalleryName}', label: 'Sub-gallery' },
+  { token: '{year}', label: 'Year' },
+  { token: '{date}', label: 'Date' },
+];
+
+function TextSlotContent({ slot, update }) {
+  const inputRef = useRef(null);
+  // Track cursor position so we can insert at the right place. We
+  // capture it on every keyup/click in the input. If the operator
+  // never focused the input (e.g., clicked a chip first), we
+  // append to the end.
+  const cursorRef = useRef(null);
+
+  function handleSelect(e) {
+    cursorRef.current = {
+      start: e.target.selectionStart,
+      end: e.target.selectionEnd,
+    };
+  }
+
+  function insertToken(token) {
+    const current = slot.text || '';
+    const cursor = cursorRef.current;
+    let nextValue;
+    let nextCursor;
+    if (cursor && cursor.start != null) {
+      const before = current.slice(0, cursor.start);
+      const after = current.slice(cursor.end);
+      nextValue = before + token + after;
+      nextCursor = cursor.start + token.length;
+    } else {
+      nextValue = current + token;
+      nextCursor = nextValue.length;
+    }
+    update('text', nextValue);
+    cursorRef.current = { start: nextCursor, end: nextCursor };
+    // Refocus the input so the operator can keep typing
+    setTimeout(() => {
+      if (inputRef.current) {
+        inputRef.current.focus();
+        try {
+          inputRef.current.setSelectionRange(nextCursor, nextCursor);
+        } catch {
+          // Some browsers throw on setSelectionRange for certain inputs
+        }
+      }
+    }, 0);
+  }
+
+  return (
+    <FormRow
+      label="Text content"
+      hint="Type literal text or click a token below to insert."
+    >
+      <input
+        ref={inputRef}
+        type="text"
+        value={slot.text || ''}
+        onChange={(e) => update('text', e.target.value)}
+        onSelect={handleSelect}
+        onClick={handleSelect}
+        onKeyUp={handleSelect}
+        style={{
+          width: '100%',
+          padding: '8px 10px',
+          fontSize: 13,
+          background: 'var(--bg-input)',
+          border: '1px solid var(--border-color)',
+          borderRadius: 4,
+          color: 'var(--text-primary)',
+          fontFamily: 'inherit',
+          boxSizing: 'border-box',
+        }}
+      />
+      <div
+        style={{
+          display: 'flex',
+          flexWrap: 'wrap',
+          gap: 4,
+          marginTop: 6,
+        }}
+      >
+        {TEXT_TOKEN_CATALOG.map((t) => (
+          <button
+            key={t.token}
+            type="button"
+            onClick={(e) => {
+              e.preventDefault();
+              insertToken(t.token);
+            }}
+            title={`Inserts ${t.token}`}
+            style={{
+              padding: '3px 8px',
+              fontSize: 11,
+              background: 'var(--bg-input)',
+              border: '1px solid var(--border-color)',
+              borderRadius: 12,
+              color: 'var(--text-primary)',
+              cursor: 'pointer',
+              fontFamily: 'inherit',
+            }}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+    </FormRow>
+  );
+}
 
 function StaticGraphicSlotEditor({
   slot,
@@ -2230,14 +2390,16 @@ function LayerCard({
         />
       )}
 
-      {/* Card header — always visible */}
+      {/* Card header — always visible. Phase 9f: tighter padding so
+          cards are more compact, leaving more vertical space for
+          the editor body when expanded. */}
       <div
         onClick={onSelect}
         style={{
           display: 'flex',
           alignItems: 'center',
-          gap: 8,
-          padding: '8px 12px',
+          gap: 6,
+          padding: '6px 10px',
           cursor: 'pointer',
           borderLeft: isSelected ? '3px solid #4a7fc1' : '3px solid transparent',
         }}
@@ -2252,10 +2414,10 @@ function LayerCard({
           style={{
             cursor: 'grab',
             color: 'var(--text-muted)',
-            fontSize: 14,
+            fontSize: 13,
             fontWeight: 700,
             userSelect: 'none',
-            padding: '0 4px',
+            padding: '0 3px',
             lineHeight: 1,
             flexShrink: 0,
           }}
@@ -2266,8 +2428,8 @@ function LayerCard({
         {/* Color swatch indicating the slot kind */}
         <div
           style={{
-            width: 16,
-            height: 16,
+            width: 12,
+            height: 12,
             background: swatchColor,
             border: '1px solid rgba(255,255,255,0.2)',
             borderRadius: 3,
@@ -2279,7 +2441,7 @@ function LayerCard({
         <div style={{ flex: 1, minWidth: 0 }}>
           <div
             style={{
-              fontSize: 12,
+              fontSize: 11,
               fontWeight: 600,
               color: 'var(--text-primary)',
               overflow: 'hidden',
@@ -2291,7 +2453,7 @@ function LayerCard({
           </div>
           <div
             style={{
-              fontSize: 10,
+              fontSize: 9,
               color: 'var(--text-muted)',
               fontFamily: 'var(--font-mono, monospace)',
             }}
@@ -2436,11 +2598,14 @@ function IconButton({ children, onClick, disabled, danger, label }) {
           : danger
           ? '#dc3545'
           : 'var(--text-primary)',
-        width: 26,
-        height: 26,
-        borderRadius: 4,
+        // Phase 9f: larger touch/click targets. Was 26×26 / fontSize 12.
+        // Bumped to 30 to be more obvious without making card heights
+        // dominate.
+        width: 30,
+        height: 30,
+        borderRadius: 5,
         cursor: disabled ? 'default' : 'pointer',
-        fontSize: 12,
+        fontSize: 15,
         fontFamily: 'inherit',
         opacity: disabled ? 0.4 : 1,
         display: 'inline-flex',

@@ -561,13 +561,50 @@ class CompositeService {
   }
 
   _textSvg(slot, x, y, w, h, text) {
-    const fontSize = slot.fontSize || 24;
+    const requestedFontSize = slot.fontSize || 24;
     const fontFamily = slot.fontFamily || 'Arial, sans-serif';
     const color = slot.color || '#000000';
     const align = slot.align || 'center';
     const weight = slot.weight || 'normal';
     const anchor = align === 'left' ? 'start' : align === 'right' ? 'end' : 'middle';
     const textX = align === 'left' ? 0 : align === 'right' ? w : w / 2;
+
+    // Phase 9f: autoFit. When slot.autoFit is enabled (or the engine
+    // detects overflow even without the flag — defensive default),
+    // shrink the font size so the rendered text fits within the slot's
+    // width. The shrink factor is estimated from average character
+    // width for Arial-class fonts; close enough for English text and
+    // typical name lengths. We never scale UP — only down.
+    //
+    // Estimate:  textWidth ≈ chars × fontSize × 0.55  (Arial-ish)
+    // Limit:     textWidth ≤ w * 0.95  (small inset)
+    // So:        fontSize ≤ (w * 0.95) / (chars × 0.55)
+    const charCount = (text || '').length || 1;
+    const padding = 0.95;
+    const avgCharWidthRatio = weight === 'bold' ? 0.6 : 0.55;
+    const maxFontByWidth = (w * padding) / (charCount * avgCharWidthRatio);
+    // Also bound by height: text shouldn't be taller than the slot
+    const maxFontByHeight = h * padding;
+    const maxFitFontSize = Math.min(maxFontByWidth, maxFontByHeight);
+
+    // Default behavior: if slot.autoFit is explicitly true, always
+    // apply the shrink. If undefined/false, only shrink when the
+    // requested size would clearly overflow (this keeps existing
+    // layouts unchanged unless the operator opts in).
+    let fontSize = requestedFontSize;
+    if (slot.autoFit) {
+      fontSize = Math.min(requestedFontSize, maxFitFontSize);
+    } else if (requestedFontSize > maxFitFontSize) {
+      // Even without autoFit, refuse to render text that would
+      // overflow drastically (more than 1.5× over). This is
+      // defensive; without it, a long name in a small slot would
+      // bleed past the slot bounds and possibly overlap other slots.
+      if (requestedFontSize > maxFitFontSize * 1.5) {
+        fontSize = maxFitFontSize;
+      }
+    }
+    // Don't go absurdly small — minimum readable
+    fontSize = Math.max(fontSize, 6);
 
     const svg = Buffer.from(
       `<svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">` +

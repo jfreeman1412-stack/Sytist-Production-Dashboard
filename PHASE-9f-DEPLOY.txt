@@ -1,0 +1,162 @@
+Phase 9f — designer polish: tokens, autoFit, sizing, fit-mode hints
+
+═══════════════════════════════════════════════════════
+WHAT THIS DELIVERS
+═══════════════════════════════════════════════════════
+
+Five small UX improvements to the layout designer based on
+your feedback:
+
+1. TOKEN BUTTONS UNDER TEXT INPUT
+   When editing a Text slot, a row of clickable chips appears
+   below the text-content input: Athlete, Coach, Team, Jersey #,
+   First name, Last name, Gallery, Sub-gallery, Year, Date.
+   Click a chip to insert that token at the current cursor
+   position. Operators don't have to memorize {subject.athleteName}
+   etc.
+
+2. AUTO-FIT TEXT (NEW SHRINK-TO-FIT FEATURE)
+   New "Shrink to fit" checkbox in the Text slot editor. When
+   on, the rendered font size shrinks down so the text fits
+   within the slot's width. Uses a simple width estimate
+   (avg char width × char count). Implementation:
+     - Server: compositeService._textSvg shrinks fontSize before
+       SVG render. Defensive: even WITHOUT the autoFit flag, the
+       engine shrinks if the requested size would overflow more
+       than 1.5× (so existing layouts don't surprise-overflow).
+     - Client: SlotText in LayoutCanvas mirrors the same math
+       so the designer matches production rendering.
+   Math: max font = (slot_width × 0.95) / (chars × 0.55).
+   Bold text uses 0.6 instead. Floor at 6px.
+
+3. LARGER ICON BUTTONS
+   The hide/lock/up/down/delete icons on layer cards are now
+   30×30 (was 26×26) with bigger glyphs. More obvious targets.
+
+4. LARGER CANVAS, TIGHTER CARDS
+   Canvas target dimension bumped from 504 → 700 pixels. Layer
+   card padding tightened (8px→6px), label fonts smaller
+   (12→11, 10→9), color swatch smaller (16→12) so cards take
+   less vertical space when collapsed.
+
+5. CLEARER FIT MODE HINTS
+   The Fit mode dropdown now shows descriptive labels:
+     - cover — fill (may crop)
+     - contain — fit (may letterbox)
+     - fill — stretch (may distort)
+     - inside — fit, don't enlarge
+     - outside — fill, don't enlarge
+   And the hint text below the dropdown changes per selection
+   to explain what each mode does and when to use it.
+
+═══════════════════════════════════════════════════════
+ABOUT FIT MODES (FOR REFERENCE)
+═══════════════════════════════════════════════════════
+
+  cover    Fills the slot completely. Crops edges if the image's
+           aspect ratio doesn't match the slot's. Use for player
+           and team photos — you want them to fill their frames
+           cleanly.
+
+  contain  Fits entirely inside the slot. Leaves empty bars on
+           the sides if aspect ratios differ. Use for logos and
+           static graphics where the whole image must be visible.
+
+  fill     Stretches the image to exactly the slot dimensions,
+           distorting it if aspect ratios don't match. Rarely
+           the right answer.
+
+  inside   Like contain, but won't enlarge an image smaller than
+           the slot. Image stays at native size if it fits.
+
+  outside  Like cover, but won't enlarge an image smaller than
+           the slot. Image stays at native size if it fits.
+
+═══════════════════════════════════════════════════════
+PREREQUISITES
+═══════════════════════════════════════════════════════
+
+Phase 9e-hotfix3 must be deployed (the auth fix that finally
+made graphic previews work).
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/services/compositeService.js                + autoFit shrink
+                                                     in _textSvg
+
+  client/src/components/LayoutCanvas.js              + autoFit mirroring
+                                                     in SlotText preview
+
+  client/src/pages/settings/LayoutDesignerPage.js    + TextSlotContent
+                                                     with token chips
+                                                     + Shrink to fit
+                                                     checkbox
+                                                     + larger IconButton
+                                                     (30×30)
+                                                     + tighter card
+                                                     header
+                                                     + canvas TARGET=700
+                                                     + per-mode fit hint
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-9f.tar.gz --strip-components=1
+  npm run dev
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+Server-side autoFit:
+  ✓ Long text + autoFit on: 100px → 13.3px (correct shrink)
+  ✓ Short text + autoFit on: no shrink (24px stays 24px)
+  ✓ Normal text + autoFit off: no shrink
+  ✓ Extreme overflow (200px in tiny slot) + autoFit off:
+    defensive shrink to 9.6px
+  ✓ Empty text: doesn't crash
+
+Client-side rendering:
+  ✓ TextSlotContent renders all 10 token chips
+  ✓ IconButton renders at 30×30 with fontSize 15
+  ✓ All files parse cleanly
+
+═══════════════════════════════════════════════════════
+KNOWN GAPS
+═══════════════════════════════════════════════════════
+
+- AUTOFIT WIDTH ESTIMATE IS APPROXIMATE: the math assumes
+  Arial-class fonts. If you use exotic fonts with very wide or
+  narrow characters (like a condensed sans or a script face),
+  the estimate may be off by ~15%. For typical operator-facing
+  fonts (Arial, Helvetica, Roboto) the estimate is accurate.
+  If we ever need exact measurement, we'd need to ship a server-
+  side font-metrics library.
+
+- TOKEN LIST IS HARDCODED: the 10 chips are baked in to
+  TEXT_TOKEN_CATALOG. If you add a new token to the production
+  pipeline (say {team.color}), I'd need to add it here too.
+  Future: pull from a shared constants file.
+
+- TOKEN INSERTION USES DOM SELECTION API: works in all modern
+  browsers but if you're using a really old browser the cursor
+  position tracking might fall back to "append to end."
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 9c            Static Graphics
+✓ 9c-hotfix     Rules-of-hooks
+✓ 9c-hotfix2    .toFixed crash
+✗ 9d            See-through (rolled back)
+✓ 9e            Native PNG transparency + hide/lock
+✓ 9e-hotfix     Body-parser limit + diagnostics
+✓ 9e-hotfix2    Cache headers
+✓ 9e-hotfix3    Public preview endpoints
+✓ 9f            Token buttons, autoFit, larger canvas, fit hints ← here
