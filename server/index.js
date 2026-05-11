@@ -111,11 +111,25 @@ app.listen(PORT, () => {
   console.log(`[sytist-dashboard] server listening on http://localhost:${PORT}`);
   console.log(`[sytist-dashboard] env: ${NODE_ENV}`);
   console.log(`[sytist-dashboard] health: http://localhost:${PORT}/api/health`);
+
+  // Phase 13e: start the ShipStation shipped-status poller. Lazy-loaded
+  // so import errors (e.g. missing better-sqlite3 in fresh installs)
+  // don't crash startup — the scheduler just doesn't run.
+  try {
+    require('./services/schedulerService').start();
+  } catch (err) {
+    console.warn(`[startup] Scheduler did not start: ${err.message}`);
+  }
 });
 
 // ─── Graceful shutdown ─────────────────────────────────────
 async function shutdown() {
   console.log('\n[sytist-dashboard] shutting down…');
+  try {
+    require('./services/schedulerService').stop();
+  } catch (err) {
+    // Scheduler may not have started; ignore.
+  }
   try {
     await sytistDb.close();
   } catch (err) {

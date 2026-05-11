@@ -27,6 +27,15 @@ export default function OrderDetailPage() {
   const [error, setError] = useState(null);
   const [notFound, setNotFound] = useState(false);
 
+  // Phase 13c: bump this counter to trigger ShippingBlock to refetch
+  // its status. Wired into ProcessOrderBlock so a successful Process
+  // (which now also creates a SS order) immediately reflects the new
+  // linked state on the Shipping card without needing a page reload.
+  const [shippingRefreshTrigger, setShippingRefreshTrigger] = useState(0);
+  const refreshShipping = React.useCallback(() => {
+    setShippingRefreshTrigger((n) => n + 1);
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -103,7 +112,12 @@ export default function OrderDetailPage() {
 
       <HeaderStrip order={order} teamCount={teamCount} />
 
-      <ProcessOrderBlock order={order} teamCount={teamCount} isBundledHome={isBundledHome} />
+      <ProcessOrderBlock
+        order={order}
+        teamCount={teamCount}
+        isBundledHome={isBundledHome}
+        onProcessComplete={refreshShipping}
+      />
 
       {/* Phase 12: warn if the gallery has no logo set. Composites that
           include a logo slot will render with a placeholder if no logo
@@ -115,8 +129,9 @@ export default function OrderDetailPage() {
       {/* Phase 13a: ShipStation integration. Renders status of the
           order's relationship to ShipStation — eligible / not yet
           sent / sent / shipped — and provides controls to send and
-          mark-as-shipped manually. */}
-      <ShippingBlock order={order} />
+          mark-as-shipped manually. Phase 13c: refreshTrigger lets
+          parent force a refetch after Process auto-creates a SS order. */}
+      <ShippingBlock order={order} refreshTrigger={shippingRefreshTrigger} />
 
       <div style={twoColumnStyle}>
         <CustomerBlock customer={order.customer} />
@@ -2121,7 +2136,7 @@ function ImpositionItemRow({ order, lineItem }) {
 // feature is preserved server-side for the future multi-order
 // flow; this just keeps the UI honest about when it applies.
 
-function ProcessOrderBlock({ order, teamCount, isBundledHome }) {
+function ProcessOrderBlock({ order, teamCount, isBundledHome, onProcessComplete }) {
   const [processing, setProcessing] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
@@ -2153,6 +2168,10 @@ function ProcessOrderBlock({ order, teamCount, isBundledHome }) {
         {}
       );
       setResult(response.result);
+      // Phase 13c: tell parent to refresh the Shipping card since
+      // Process now also auto-creates a ShipStation order. The card's
+      // linked-state UI replaces its "click Send" form on success.
+      if (onProcessComplete) onProcessComplete();
     } catch (err) {
       setError(err.message);
     } finally {
@@ -2343,7 +2362,7 @@ function LogoWarningBanner({ galleryId }) {
 // On mount, hits /api/shipstation/orders/:orderId/status to figure
 // out which state we're in. Re-fetches after any action.
 
-function ShippingBlock({ order }) {
+function ShippingBlock({ order, refreshTrigger }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [status, setStatus] = useState(null);
@@ -2374,8 +2393,11 @@ function ShippingBlock({ order }) {
 
   useEffect(() => {
     let cancelled = false;
+    // Initialize from app-settings first (cheap fallback), then fetch
+    // status which may include packaging engine output. If engine
+    // output is present, it overrides the app-settings defaults.
+    initFormFromDefaults();
     fetchStatus();
-    fetchDefaults();
     return () => {
       cancelled = true;
     };
@@ -2387,6 +2409,12 @@ function ShippingBlock({ order }) {
         );
         if (cancelled) return;
         setStatus(data);
+        // Phase 13b: packaging engine drives the form when present.
+        // Operators can still override before sending — the form
+        // fields stay editable.
+        if (data.packaging) {
+          applyPackagingToForm(data.packaging);
+        }
       } catch (err) {
         if (!cancelled) setError(err.message);
       } finally {
@@ -2394,24 +2422,25 @@ function ShippingBlock({ order }) {
       }
     }
 
-    async function fetchDefaults() {
-      // Pull app-settings to populate the form's initial values. Only
-      // does this once — re-renders shouldn't clobber operator edits.
+    async function initFormFromDefaults() {
+      // App-settings defaults as the floor — used until status arrives
+      // with engine output (which overrides), or kept as-is if engine
+      // can't decide / errors out.
       try {
         const data = await api.get('/api/shipstation/app-settings');
         if (cancelled) return;
         const s = data.settings || {};
         setCarrierCode(s.defaultCarrier?.value || 'stamps_com');
         setServiceCode(s.defaultService?.value || 'usps_first_class_mail');
-        setPackageCode(s.defaultPackageCode?.value || 'large_envelope_or_flat');
+        setPackageCode(
+          s.defaultPackageCode?.value || 'large_envelope_or_flat'
+        );
         setWeightOz(s.defaultWeightOz?.value || '4');
         setDimLength(s.defaultLengthIn?.value || '10');
         setDimWidth(s.defaultWidthIn?.value || '8');
         setDimHeight(s.defaultHeightIn?.value || '0.5');
         setDefaultsLoaded(true);
       } catch (err) {
-        // Soft-fail: fall back to hard-coded defaults so the form
-        // still works even if the settings endpoint isn't reachable.
         if (!cancelled) {
           setCarrierCode('stamps_com');
           setServiceCode('usps_first_class_mail');
@@ -2424,7 +2453,21 @@ function ShippingBlock({ order }) {
         }
       }
     }
-  }, [order.orderId]);
+
+    function applyPackagingToForm(pkg) {
+      if (cancelled || !pkg) return;
+      if (pkg.carrierCode) setCarrierCode(pkg.carrierCode);
+      if (pkg.serviceCode) setServiceCode(pkg.serviceCode);
+      if (pkg.packageCode) setPackageCode(pkg.packageCode);
+      if (pkg.weight?.value != null) setWeightOz(String(pkg.weight.value));
+      if (pkg.dimensions?.length != null)
+        setDimLength(String(pkg.dimensions.length));
+      if (pkg.dimensions?.width != null)
+        setDimWidth(String(pkg.dimensions.width));
+      if (pkg.dimensions?.height != null)
+        setDimHeight(String(pkg.dimensions.height));
+    }
+  }, [order.orderId, refreshTrigger]);
 
   async function refreshStatus() {
     try {
@@ -2687,6 +2730,45 @@ function ShippingBlock({ order }) {
 
       {isEligible && defaultsLoaded && (
         <>
+          {/* Phase 13b: show what the packaging engine decided so the
+              operator understands why the form values look the way they
+              do. If status.packaging is missing (engine error, fresh
+              install, or eligibility was false) we just don't show the
+              line — form values fall back to app-settings defaults. */}
+          {status?.packaging && (
+            <div
+              style={{
+                marginBottom: 12,
+                padding: '8px 12px',
+                background: 'rgba(74,127,193,0.10)',
+                border: '1px solid rgba(74,127,193,0.30)',
+                borderRadius: 6,
+                fontSize: 12,
+                color: 'var(--text-secondary)',
+                lineHeight: 1.5,
+              }}
+              title={status.packaging.notes?.join(' · ') || ''}
+            >
+              <strong style={{ color: 'var(--text-primary)' }}>
+                💡 Engine suggests:
+              </strong>{' '}
+              {status.packaging.packageTypeName} ·{' '}
+              {status.packaging.weight.value}oz ·{' '}
+              {status.packaging.carrierCode}/{status.packaging.serviceCode}
+              {status.packaging.notes?.length > 0 && (
+                <div
+                  style={{
+                    fontSize: 11,
+                    color: 'var(--text-muted)',
+                    marginTop: 4,
+                  }}
+                >
+                  {status.packaging.notes.join(' · ')}
+                </div>
+              )}
+            </div>
+          )}
+
           <div
             style={{
               display: 'grid',
@@ -3017,12 +3099,26 @@ const shippingErrorBoxStyle = {
 
 function ProcessResultDisplay({ result }) {
   const allOk = result.subOrders.every((s) => s.success);
+  const ss = result.shipstation; // Phase 13c: optional auto-create result
+
+  // SS step state for the headline:
+  //   - undefined → SS wasn't attempted (older server, batch run, etc.)
+  //   - ok && skipped → legit skip (non-home, all-digital, already-linked, etc.)
+  //   - ok && !skipped → actually created an SS order
+  //   - !ok → real failure; status was NOT updated
+  const ssFailed = ss && !ss.ok;
+  const ssCreated = ss && ss.ok && !ss.skipped;
+  const ssSkipped = ss && ss.ok && ss.skipped;
+
+  // Overall banner color: red if anything failed (sub-order or SS),
+  // amber if there were warnings, green if everything's clean.
+  const overallOk = allOk && !ssFailed;
   return (
     <div
       style={{
         padding: 12,
-        background: allOk ? 'rgba(76,175,80,0.08)' : 'rgba(224,179,65,0.08)',
-        border: `1px solid ${allOk ? 'rgba(76,175,80,0.3)' : 'rgba(224,179,65,0.3)'}`,
+        background: overallOk ? 'rgba(76,175,80,0.08)' : 'rgba(224,179,65,0.08)',
+        border: `1px solid ${overallOk ? 'rgba(76,175,80,0.3)' : 'rgba(224,179,65,0.3)'}`,
         borderRadius: 6,
       }}
     >
@@ -3030,11 +3126,11 @@ function ProcessResultDisplay({ result }) {
         style={{
           fontSize: 12,
           fontWeight: 600,
-          color: allOk ? '#4caf50' : '#e0b341',
+          color: overallOk ? '#4caf50' : '#e0b341',
           marginBottom: 8,
         }}
       >
-        {allOk
+        {overallOk
           ? `✓ Processed ${result.subOrders.length} sub-order${result.subOrders.length === 1 ? '' : 's'} successfully`
           : `⚠ Completed with errors`}
         {result.statusUpdated && (
@@ -3043,6 +3139,83 @@ function ProcessResultDisplay({ result }) {
           </span>
         )}
       </div>
+
+      {/* Phase 13c: ShipStation auto-create outcome. Shown as its own
+          row right under the headline so the operator immediately sees
+          whether SS happened, was skipped, or failed. */}
+      {ss && (
+        <div
+          style={{
+            padding: 8,
+            marginBottom: 8,
+            background: ssFailed
+              ? 'rgba(220,53,69,0.08)'
+              : ssCreated
+              ? 'rgba(76,175,80,0.06)'
+              : 'rgba(255,255,255,0.03)',
+            border: `1px solid ${
+              ssFailed
+                ? 'rgba(220,53,69,0.3)'
+                : ssCreated
+                ? 'rgba(76,175,80,0.25)'
+                : 'var(--border-color)'
+            }`,
+            borderRadius: 4,
+            fontSize: 12,
+          }}
+        >
+          <div
+            style={{
+              fontWeight: 600,
+              marginBottom: ss.message || ss.error ? 4 : 0,
+              color: ssFailed ? '#dc3545' : ssCreated ? '#4caf50' : 'inherit',
+            }}
+          >
+            {ssFailed
+              ? '✗ ShipStation: failed'
+              : ssCreated
+              ? `✓ ShipStation: created SS#${ss.orderId}`
+              : `↻ ShipStation: skipped`}
+            {ssCreated && ss.packageCodeDrift && (
+              <span
+                style={{
+                  color: '#e0b341',
+                  marginLeft: 8,
+                  fontSize: 11,
+                  fontWeight: 500,
+                }}
+                title={`Sent package code "${ss.packageCodeSent}" but ShipStation stored "${ss.packageCodeStored}". Usually means SS reassigned based on the carrier/service combo.`}
+              >
+                ⚠ packageCode drift ({ss.packageCodeSent} → {ss.packageCodeStored})
+              </span>
+            )}
+          </div>
+          {ss.message && (
+            <div style={{ color: 'var(--text-muted)', fontSize: 11 }}>
+              {ss.message}
+            </div>
+          )}
+          {ss.error && (
+            <div style={{ color: '#dc3545', fontSize: 11 }}>
+              {ss.error}
+            </div>
+          )}
+          {ssFailed && (
+            <div
+              style={{
+                color: 'var(--text-muted)',
+                fontSize: 11,
+                marginTop: 4,
+                fontStyle: 'italic',
+              }}
+            >
+              Sytist status was NOT updated. Fix the underlying issue
+              (check API keys in Settings → API Keys, or use the manual
+              Send button on this page) and run Process again.
+            </div>
+          )}
+        </div>
+      )}
 
       {result.subOrders.map((sub, i) => {
         const scopeName =

@@ -1,0 +1,153 @@
+Phase 13b hotfix #2 — weight breakdown diagnostics
+
+═══════════════════════════════════════════════════════
+WHAT THIS HOTFIX DOES
+═══════════════════════════════════════════════════════
+
+Adds visibility into how the packaging engine computes the final
+weight that goes to ShipStation, so when a scale weight disagrees
+with the label you can identify which SKU or packaging type is
+miscalibrated without spelunking through code.
+
+Two surfaces for the same data:
+
+  1. Server log [Packaging Trace] block fires on every
+     Send-to-ShipStation, showing each item × weight, slip,
+     mailer baseWeight, ceiling rounding, and final total.
+
+  2. Test Calculator on Settings → Packaging adds a "Weight
+     breakdown" panel below the existing summary table. Same
+     data but visible in the browser, with a warning callout
+     when a SKU has no config (defaulted to 1oz fallback).
+
+═══════════════════════════════════════════════════════
+WHAT WAS HAPPENING
+═══════════════════════════════════════════════════════
+
+After hotfix-1, the engine pulls PhotoDay's real-world weights.
+For order 110633 (4-Mini Magnets + 5×7 Photo) it returns:
+
+    1.7  (magnets per config)
+  + 0.1  (5×7 per config)
+  + 0.4  (packing slip)
+  + 1.5  (6×8 mailer baseWeight)
+  = 3.7  oz
+  → Math.ceil() = 4 oz
+
+That math is correct AND the engine IS including the packaging.
+But "feels light" is a real signal. The most likely culprits:
+
+  - PhotoDay's 0.1oz for a 5×7 print is unusually light (real
+    photo paper is closer to 0.3-0.5oz). Their lab may have
+    been running for a while with under-declared weights.
+  - The 1.5oz mailer baseWeight assumes a thin chipboard mailer;
+    if your suppliers' mailers weigh more, that number's wrong.
+  - Sytist might be putting MORE inside the mailer than PhotoDay
+    typically did (multiple prints, fillers, etc.) without a
+    config row for those items.
+
+This hotfix doesn't change any numbers. It gives you the tool
+to find which specific number is off, fix it via the existing
+Settings → Packaging UI, and verify against the next real
+shipment.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/services/packagingService.js
+    + Engine now returns a structured weightBreakdown on every
+      determinePackaging() call, alongside the existing fields.
+    + Threaded weightBreakdown through all 12 _buildResult call
+      sites so every routing decision populates it.
+    + _buildResult sets a stub for the digital-only early path.
+
+  server/services/shipstationService.js
+    + _logPackagingTrace() helper logs the breakdown to the
+      server console after each Send. Single grouped log block
+      so it stays readable in a busy log.
+    + ⚠️ FALLBACK flag in the trace when a SKU has no config.
+
+  client/src/pages/settings/PackagingPage.js
+    + New WeightBreakdownPanel component rendered below the
+      Test Calculator's summary table.
+    + Items table: SKU, name, qty, unit oz, line oz, source.
+    + Summary math: items subtotal + slip + packaging =
+      pre-ceiling, + ceiling rounding = FINAL.
+    + Inline hint at the bottom of the panel pointing to which
+      section to edit when a number's wrong.
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+✓ All three modified files parse cleanly.
+✓ Engine returns weightBreakdown for order 110633:
+    Items:
+      SKU 17 (4 Mini Magnets) × 1 = 1.7 oz [productWeights]
+      SKU 10 (5x7 Individual Print) × 1 = 0.1 oz [productWeights]
+    Items subtotal:    1.8 oz
+    Packing slip:     +0.4 oz
+    Packaging (6x8 Flat Mailer): +1.5 oz
+    Pre-ceiling total: 3.7 oz
+    Ceiling rounding: +0.3 oz
+    FINAL:             4 oz  →  stamps_com / usps_first_class_mail
+✓ Unknown SKU triggers ⚠️ FALLBACK in both log and UI.
+✓ Multi-item plaque order builds proper line-by-line breakdown.
+✓ PackagingPage SSR renders cleanly.
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-13b-hotfix-2.tar.gz --strip-components=1
+
+DO NOT delete packaging-config.json this time — keep your
+existing config from hotfix-1. Nothing about the engine's
+defaults changed.
+
+Nodemon restarts. Ctrl+Shift+R in the browser.
+
+═══════════════════════════════════════════════════════
+HOW TO USE THIS TO FIND THE PROBLEM
+═══════════════════════════════════════════════════════
+
+The workflow when a scale weight disagrees with what
+ShipStation says:
+
+  1. Build a real package (pick order 110633 or any test order).
+  2. Weigh the SEALED package on a scale. Write down the number.
+  3. Settings → Packaging → Test calculator → enter that order
+     ID → Run preview.
+  4. Compare scale weight against the FINAL row of the new
+     Weight breakdown panel.
+  5. If they disagree:
+     - If a line in the Items table looks too low/high, edit
+       that SKU in the Product weights section above.
+     - If everything in Items looks right but the total is
+       still off, the Packaging baseWeight is probably wrong —
+       weigh the empty mailer/box and update it in Packaging
+       types.
+     - If there's a ⚠️ FALLBACK in the source column, that SKU
+       has no config at all — add it in Product weights.
+  6. Save the change. Re-run the calculator on the same order
+     to verify the new FINAL matches the scale.
+  7. Send the order to ShipStation; the server log will print
+     the [Packaging Trace] block confirming the values that
+     actually went out.
+
+The server log block is also useful for orders you've ALREADY
+sent: the trace is logged for every Send, so historical orders
+in the log can be audited the same way.
+
+═══════════════════════════════════════════════════════
+WHAT'S DEFERRED
+═══════════════════════════════════════════════════════
+
+This hotfix only adds visibility. Once you've calibrated weights
+against real scale measurements, the breakdown becomes a
+sanity-check tool rather than a debugging tool. We can come
+back to bulk-edit the weights via the existing UI once you have
+the scale numbers.

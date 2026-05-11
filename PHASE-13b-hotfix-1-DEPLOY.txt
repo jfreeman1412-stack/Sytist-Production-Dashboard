@@ -1,0 +1,157 @@
+Phase 13b hotfix #1 — packaging defaults match PhotoDay production
+
+═══════════════════════════════════════════════════════
+WHY THIS HOTFIX EXISTS
+═══════════════════════════════════════════════════════
+
+I shipped Phase 13b with DEFAULT_CONFIG values that were my
+guesses about reasonable weights, not the values PhotoDay
+actually uses in production. After you flagged "isn't really
+sending to ship station with the same logic," I went back to
+PhotoDay's repo and compared its LIVE packaging-config.json
+against my Sytist defaults.
+
+The decision LOGIC was a faithful port — every routing rule,
+priority order, and edge case matches. The CONFIG values
+(weights, baseWeights, routing lists) were off in many cases.
+
+Examples of the worst gaps:
+
+  SKU                            PhotoDay (real)  Sytist (mine)
+  8x10 Plaque  (SKU 22)             32 oz           8 oz
+  Item 36                           32 oz           1 oz
+  Collector Cards (SKU 13)           4 oz           0.5 oz
+  Magnets (SKU 15)                   1.7 oz         0.5 oz
+  Mini Magnets (SKU 17)              1.7 oz         0.5 oz
+  Pano frame sm (baseWeight)        30 oz           8 oz
+  Pano frame lg (baseWeight)        44 oz          10 oz
+
+And lists/routing differences:
+
+  boxRouteSKUs:   PD: 36, 35, 38, 41, 42, 45, 46, 19   Mine: empty
+  magnetThreshold.skus:  PD: [15, 17]                  Mine: [15] only
+  packingSlipPosition:   PD: "last"                    Mine: "first"
+
+Net effect: any Sytist order with plaques, magnets in qty,
+trading cards, large items, or pano frames was getting weights
+significantly lower than reality. ShipStation would print
+labels for less postage than the actual package weight, which
+either gets rejected at induction or eats the difference on
+your account.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/services/packagingService.js
+    DEFAULT_CONFIG block replaced with values taken directly
+    from PhotoDay's live packaging-config.json. The rest of
+    the file (engine logic, helpers, CRUD methods) is unchanged.
+
+The decision logic comparison against PhotoDay's source was
+done line-by-line — determinePackaging, _buildItemWeights,
+_buildResult, _getServiceCode, _getCarrierCode all match
+exactly. Only the seed data was wrong.
+
+═══════════════════════════════════════════════════════
+ONE THING YOU NEED TO DO BEFORE DEPLOYING
+═══════════════════════════════════════════════════════
+
+Delete the existing packaging-config.json BEFORE you run the
+deploy. The engine's _ensureConfig() only writes defaults when
+the file doesn't exist; if the file from yesterday's 13b deploy
+is still there, your wrong defaults will stick around and this
+hotfix won't help.
+
+In PowerShell:
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  del server\config\packaging-config.json
+
+(Or just delete it via File Explorer. The path is
+sytist-dashboard/server/config/packaging-config.json.)
+
+Important: if you've already made customizations via the
+Settings → Packaging UI since deploying 13b, those will be
+lost when you delete the file. The newly-regenerated config
+will be PhotoDay's defaults. Given 13b only deployed in the
+last turn or so, this is probably not an issue — but if you
+DID edit anything, take a screenshot first.
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  del server\config\packaging-config.json
+  tar -xzf F:\Downloads\sytist-dashboard-phase-13b-hotfix-1.tar.gz --strip-components=1
+
+Nodemon restarts. On startup you should see:
+
+  [PackagingService] Created default config at C:\...\server\config\packaging-config.json
+
+That confirms the new defaults are in place.
+
+Ctrl+Shift+R in the browser.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+  1. Open order 110633 again. The "💡 Engine suggests" line
+     should now show:
+        6x8 Flat Mailer · 4oz · stamps_com/usps_first_class_mail
+     (Previously showed 3oz with the lower magnet weight.)
+
+  2. Settings → Packaging → Product weights. Spot-check:
+        SKU 21 (5x7 Plaque):  13.4 oz
+        SKU 22 (8x10 Plaque): 32 oz
+        SKU 15 (2 Large Magnets): 1.7 oz
+        SKU 17 (4 Mini Magnets):  1.7 oz
+        SKU 13 (Collector Cards): 4 oz
+
+  3. Settings → Packaging → Test calculator. Paste an order
+     ID with a plaque or magnets and click Run preview.
+     Confirm the weight matches what you'd actually weigh on
+     a scale.
+
+═══════════════════════════════════════════════════════
+ONE THING WORTH YOUR ATTENTION
+═══════════════════════════════════════════════════════
+
+PhotoDay's live config has packageBundles weight=0 for
+Gold/Silver/Bronze. The comment in the code explains why:
+those bundles' constituent items appear as their OWN line
+items in the order, so their individual SKU weights already
+total the bundle's true weight. Adding a bundle weight on top
+would double-count.
+
+If your Gold/Silver/Bronze packages in Sytist DON'T decompose
+into individual line items (they appear as one bundle line
+item only), the bundle weight should be the package's actual
+total weight — somewhere in the 4-8 oz range probably. Go to
+Settings → Packaging → Package bundles and bump them up.
+
+How to check: open an order with a Gold/Silver/Bronze package
+and look at the Line Items list. If you see ONE line item
+("Gold Package"), bump the bundle weight. If you see multiple
+line items (the 8x10, the 5x7, the magnets, the wallets all
+listed separately), leave the bundle weight at 0.
+
+═══════════════════════════════════════════════════════
+WHY THIS HAPPENED
+═══════════════════════════════════════════════════════
+
+When I ported PhotoDay's packagingService.js for Phase 13b I
+copied the SOURCE FILE but did NOT load its actual config.
+Instead I built fresh DEFAULT_CONFIG values that "looked
+reasonable." The PhotoDay repo has the production config sitting
+right there at server/config/packaging-config.json — I should
+have read it on the way through.
+
+Lesson for the remaining 13c/13d/13e/13f ports: when porting a
+service that has paired runtime config (path-overrides.json,
+specialty-products.json, size-mappings.json, etc.), check the
+LIVE config file in PhotoDay's repo and use those values for
+the Sytist defaults rather than synthesizing my own.

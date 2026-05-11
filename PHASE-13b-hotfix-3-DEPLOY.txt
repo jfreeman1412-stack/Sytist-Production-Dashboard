@@ -1,0 +1,143 @@
+Phase 13b hotfix #3 — bundle weights for Sytist's single-line-item bundles
+
+═══════════════════════════════════════════════════════
+THE PROBLEM
+═══════════════════════════════════════════════════════
+
+PhotoDay's live config has packageBundles weight = 0 for
+Gold/Silver/Bronze. That works in PhotoDay because their bundles
+DECOMPOSE into multiple line items — the Memory Mate, the 5x7,
+the 8 wallets, etc. each appear as their own line item with
+their own weight. The "Gold Package" line itself contributes 0
+because everything's already counted via constituent SKUs.
+
+Sytist works differently. A "Gold Package" order shows up as
+ONE line item (sku=1, "Gold Package") with a single photo. There
+are no constituent line items for the engine to look at. With
+the inherited weight=0, every Gold/Silver/Bronze order was
+declaring postage for ZERO ounces of items + slip + mailer only.
+ShipStation labels were being printed at the minimum-postage
+tier for actual packages weighing half a pound or more.
+
+═══════════════════════════════════════════════════════
+THE FIX
+═══════════════════════════════════════════════════════
+
+Computed each bundle's total weight from your description of
+what's in each package, using the per-SKU weights from PhotoDay's
+config:
+
+  GOLD Package: 7.0 oz
+    Memory Mate (SKU 6)      0.5
+    8x10 Individual (SKU 8)  0.5
+    5x7 Individual (SKU 10)  0.1
+    5x7 Team (SKU 11)        0.1
+    8 Wallets (SKU 12)       0.5
+    8 Trading Cards (SKU 35) 3.0
+    2 Magnets (SKU 15)       1.7
+    Photo Button (SKU 16)    0.6
+    Digital Download (SKU 25) 0.0
+    ─────────────────────────────
+    TOTAL                    7.0 oz
+
+  SILVER Package: 3.4 oz
+    Memory Mate              0.5
+    8x10 Individual          0.5
+    5x7 Individual           0.1
+    5x7 Team                 0.1
+    8 Wallets                0.5
+    2 Magnets                1.7
+    Digital Download         0.0
+    ─────────────────────────────
+    TOTAL                    3.4 oz
+
+  BRONZE Package: 1.0 oz
+    4 small prints (SKU 27)  0.5
+    8 Wallets (SKU 12)       0.5
+    ─────────────────────────────
+    TOTAL                    1.0 oz
+
+Routing impact with these weights:
+
+  GOLD   (items 7.0 + slip 0.4 + 9x11 mailer 3.0 = 10.4 → 11oz)
+         → 9x11 mailer as Package (forcePackage:true keeps Package
+           service because the magnets/button need it), USPS First
+           Class Mail (under 13oz threshold)
+
+  SILVER (items 3.4 + slip 0.4 + 9x11 mailer 3.0 = 6.8 → 7oz)
+         → 9x11 mailer as flat envelope (Memory Mate triggers the
+           8x10-size detection rule), USPS First Class Mail
+
+  BRONZE (items 1.0 + slip 0.4 + 9x11 mailer 3.0 = 4.4 → 5oz)
+         → 9x11 mailer as flat envelope (any bundle SKU triggers
+           9x11 in the engine's size detection), USPS First Class
+
+═══════════════════════════════════════════════════════
+ONE THING WORTH FLAGGING
+═══════════════════════════════════════════════════════
+
+For the "8 Trading Cards" in the Gold Package, I mapped to SKU 35
+(Trading Cards, 3oz from PD config). There's also SKU 13
+(Collector Cards, 4oz) which sounds similar. I went with 35
+because 3oz seems more consistent with a set of 8 cards. If your
+lab actually uses SKU 13 for this product, the Gold total should
+be 8.0 oz, not 7.0 oz. Bump it via Settings → Packaging if so.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/services/packagingService.js
+    + DEFAULT_CONFIG.packageBundles weights set to 7.0/3.4/1.0
+    + Comment block documents the math + per-SKU breakdown so
+      future-you can recompute if package contents change.
+
+  client/src/pages/settings/PackagingPage.js
+    + Info banner at the top of "Package bundles" section
+      explaining that Sytist bundles are single line items and
+      the weight must total everything in the package.
+    + Mentions the gotcha that bundle weights don't auto-update
+      when per-SKU weights change — they're a one-shot
+      calculation that needs manual recompute.
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+Since this changes DEFAULT_CONFIG and your existing
+packaging-config.json on disk takes precedence, you have two
+options:
+
+OPTION A — delete and regenerate (loses any UI edits you've
+made since hotfix-1, but you haven't made any so this is safe):
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  del server\config\packaging-config.json
+  tar -xzf F:\Downloads\sytist-dashboard-phase-13b-hotfix-3.tar.gz --strip-components=1
+
+OPTION B — keep the file, edit the three weights via the UI:
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-13b-hotfix-3.tar.gz --strip-components=1
+  # Then: Settings → Packaging → Package bundles:
+  #   Gold:   set weight to 7.0
+  #   Silver: set weight to 3.4
+  #   Bronze: set weight to 1.0
+
+Either way works. A is faster.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+  1. Find any order with a Gold/Silver/Bronze package SKU.
+     (Or test against an existing order via Settings →
+     Packaging → Test calculator.)
+  2. Run preview. The Weight breakdown panel should show:
+     Gold:   items 7 oz   final ~11 oz
+     Silver: items 3.4 oz final ~7 oz
+     Bronze: items 1 oz   final ~5 oz
+  3. Settings → Packaging → Package bundles should show the
+     new weights, and there's an info banner at the top of
+     that section explaining Sytist's single-line-item behavior.

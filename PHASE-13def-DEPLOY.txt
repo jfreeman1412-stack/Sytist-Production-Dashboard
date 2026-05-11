@@ -1,0 +1,243 @@
+Phase 13 d/e/f — batch summary, shipped polling, dedicated page
+
+═══════════════════════════════════════════════════════
+SCOPE
+═══════════════════════════════════════════════════════
+
+Wraps up phase 13 by adding the three remaining sub-phases in one
+tarball:
+
+  13d  Batch processing send polish
+       Per-batch ShipStation summary in the existing batch banner
+       on the orders list. Inline retry-SS-only buttons for failed
+       sends — operator doesn't need to reprocess the whole order.
+
+  13e  Background polling for shipped status
+       New schedulerService that polls ShipStation every 5 minutes
+       (configurable via SHIPSTATION_POLL_MS env var) for orders
+       that have moved to shipped status. Updates the local
+       shipstation_links row with tracking number, carrier, and
+       shipped_at timestamp. Runs in the server process; starts
+       on boot, stops on graceful shutdown.
+
+  13f  Dedicated ShipStation page
+       Top-level /shipstation route with three tabs: Pending,
+       Shipped, Poller. Pending auto-refreshes every 60s while
+       open. Operators can refresh status for individual rows or
+       trigger an on-demand poll from the Poller tab.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+NEW FILES:
+  server/services/schedulerService.js
+    The background poller. Singleton lifecycle (start/stop). Polls
+    SS for shipped orders in a 7-day window, matches by orderNumber
+    or ssOrderId against local pending links, updates link rows
+    with tracking info. Re-entrant guard prevents overlapping polls.
+    Failure-tolerant — errors log but don't kill the timer.
+
+  client/src/pages/ShipStationPage.js
+    Top-level /shipstation page with three tabs (URL-driven via
+    /shipstation/:tab). Tabs:
+      Pending — table of pending links with per-row Refresh button
+      Shipped — table of shipped orders with tracking + carrier
+      Poller  — poller status, last run, manual "Run poll now"
+
+MODIFIED FILES:
+  server/index.js
+    + Starts schedulerService after app.listen() so polling begins
+      automatically on every restart.
+    + shutdown() now calls scheduler.stop() before closing DB pools.
+      Defensive — wrapped in try/catch in case the scheduler never
+      started (e.g. an earlier dep failure).
+
+  server/services/processingService.js
+    + _runBatchJob now computes a shipstationSummary on job completion:
+        { created, skipped, failed, notAttempted, driftCount, failures[] }
+      Stored on the job object so /process/job/:jobId returns it.
+    + New retryShipStationForOrder(orderId) public method. Reuses
+      _tryCreateShipStation but adds Sytist status update on success
+      (since the original processOrder didn't get to do it). Used
+      by the batch banner's retry buttons + Phase 13f's failed list.
+
+  server/routes/shipstation.js
+    + GET /links — list local SS links with filtering:
+        ?status=pending|shipped|cancelled|all
+        ?limit=N (default 200, max 500)
+        ?since=ISO_DATE
+      Sorted shipped_at desc for shipped, updated_at desc otherwise.
+      payload_json is stripped from list responses (can be large).
+    + POST /orders/:orderId/retry-send — retry-SS-only endpoint.
+    + GET /scheduler/status — poller health for the UI.
+    + POST /scheduler/poll — manual on-demand poll trigger.
+
+  client/src/components/AppLayout.js
+    + ShipStation top-level nav link (visible to all roles, same as
+      Orders — operators need to access this for fulfillment).
+    + Route /shipstation and /shipstation/:tab → ShipStationPage.
+
+  client/src/pages/OrdersListPage.js
+    + New BatchSSSummary component rendered inside the batch banner
+      when the job completes. Shows per-bucket counts and an inline
+      retry list for failed SS sends.
+    + Retry button per failure row hits POST /orders/:id/retry-send,
+      removes the row from the displayed list on success.
+
+═══════════════════════════════════════════════════════
+ENVIRONMENT VARIABLE
+═══════════════════════════════════════════════════════
+
+SHIPSTATION_POLL_MS (optional)
+  Poll interval in milliseconds for the shipped-status poller.
+  Default: 300000 (5 minutes).
+  Set to 0 to disable polling entirely.
+  Below 60000 logs a warning since SS V1 rate-limits at 40 req/min.
+
+To set, add to your .env (the same one with INITIAL_ADMIN_USERNAME
+etc.):
+
+  SHIPSTATION_POLL_MS=300000
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+All 7 modified/new files parse cleanly.
+
+schedulerService._pollOnce tested across 5 scenarios:
+  ✓ No pending links → ok=true, matched=0, no SS call wasted
+  ✓ Two pending links with shipped matches → both updated with
+    tracking + carrier + shipped_at (latest shipment record wins)
+  ✓ Pending link with no SS match → ok=true, matched=0 (won't
+    spam retries on orders that just haven't shipped yet)
+  ✓ Already-shipped local link → filtered out of pending, skipped
+  ✓ SS error → ok=false, error surfaced, doesn't crash timer
+
+Routes verified:
+  ✓ /links?status=pending|shipped|all — filters + sorts correctly
+  ✓ /links strips payload_json from response
+  ✓ /orders/:id/retry-send hits retryShipStationForOrder
+
+UI rendered:
+  ✓ ShipStationPage SSRs cleanly with three tabs
+  ✓ BatchSSSummary renders + retry button wired
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-13def.tar.gz --strip-components=1
+
+Nodemon restarts. No new dependencies. No config file changes.
+
+On startup you should see a new log line:
+  [Scheduler] ShipStation polling started (every 300000ms)
+
+Followed shortly by:
+  [Scheduler] Poll complete: N order(s) marked shipped
+or
+  (silent if no shipped orders matched — only successful matches log)
+
+Ctrl+Shift+R in the browser.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+Phase 13e (poller):
+  1. After deploy, server log should show:
+       [Scheduler] ShipStation polling started (every 300000ms)
+  2. If you have any local shipstation_links in awaiting_shipment
+     state AND a matching order in SS has shipped → after up to 5
+     minutes you'll see:
+       [Scheduler] Order NNNN marked shipped: stamps_com 9400...
+  3. Reload that order's detail page. Shipping card now shows
+     "Shipped" with tracking number.
+
+Phase 13f (dedicated page):
+  4. Click "ShipStation" in the top nav.
+  5. Pending tab: lists all orders with SS links awaiting shipment.
+     Auto-refreshes every 60s.
+  6. Shipped tab: lists shipped orders with tracking + ship date.
+  7. Poller tab: shows last poll time, status, total polls run.
+     "Run poll now" triggers an immediate poll.
+
+Phase 13d (batch summary):
+  8. From Orders list, batch-process several ship_to_home orders.
+  9. When batch completes, banner now shows:
+       Sub-order counts (existing): "✓ N ok"
+       ShipStation: "✓ N sent · ↻ M skipped"
+ 10. If any failed: red box with retry button per failed order.
+     Click Retry → button shows "Retrying…" → row removes on success.
+
+═══════════════════════════════════════════════════════
+DESIGN DECISIONS WORTH NOTING
+═══════════════════════════════════════════════════════
+
+• Poller is in-process (not a separate worker). Sytist isn't running
+  at the scale where a queue worker would be justified. setInterval
+  in the same Node process is fine for hundreds of orders/day. If
+  this ever grows, the natural next step is a worker that imports
+  the same service — the work is already isolated in
+  schedulerService.
+
+• 7-day shipped window. ShipStation's listOrders is bounded so we
+  don't pull the entire account history every 5 minutes. Anything
+  older than 7 days would have been caught on previous polls. If
+  there's a need to backfill ancient shipped status, an operator
+  can extend SHIPPED_WINDOW_DAYS in code (no UI for that).
+
+• Match by orderNumber first, ssOrderId as fallback. ShipStation's
+  orderNumber should always match our Sytist order number since
+  shipstationService.buildOrderFromSytist uses order.orderNumber as
+  the SS orderNumber. The ssOrderId fallback is defensive against
+  any historical data where orderNumber was empty.
+
+• ShipStation top-level nav link, not under Settings. The page is
+  an operational surface (operators check fulfillment progress)
+  not a configuration surface. Settings is for "configure once,
+  forget"; ShipStation page is for "check daily."
+
+• Retry-SS-only updates Sytist status on success. The first Process
+  ran but failed mid-pipeline at SS, so Sytist status wasn't updated.
+  Retrying just the SS step succeeds, and now the order IS truly
+  done — so the status should advance. This is the same gating
+  logic processOrder uses, just for a different entry point.
+
+═══════════════════════════════════════════════════════
+WHAT 13f DELIBERATELY DOES NOT DO
+═══════════════════════════════════════════════════════
+
+  - No "Failed sends" tab. PhotoDay has one; Sytist doesn't yet
+    because the data source is fuzzy (would need to join recent
+    processing history with the absence of an SS link). Right now
+    failed sends show up in two places: the batch banner (right
+    after they fail) and the order detail page's Shipping card
+    (which still shows the form because no link exists). That's
+    sufficient for the current scale.
+  - No bulk-resend from the Pending tab. If you need to resend
+    many at once, batch-process them again — Phase 13c handles
+    already-linked orders cleanly (skips create, adopts existing).
+  - No customer notification on shipped. The poller has all the
+    data to email the customer "Your order shipped, track at X,"
+    but Sytist doesn't have an email system yet. That's its own
+    phase when the time comes — schedulerService is the obvious
+    hook.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 13a            ShipStation scaffolding + single-order send
+✓ 13b            Packaging rules engine + settings UI
+✓ 13b hf1-3      Calibration + diagnostics + bundle weights
+✓ 13c            Auto-create during processing
+✓ 13d            Batch summary + retry-SS button ← here
+✓ 13e            Background polling for shipped status ← here
+✓ 13f            Dedicated ShipStation page ← here
+
+Phase 13 is complete. Ready to commit + tag, then move on to
+whatever's next.

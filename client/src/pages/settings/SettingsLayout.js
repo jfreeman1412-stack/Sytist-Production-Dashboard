@@ -112,6 +112,7 @@ function Sidebar() {
           Integrations
         </div>
         <SidebarLink to="api-keys" label="API Keys" />
+        <SidebarLink to="packaging" label="Packaging" />
 
         <div
           style={{

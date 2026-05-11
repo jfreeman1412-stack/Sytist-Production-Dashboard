@@ -80,7 +80,31 @@ router.get('/orders/:orderId/status', async (req, res) => {
       return res.status(404).json({ error: 'Order not found' });
     }
     const eligibility = await _computeEligibility(order);
-    res.json({ linked: false, eligibility, order: _orderSummary(order) });
+
+    // Phase 13b: if the order is eligible, also include the packaging
+    // engine's suggestion so the UI can pre-populate the Ship form
+    // with what the rules engine decided. Ineligible orders skip
+    // this — there's no shippable content to preview.
+    let packaging = null;
+    if (eligibility.eligible) {
+      try {
+        const preview = await shipstationService.previewPackagingForOrder(
+          order
+        );
+        packaging = preview.ok ? preview.packaging : null;
+      } catch (err) {
+        console.warn(
+          `[shipstation] packaging preview failed for ${orderId}: ${err.message}`
+        );
+      }
+    }
+
+    res.json({
+      linked: false,
+      eligibility,
+      order: _orderSummary(order),
+      packaging,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -312,6 +336,258 @@ router.get('/carriers/:carrierCode/services', async (req, res) => {
       req.params.carrierCode
     );
     res.json({ services });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── PACKAGING ENGINE — config + preview ───────────────────
+// Phase 13b. The packaging rules engine lives in
+// server/services/packagingService.js with its config persisted to
+// server/config/packaging-config.json. These endpoints expose the
+// config for editing via the Settings → Packaging UI, and a
+// per-order preview for the test calculator.
+
+const packagingService = require('../services/packagingService');
+
+// GET /packaging/config — full config dump.
+router.get('/packaging/config', async (req, res) => {
+  try {
+    const config = await packagingService.getConfig();
+    res.json({ config });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /packaging/config — replace top-level fields.
+// Body: any subset of { productWeights, packagingTypes, packageBundles,
+//   forcePackageSKUs, magnetThreshold, framedPanoSmallSKUs,
+//   framedPanoLargeSKUs, boxRouteSKUs, packingSlipWeightOz,
+//   packingSlipPosition }. Unrecognized keys are dropped.
+router.put('/packaging/config', async (req, res) => {
+  try {
+    const allowed = [
+      'productWeights',
+      'packagingTypes',
+      'packageBundles',
+      'forcePackageSKUs',
+      'magnetThreshold',
+      'framedPanoSmallSKUs',
+      'framedPanoLargeSKUs',
+      'boxRouteSKUs',
+      'packingSlipWeightOz',
+      'packingSlipPosition',
+    ];
+    const updates = {};
+    for (const key of allowed) {
+      if (req.body && req.body[key] !== undefined) {
+        updates[key] = req.body[key];
+      }
+    }
+    const config = await packagingService.updateConfig(updates);
+    res.json({ config });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /packaging/product-weights/:sku — upsert one weight row.
+// Body: { weight, name, category }
+router.put('/packaging/product-weights/:sku', async (req, res) => {
+  try {
+    const weights = await packagingService.setProductWeight(
+      req.params.sku,
+      req.body || {}
+    );
+    res.json({ productWeights: weights });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /packaging/product-weights/:sku
+router.delete('/packaging/product-weights/:sku', async (req, res) => {
+  try {
+    const weights = await packagingService.deleteProductWeight(
+      req.params.sku
+    );
+    res.json({ productWeights: weights });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /packaging/types/:typeId — upsert a packaging type template.
+// Body: { name, length, width, height, baseWeight, service }
+router.put('/packaging/types/:typeId', async (req, res) => {
+  try {
+    const types = await packagingService.setPackagingType(
+      req.params.typeId,
+      req.body || {}
+    );
+    res.json({ packagingTypes: types });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /packaging/bundles/:sku — upsert a package bundle.
+// Body: { name, weight, forcePackage }
+router.put('/packaging/bundles/:sku', async (req, res) => {
+  try {
+    const bundles = await packagingService.setPackageBundle(
+      req.params.sku,
+      req.body || {}
+    );
+    res.json({ packageBundles: bundles });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /packaging/bundles/:sku
+router.delete('/packaging/bundles/:sku', async (req, res) => {
+  try {
+    const bundles = await packagingService.deletePackageBundle(
+      req.params.sku
+    );
+    res.json({ packageBundles: bundles });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /packaging/preview/:orderId — run the engine on an order
+// without sending anything. Used by the test calculator on the
+// Settings → Packaging page and the ShippingBlock pre-population.
+router.get('/packaging/preview/:orderId', async (req, res) => {
+  try {
+    const order = await sytistDb.getOrderById(req.params.orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    const preview = await shipstationService.previewPackagingForOrder(
+      order
+    );
+    res.json({
+      orderId: order.orderId,
+      orderSummary: _orderSummary(order),
+      ...preview,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── PHASE 13d/e/f: LINKS + RETRY + POLLER ─────────────────
+
+// GET /links — list local SS links with simple filtering.
+// Query params:
+//   status: 'pending' | 'shipped' | 'cancelled' | 'all'  (default: 'all')
+//   limit:  number of rows to return (default: 200; max: 500)
+//   since:  ISO date string — only return links updated after this
+//
+// 'pending' includes any status that isn't 'shipped' or 'cancelled'.
+// The dedicated ShipStation page uses this for its Pending tab.
+// Default ordering: most recently updated first.
+router.get('/links', async (req, res) => {
+  try {
+    const status = (req.query.status || 'all').toLowerCase();
+    const rawLimit = parseInt(req.query.limit, 10);
+    const limit = Math.min(
+      500,
+      Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : 200
+    );
+    const sinceIso = req.query.since || null;
+
+    let links = shipstationLinkService.listAll();
+
+    if (status === 'pending') {
+      links = links.filter(
+        (l) => l.ss_order_status !== 'shipped' && l.ss_order_status !== 'cancelled'
+      );
+    } else if (status === 'shipped') {
+      links = links.filter((l) => l.ss_order_status === 'shipped');
+    } else if (status === 'cancelled') {
+      links = links.filter((l) => l.ss_order_status === 'cancelled');
+    }
+
+    if (sinceIso) {
+      const sinceTs = Date.parse(sinceIso);
+      if (Number.isFinite(sinceTs)) {
+        links = links.filter((l) => {
+          const u = Date.parse(l.updated_at || l.created_at || 0);
+          return Number.isFinite(u) && u >= sinceTs;
+        });
+      }
+    }
+
+    // Sort: shipped tab wants shipped_at desc; everything else updated_at desc.
+    const sortKey = status === 'shipped' ? 'shipped_at' : 'updated_at';
+    links.sort((a, b) => {
+      const ka = Date.parse(a[sortKey] || a.updated_at || 0);
+      const kb = Date.parse(b[sortKey] || b.updated_at || 0);
+      return kb - ka;
+    });
+
+    const trimmed = links.slice(0, limit);
+
+    // Mask payload_json — it can be large and we don't need to ship
+    // every payload back to the list view. Detail page already has
+    // a way to fetch the link directly if needed.
+    const masked = trimmed.map((l) => {
+      const { payload_json, ...rest } = l; // eslint-disable-line no-unused-vars
+      return rest;
+    });
+
+    res.json({
+      links: masked,
+      total: links.length,
+      returned: masked.length,
+      status,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /orders/:orderId/retry-send — retry just the ShipStation step
+// for an order whose Process succeeded but SS create failed (or for
+// an order the operator wants to send without re-running processing).
+//
+// This uses processingService.retryShipStationForOrder which handles
+// the lookup-by-orderNumber adoption path, the link table, and the
+// status update gating. The operator doesn't need to think about any
+// of that.
+router.post('/orders/:orderId/retry-send', async (req, res) => {
+  try {
+    const processingService = require('../services/processingService');
+    const result = await processingService.retryShipStationForOrder(
+      req.params.orderId
+    );
+    res.json({ result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /scheduler/status — poller health for the UI footer / debug.
+router.get('/scheduler/status', async (req, res) => {
+  try {
+    const schedulerService = require('../services/schedulerService');
+    res.json({ status: schedulerService.getStatus() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /scheduler/poll — trigger an on-demand poll. Operator-driven.
+// Useful when an order's ShipStation status changed RIGHT NOW and the
+// operator doesn't want to wait for the next scheduled tick.
+router.post('/scheduler/poll', async (req, res) => {
+  try {
+    const schedulerService = require('../services/schedulerService');
+    const summary = await schedulerService._pollOnce();
+    res.json({ summary });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

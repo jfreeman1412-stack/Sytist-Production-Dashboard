@@ -78,6 +78,13 @@ const SETTINGS_PATH = path.join(
 const DEFAULT_SETTINGS = {
   autoStatusUpdate: false,
   targetStatusId: null,
+  // Phase 13c: when true, ship_to_home orders processed via this
+  // service also get auto-created in ShipStation. Default ON since
+  // 13c's whole purpose is "Process this order should also send to
+  // ShipStation." Operators can flip it off in Settings → Processing
+  // (the existing processing settings page) if they want to fall
+  // back to the manual Send button on the order detail page.
+  autoShipStation: true,
 };
 
 // Skip flags shared with darkroom + slip — items with any of these aren't
@@ -126,6 +133,14 @@ class ProcessingService {
     const merged = { ...current, ...(updates || {}) };
     // Coerce types
     merged.autoStatusUpdate = !!merged.autoStatusUpdate;
+    // autoShipStation: undefined/missing → keep current; explicit
+    // false/null → off. Default in DEFAULT_SETTINGS is true, so a
+    // brand-new install gets the auto-create behavior.
+    if (merged.autoShipStation === undefined) {
+      merged.autoShipStation = true;
+    } else {
+      merged.autoShipStation = !!merged.autoShipStation;
+    }
     merged.targetStatusId =
       merged.targetStatusId === null || merged.targetStatusId === ''
         ? null
@@ -196,7 +211,53 @@ class ProcessingService {
 
     // Status update: only when all sub-orders succeeded
     const allOk = result.subOrders.every((s) => s.success);
+
+    // ─── Phase 13c: auto-create ShipStation order ───────────
+    //
+    // Fires after all sub-orders succeed, BEFORE the status update.
+    // Only runs for ship_to_home workflow — managers/league bypass
+    // ShipStation entirely (those workflows ship internally, not
+    // through SS).
+    //
+    // If the engine returns __skipShipStation (e.g. order is all
+    // drop-shipped/digital), we treat that as a legitimate skip and
+    // still update Sytist's status. Real SS errors (network, auth,
+    // 400 from SS) leave the order's Sytist status untouched so the
+    // operator notices and can reprocess.
+    //
+    // Reprocess behavior: if the order already has a row in
+    // shipstation_links, skip create and reuse the existing link.
+    // Operators who want to start over should Delete the SS order
+    // from the order detail page first.
+    let shipstationStepOk = true; // default true for non-home workflows
     if (allOk) {
+      const settings = await this.getSettings();
+      const isHome = order.shipping?.workflow === 'ship_to_home';
+      const autoSS = settings.autoShipStation !== false; // default ON
+
+      if (isHome && autoSS) {
+        shipstationStepOk = false; // require explicit success below
+        result.shipstation = await this._tryCreateShipStation(order);
+        shipstationStepOk = result.shipstation.ok;
+      } else if (isHome && !autoSS) {
+        result.shipstation = {
+          ok: true,
+          skipped: true,
+          reason: 'auto_shipstation_disabled',
+          message: 'Auto-create disabled in settings; use manual Send button on order detail',
+        };
+      } else {
+        // Non-home workflow — SS doesn't apply.
+        result.shipstation = {
+          ok: true,
+          skipped: true,
+          reason: 'non_home_workflow',
+          message: `Workflow "${order.shipping?.workflow || 'unknown'}" — ShipStation not applicable`,
+        };
+      }
+    }
+
+    if (allOk && shipstationStepOk) {
       const settings = await this.getSettings();
       if (
         settings.autoStatusUpdate &&
@@ -213,6 +274,252 @@ class ProcessingService {
         } catch (err) {
           console.warn(
             `[Processing] Status update failed for ${order.orderId}: ${err.message}`
+          );
+          result.statusUpdateError = err.message;
+        }
+      }
+    } else if (allOk && !shipstationStepOk) {
+      // Sub-orders all succeeded but SS failed. Leave status untouched
+      // so the operator can fix and reprocess. Mirrors PhotoDay's
+      // behavior — never mark something as "done" if a downstream
+      // step failed silently.
+      console.warn(
+        `[Processing] Order ${order.orderId}: sub-orders OK but ShipStation step failed — NOT updating Sytist status`
+      );
+    }
+
+    return result;
+  }
+
+  /**
+   * Phase 13c: encapsulates the ShipStation create logic so processOrder
+   * stays readable. Returns:
+   *   {
+   *     ok: boolean,
+   *     skipped?: boolean,
+   *     reason?: string,
+   *     message?: string,
+   *     orderId?: string|number,        // ShipStation order ID on success
+   *     orderNumber?: string,
+   *     orderStatus?: string,
+   *     packageCodeSent?: string,
+   *     packageCodeStored?: string,     // what SS came back with
+   *     packageCodeDrift?: boolean,     // SS reassigned the package code
+   *     error?: string,
+   *   }
+   */
+  async _tryCreateShipStation(order) {
+    const orderNum = order.orderNumber || String(order.orderId);
+    let shipstationService;
+    let shipstationLinkService;
+    try {
+      shipstationService = require('./shipstationService');
+      shipstationLinkService = require('./shipstationLinkService');
+    } catch (e) {
+      // The services aren't installed (unlikely, but defensive). Don't
+      // fail the order over a missing dep — log and treat as skip.
+      console.warn(
+        `[Processing] ShipStation services unavailable: ${e.message}`
+      );
+      return {
+        ok: true,
+        skipped: true,
+        reason: 'services_unavailable',
+        message: 'ShipStation services not loaded',
+      };
+    }
+
+    // 1. Check for existing local link — operator may be reprocessing.
+    let existingLink = null;
+    try {
+      existingLink = shipstationLinkService.getByOrderId(order.orderId);
+    } catch (e) {
+      // Link service is read-only here; if it fails just proceed.
+    }
+    if (existingLink) {
+      console.log(
+        `[Processing] Order ${orderNum} already linked to SS#${existingLink.ss_order_id} — skipping create`
+      );
+      return {
+        ok: true,
+        skipped: true,
+        reason: 'already_linked',
+        message: `Already linked to ShipStation order ${existingLink.ss_order_number || existingLink.ss_order_id}`,
+        orderId: existingLink.ss_order_id,
+        orderNumber: existingLink.ss_order_number,
+        orderStatus: existingLink.ss_order_status,
+      };
+    }
+
+    // 2. Build the SS payload. The packaging engine drives carrier/
+    // service/dims/weight via shipstationService.buildOrderFromSytist
+    // — no overrides at the automated path (operator can still do
+    // manual overrides via the Shipping card if they want to redo).
+    let payload;
+    try {
+      payload = await shipstationService.buildOrderFromSytist(order, {});
+    } catch (e) {
+      console.error(
+        `[Processing] buildOrderFromSytist failed for ${orderNum}: ${e.message}`
+      );
+      return {
+        ok: false,
+        error: `Payload build failed: ${e.message}`,
+      };
+    }
+
+    // 3. Engine-skip — order has nothing shippable (all digital/drop-
+    // shipped). Treat as legitimate skip; status update should still
+    // proceed since there's no actual ShipStation step that failed.
+    if (payload && payload.__skipShipStation) {
+      console.log(
+        `[Processing] ShipStation skip for ${orderNum}: ${payload.message}`
+      );
+      return {
+        ok: true,
+        skipped: true,
+        reason: payload.reason || 'nothing_shippable',
+        message: payload.message,
+      };
+    }
+
+    // 4. Look up SS by orderNumber in case a duplicate exists on SS's
+    // side (the operator may have created it manually). Adopt rather
+    // than create-and-conflict. Errors here are logged but non-fatal;
+    // worst case we create a duplicate that the operator deletes
+    // manually.
+    try {
+      const lookup = await shipstationService.listOrders({
+        orderNumber: orderNum,
+      });
+      const found = (lookup?.orders || []).find(
+        (o) => o.orderNumber === orderNum
+      );
+      if (found) {
+        console.log(
+          `[Processing] Order ${orderNum} already exists in SS (SS#${found.orderId}) — adopting existing`
+        );
+        try {
+          shipstationLinkService.create({
+            orderId: order.orderId,
+            ssOrderId: found.orderId,
+            ssOrderNumber: found.orderNumber,
+            ssOrderStatus: found.orderStatus,
+            payload,
+          });
+        } catch (linkErr) {
+          console.warn(
+            `[Processing] Link insert failed for ${orderNum}: ${linkErr.message}`
+          );
+        }
+        return {
+          ok: true,
+          skipped: true,
+          reason: 'adopted_existing',
+          message: `Adopted existing ShipStation order ${found.orderNumber}`,
+          orderId: found.orderId,
+          orderNumber: found.orderNumber,
+          orderStatus: found.orderStatus,
+        };
+      }
+    } catch (lookupErr) {
+      // Lookup failing doesn't block create; we'd rather create a
+      // potential duplicate than refuse to ship.
+      console.warn(
+        `[Processing] ShipStation lookup failed for ${orderNum} (non-fatal): ${lookupErr.message}`
+      );
+    }
+
+    // 5. Create.
+    try {
+      const ssResult = await shipstationService.createOrder(payload);
+      const sentPkg = payload.packageCode;
+      const storedPkg = ssResult.packageCode;
+      const drift = sentPkg !== storedPkg;
+      if (drift) {
+        console.log(
+          `[Processing] Order ${orderNum} → SS#${ssResult.orderId} ⚠ packageCode drift: sent=${sentPkg}, stored=${storedPkg}`
+        );
+      } else {
+        console.log(
+          `[Processing] Order ${orderNum} → SS#${ssResult.orderId} (packageCode=${storedPkg})`
+        );
+      }
+      try {
+        shipstationLinkService.create({
+          orderId: order.orderId,
+          ssOrderId: ssResult.orderId,
+          ssOrderNumber: ssResult.orderNumber,
+          ssOrderStatus: ssResult.orderStatus,
+          carrierCode: payload.carrierCode,
+          serviceCode: payload.serviceCode,
+          packageCode: storedPkg,
+          payload,
+        });
+      } catch (linkErr) {
+        console.warn(
+          `[Processing] Link insert failed for ${orderNum} (SS order created OK): ${linkErr.message}`
+        );
+      }
+      return {
+        ok: true,
+        orderId: ssResult.orderId,
+        orderNumber: ssResult.orderNumber,
+        orderStatus: ssResult.orderStatus,
+        packageCodeSent: sentPkg,
+        packageCodeStored: storedPkg,
+        packageCodeDrift: drift,
+      };
+    } catch (createErr) {
+      console.error(
+        `[Processing] ShipStation createOrder failed for ${orderNum}: ${createErr.message}`
+      );
+      return {
+        ok: false,
+        error: createErr.message,
+      };
+    }
+  }
+
+  /**
+   * Phase 13d: retry ONLY the ShipStation step for an order whose
+   * sub-orders processed successfully but whose SS create failed.
+   * Re-runs _tryCreateShipStation against the current Sytist order
+   * snapshot. Used by:
+   *   - batch UI's "Retry SS sends" button after a partially-failed batch
+   *   - dedicated ShipStation page's failed-sends tab (Phase 13f)
+   *
+   * Returns the same shape as _tryCreateShipStation, plus orderNumber.
+   * Updates Sytist status if SS now succeeds (mirrors processOrder's
+   * gating).
+   */
+  async retryShipStationForOrder(orderId) {
+    const order = await sytistDb.getOrderById(orderId);
+    if (!order) throw new Error(`Order ${orderId} not found`);
+
+    const result = await this._tryCreateShipStation(order);
+    result.orderId = order.orderId;
+    result.orderNumber = order.orderNumber;
+
+    // If the retry succeeded AND this is a home order, also update
+    // Sytist status (since processOrder didn't get the chance to).
+    if (result.ok && order.shipping?.workflow === 'ship_to_home') {
+      const settings = await this.getSettings();
+      if (
+        settings.autoStatusUpdate &&
+        settings.targetStatusId !== null &&
+        settings.targetStatusId !== undefined
+      ) {
+        try {
+          await sytistDb.updateOrderStatus(
+            order.orderId,
+            settings.targetStatusId
+          );
+          result.statusUpdated = true;
+          result.newStatusId = settings.targetStatusId;
+        } catch (err) {
+          console.warn(
+            `[Processing] Retry status update failed for ${orderId}: ${err.message}`
           );
           result.statusUpdateError = err.message;
         }
@@ -356,6 +663,54 @@ class ProcessingService {
 
     job.status = job.cancelled ? 'cancelled' : 'complete';
     job.completedAt = new Date().toISOString();
+
+    // Phase 13d: aggregate ShipStation outcomes across the batch so the
+    // UI can show "X sent, Y skipped, Z failed" without re-walking
+    // result objects. Each per-order result has its own .shipstation
+    // field populated by processOrder (Phase 13c). Orders where
+    // shipstation wasn't attempted (sub-order failure, or older
+    // results without the field) don't count toward any bucket.
+    const ssSummary = {
+      created: 0,        // fresh SS order created
+      skipped: 0,        // legit skip (non-home, all-digital, already-linked, etc.)
+      failed: 0,         // SS step threw or returned ok:false
+      notAttempted: 0,   // sub-order failed so SS step never ran
+      driftCount: 0,     // packageCode drift detected
+      failures: [],      // [{ orderId, orderNumber, error }] — for retry-SS UI
+    };
+    for (const r of job.results) {
+      // Errored result with no .shipstation — sub-order failed or
+      // getOrderById blew up. Doesn't go in any bucket.
+      if (r.error && !r.shipstation) {
+        ssSummary.notAttempted += 1;
+        continue;
+      }
+      const ss = r.shipstation;
+      if (!ss) {
+        ssSummary.notAttempted += 1;
+        continue;
+      }
+      if (!ss.ok) {
+        ssSummary.failed += 1;
+        ssSummary.failures.push({
+          orderId: r.orderId,
+          orderNumber: r.orderNumber,
+          error: ss.error || 'Unknown error',
+        });
+      } else if (ss.skipped) {
+        ssSummary.skipped += 1;
+      } else {
+        ssSummary.created += 1;
+        if (ss.packageCodeDrift) ssSummary.driftCount += 1;
+      }
+    }
+    job.shipstationSummary = ssSummary;
+    console.log(
+      `[Processing] Batch ${jobId} SS summary: ` +
+        `${ssSummary.created} created, ${ssSummary.skipped} skipped, ` +
+        `${ssSummary.failed} failed, ${ssSummary.notAttempted} not attempted` +
+        (ssSummary.driftCount > 0 ? `, ${ssSummary.driftCount} drift` : '')
+    );
 
     // Phase 4.7 — record to persistent history.
     // We catch any history errors here because failure to record

@@ -1,0 +1,226 @@
+Phase 13b — packaging rules engine (server + UI)
+
+═══════════════════════════════════════════════════════
+SCOPE
+═══════════════════════════════════════════════════════
+
+Direct port of PhotoDay's packaging engine, adapted to Sytist's
+order shape. Replaces the manual carrier/service/weight/dims
+form with rule-driven defaults that the operator can still
+override per-order.
+
+Two pieces in one tarball:
+
+  13b-1: Server-side engine + integration
+  13b-2: Settings → Packaging UI
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+NEW FILES:
+  server/services/packagingService.js
+    The rule engine. Single public method:
+      determinePackaging(order) → {
+        packageType, packageTypeName,
+        dimensions, weight, carrierCode, serviceCode,
+        packageCode, notes[], itemWeights[]
+      }
+    Auto-creates server/config/packaging-config.json on first
+    run with PhotoDay's defaults (SKU table identical between
+    the two systems). Built-in `fs` only — no fs-extra.
+
+  client/src/pages/settings/PackagingPage.js
+    Five-section settings UI:
+      1. Product weights table (SKU CRUD)
+      2. Packaging types table (edit dims + base weight per type)
+      3. Routing rules form (forcePackageSKUs, boxRouteSKUs,
+         framedPanoSKUs, magnet threshold, slip weight + position)
+      4. Package bundles table (Gold/Silver/Bronze CRUD)
+      5. Test calculator — paste an order ID, see engine output
+         including the rule trace ("Why this routing: …")
+
+MODIFIED:
+  server/services/shipstationService.js
+    + Calls packagingService.determinePackaging in
+      buildOrderFromSytist
+    + Per-item weights from the engine are converted to grams
+      and attached to each item in the SS payload (fixes the
+      SS line-item-sum truncation issue)
+    + Override > engine > app-settings defaults precedence
+    + New previewPackagingForOrder() method returns the engine
+      output for an order without building a full SS payload
+
+  server/routes/shipstation.js
+    + GET /orders/:orderId/status now includes packaging
+      suggestion when the order is eligible
+    + GET /packaging/config — return full config
+    + PUT /packaging/config — replace top-level fields
+    + PUT/DELETE /packaging/product-weights/:sku
+    + PUT /packaging/types/:typeId
+    + PUT/DELETE /packaging/bundles/:sku
+    + GET /packaging/preview/:orderId — run engine on order
+
+  client/src/pages/OrderDetailPage.js
+    + ShippingBlock form pre-populates from engine output
+      (when status.packaging is present)
+    + Shows "💡 Engine suggests: <type> · <weight>oz ·
+      <carrier>/<service>" banner above the form with the
+      rule trace as a tooltip
+    + Falls back gracefully to app-settings defaults when
+      engine has no output (eligibility false, engine error,
+      etc.)
+
+  client/src/pages/settings/SettingsLayout.js
+    + Sidebar link "Packaging" under Integrations
+
+  client/src/components/AppLayout.js
+    + Route /settings/packaging → PackagingPage
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-13b.tar.gz --strip-components=1
+
+Nodemon picks it up. No new dependencies needed.
+
+On first restart, packaging-config.json gets created in
+server/config/ with the defaults. Log line you'll see:
+
+  [PackagingService] Created default config at <path>
+
+Ctrl+Shift+R in the browser.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+Engine integration:
+  1. Open the order you sent successfully earlier (110633).
+     The Shipping card now shows a "💡 Engine suggests" line
+     above the form with the engine's pick (should be: 6x8
+     Flat Mailer · 3oz · stamps_com/usps_first_class_mail).
+  2. Hover the suggestion line → tooltip with the rule trace.
+  3. Open an order with an 8x10 (SKU 6/8/9/22) line item.
+     Engine should pick 9x11 Flat Mailer.
+  4. Open an order with a plaque (SKU 21 or 22) — should pick
+     Medium Box with package service.
+
+Settings UI:
+  5. Settings → Packaging. Page renders with five sections
+     filled in from the default config.
+  6. Test calculator: paste 110633 → "Run preview." Result
+     shows package type, weight, carrier/service, rule trace,
+     per-item weights.
+  7. Edit a product weight (e.g. bump Memory Mate from 1.5 to
+     2.0), Save → banner confirms. Reload calculator on an
+     order with that SKU — new weight reflected.
+  8. Routing rules: add a SKU to boxRouteSKUs (e.g. 40),
+     Save. Run calculator on an order with that SKU → routes
+     to Medium Box.
+
+Per-item weight payload to SS:
+  9. Send a multi-line order to ShipStation. In SS, the order
+     weight should match the engine's total exactly. Each line
+     item should show its own weight in grams (the engine
+     splits the order weight across items so SS's per-line
+     sum stays correct).
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+All 7 files parse cleanly.
+
+Packaging engine, 15 scenarios:
+✓ Real order 110633 (4-Mini Magnets + 5×7) → 6×8 flat, 3oz
+✓ Single Memory Mate (8×10 size) → 9×11 flat, 4oz
+✓ Coffee mug alone (17oz) → small box, USPS Ground Advantage
+✓ Mug + 8x10 (20oz) → large box, USPS Ground Advantage
+✓ 10×30 Pano alone → pano tube
+✓ Pano + 8x10 → medium box
+✓ 5×7 Plaque (rigid) → medium box
+✓ Two plaques (2 rigid items) → large box
+✓ 1×15 magnet (below threshold) → 6×8 flat
+✓ 3×15 magnets (trips threshold) → 9×11 as package
+✓ Collector cards (force-package SKU) → 9×11 as package
+✓ Mixed (5×7 + digital download) → 6×8 flat, digital has 0 weight
+✓ 5× 8×10 plaques (heavy, rigid) → large box, USPS Ground Advantage
+✓ Per-item weights sum exactly to order weight (no rounding error)
+✓ Digital line items get 0 weight in itemWeights
+
+Integration:
+✓ Engine drives weight/dims/carrier/service when no overrides
+✓ Override (8oz) wins over engine (3oz) → correct grams in payload
+✓ previewPackagingForOrder returns the engine output cleanly
+✓ ApiKeysPage / PackagingPage / ShippingBlock SSR cleanly
+
+═══════════════════════════════════════════════════════
+DESIGN DECISIONS WORTH NOTING
+═══════════════════════════════════════════════════════
+
+• Engine output OVERRIDES app-settings defaults in the form.
+  Operator can still override per-order. Reasoning: the whole
+  point of an engine is it knows more than a static default;
+  if we keep showing the static defaults, the engine is mere
+  decoration. The "💡 Engine suggests" line above the form
+  makes WHY the form values look that way visible.
+
+• Save buttons are per-section, not page-wide. Each table row
+  has its own Save / Delete; routing rules section has a single
+  Save for that section. This matches how the engine config is
+  shaped (multiple independent concerns) and avoids the "save
+  everything every time" pattern that's easy to mis-target.
+
+• Test calculator lives ON the Settings page rather than as a
+  separate route. Operators editing rules can immediately
+  validate against a real order without context-switching.
+
+• Package type IDs (flat_6x8, medium_box, etc.) are NOT
+  editable in the UI — the engine references them by ID. To
+  add a new packaging type you'd edit the JSON config directly.
+  Could add a "New type" UI later if needed.
+
+• Per-item weight encoding: ShipStation sums line-item weights
+  when SKUs have Product Defaults stored. To stay accurate the
+  engine emits per-line weights that total exactly the order
+  weight. The packaging baseWeight + ceiling-rounding remainder
+  gets rolled onto the first non-digital line item. Weights go
+  out in GRAMS (integer) rather than oz (fractional) because
+  ShipStation truncates fractional ounces per line.
+
+═══════════════════════════════════════════════════════
+WHAT'S STILL DEFERRED
+═══════════════════════════════════════════════════════
+
+13c — Auto-create during processing
+  Wire shipstationService.createOrder into processingService.
+  processOrder as step 5 (after slip generation). Only fires
+  for ship_to_home orders. Reprocess detects existing SS
+  orders by orderNumber.
+
+13d — Batch processing send
+  When operator processes a batch from the orders list, each
+  ship-to-home order gets sent to SS. Summary at end.
+
+13e — Polling for shipped status
+  Background poller detects SS orders marked shipped, updates
+  local link with tracking info. Future hook for customer
+  notifications.
+
+13f — Dedicated ShipStation page
+  Three-tab UI like PhotoDay: batch create, manage orders,
+  mark shipped.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 13a          ShipStation scaffolding + single-order send
+✓ 13b          Packaging rules engine + settings UI ← here
+□ 13c          Auto-create during processing
+□ 13d          Batch processing send
+□ 13e          Polling for shipped status
+□ 13f          Dedicated ShipStation page

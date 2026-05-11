@@ -1453,6 +1453,7 @@ function JobProgressBanner({ job, onDismiss, onCancel }) {
             color: 'var(--text-muted)',
             display: 'flex',
             gap: 12,
+            flexWrap: 'wrap',
           }}
         >
           {successCount > 0 && (
@@ -1465,6 +1466,13 @@ function JobProgressBanner({ job, onDismiss, onCancel }) {
             <span style={{ color: '#dc3545' }}>✗ {errorCount} failed</span>
           )}
         </div>
+      )}
+
+      {/* Phase 13d: ShipStation summary for the batch. Only meaningful
+          when the batch is complete; running batches haven't aggregated
+          this yet (the summary is computed at end-of-batch). */}
+      {isComplete && job.shipstationSummary && (
+        <BatchSSSummary summary={job.shipstationSummary} />
       )}
 
       {/* Phase 4.7 — graceful cancel button. Visible while the batch
@@ -1540,6 +1548,176 @@ function JobProgressBanner({ job, onDismiss, onCancel }) {
               }}
             >
               {p}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Phase 13d: ShipStation summary inside the batch banner ──
+//
+// Aggregated counts of SS create outcomes for the just-completed
+// batch. Shows alongside the regular sub-order counts so operators
+// see at a glance: "20 processed, 18 sent to SS, 2 failed."
+//
+// If failures exist, expose an inline retry list — each failed
+// order can be retried individually without reprocessing photos/
+// imposition. Server's POST /api/shipstation/orders/:id/retry-send
+// uses processingService.retryShipStationForOrder.
+//
+// Retry success removes the entry from the displayed list so the
+// operator can watch the failures drain to zero.
+
+function BatchSSSummary({ summary }) {
+  const [retryingId, setRetryingId] = React.useState(null);
+  const [remaining, setRemaining] = React.useState(summary.failures || []);
+  const [errors, setErrors] = React.useState({});
+
+  async function handleRetry(orderId) {
+    setRetryingId(orderId);
+    setErrors((e) => ({ ...e, [orderId]: null }));
+    try {
+      const data = await api.post(
+        `/api/shipstation/orders/${orderId}/retry-send`,
+        {}
+      );
+      if (data.result?.ok) {
+        setRemaining((rs) => rs.filter((r) => r.orderId !== orderId));
+      } else {
+        setErrors((e) => ({
+          ...e,
+          [orderId]: data.result?.error || 'Unknown error',
+        }));
+      }
+    } catch (err) {
+      setErrors((e) => ({ ...e, [orderId]: err.message }));
+    } finally {
+      setRetryingId(null);
+    }
+  }
+
+  const totalAttempted =
+    summary.created + summary.skipped + summary.failed;
+  if (totalAttempted === 0) return null;
+
+  return (
+    <div
+      style={{
+        marginTop: 10,
+        paddingTop: 8,
+        borderTop: '1px solid var(--border-color)',
+      }}
+    >
+      <div
+        style={{
+          fontSize: 11,
+          color: 'var(--text-muted)',
+          marginBottom: 4,
+          fontWeight: 500,
+        }}
+      >
+        ShipStation:
+      </div>
+      <div
+        style={{
+          fontSize: 11,
+          display: 'flex',
+          gap: 12,
+          flexWrap: 'wrap',
+          marginBottom: remaining.length > 0 ? 8 : 0,
+        }}
+      >
+        {summary.created > 0 && (
+          <span style={{ color: '#4caf50' }}>
+            ✓ {summary.created} sent
+          </span>
+        )}
+        {summary.skipped > 0 && (
+          <span style={{ color: 'var(--text-muted)' }}>
+            ↻ {summary.skipped} skipped
+          </span>
+        )}
+        {summary.failed > 0 && (
+          <span style={{ color: '#dc3545' }}>
+            ✗ {summary.failed} failed
+          </span>
+        )}
+        {summary.driftCount > 0 && (
+          <span
+            style={{ color: '#e0b341' }}
+            title="ShipStation reassigned the packageCode for these orders. Usually cosmetic."
+          >
+            ⚠ {summary.driftCount} drift
+          </span>
+        )}
+      </div>
+
+      {remaining.length > 0 && (
+        <div
+          style={{
+            background: 'rgba(220,53,69,0.05)',
+            border: '1px solid rgba(220,53,69,0.2)',
+            borderRadius: 4,
+            padding: 8,
+            fontSize: 11,
+          }}
+        >
+          <div
+            style={{
+              fontWeight: 500,
+              color: '#dc3545',
+              marginBottom: 4,
+            }}
+          >
+            Retry failed SS sends:
+          </div>
+          {remaining.map((f) => (
+            <div
+              key={f.orderId}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                padding: '4px 0',
+                borderTop: '1px solid rgba(220,53,69,0.1)',
+              }}
+            >
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontWeight: 500 }}>
+                  Order {f.orderNumber || f.orderId}
+                </div>
+                <div
+                  style={{
+                    color: 'var(--text-muted)',
+                    fontSize: 10,
+                    wordBreak: 'break-word',
+                  }}
+                >
+                  {errors[f.orderId] || f.error}
+                </div>
+              </div>
+              <button
+                onClick={() => handleRetry(f.orderId)}
+                disabled={retryingId === f.orderId}
+                style={{
+                  padding: '3px 8px',
+                  background:
+                    retryingId === f.orderId
+                      ? 'transparent'
+                      : 'rgba(74,127,193,0.15)',
+                  border: '1px solid rgba(74,127,193,0.4)',
+                  color: retryingId === f.orderId ? 'var(--text-muted)' : '#4a7fc1',
+                  borderRadius: 3,
+                  fontSize: 10,
+                  fontWeight: 500,
+                  cursor: retryingId === f.orderId ? 'default' : 'pointer',
+                  fontFamily: 'inherit',
+                }}
+              >
+                {retryingId === f.orderId ? 'Retrying…' : 'Retry SS'}
+              </button>
             </div>
           ))}
         </div>

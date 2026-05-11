@@ -20,6 +20,10 @@ import OrderOverridesPage from '../pages/settings/OrderOverridesPage';
 import OverrideEditorPage from '../pages/settings/OverrideEditorPage';
 // Phase 13a: ShipStation integration settings
 import ApiKeysPage from '../pages/settings/ApiKeysPage';
+// Phase 13b: packaging rules engine settings
+import PackagingPage from '../pages/settings/PackagingPage';
+// Phase 13f: dedicated ShipStation page (pending/shipped/failed)
+import ShipStationPage from '../pages/ShipStationPage';
 
 /**
  * App shell shown to authenticated users.
@@ -84,6 +88,9 @@ export default function AppLayout({ user, onLogout }) {
           <Route path="/" element={<HomePage />} />
           <Route path="/orders" element={<OrdersListPage />} />
           <Route path="/orders/:orderId" element={<OrderDetailPage />} />
+          {/* Phase 13f: dedicated ShipStation page */}
+          <Route path="/shipstation" element={<ShipStationPage />} />
+          <Route path="/shipstation/:tab" element={<ShipStationPage />} />
 
           {/* Settings: nested routes inside SettingsLayout (sidebar + outlet).
               Default redirect → /settings/paths. */}
@@ -111,6 +118,8 @@ export default function AppLayout({ user, onLogout }) {
             <Route path="process-history" element={<ProcessHistoryPage />} />
             {/* Phase 13a: API integrations */}
             <Route path="api-keys" element={<ApiKeysPage />} />
+            {/* Phase 13b: packaging rules engine */}
+            <Route path="packaging" element={<PackagingPage />} />
           </Route>
 
           {/* Unknown paths fall back to home. Could be a 404 page later. */}
@@ -159,6 +168,9 @@ function Header({ user, onLogout, pathMode }) {
         <nav style={{ display: 'flex', gap: 4 }}>
           <NavLink to="/orders" style={navLinkStyle}>
             Orders
+          </NavLink>
+          <NavLink to="/shipstation" style={navLinkStyle}>
+            ShipStation
           </NavLink>
           {user.role === 'admin' && (
             <NavLink to="/settings" style={navLinkStyle}>

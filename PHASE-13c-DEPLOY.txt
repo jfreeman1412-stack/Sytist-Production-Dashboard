@@ -1,0 +1,226 @@
+Phase 13c — auto-create ShipStation order during Process
+
+═══════════════════════════════════════════════════════
+SCOPE
+═══════════════════════════════════════════════════════
+
+Closes the loop on the existing one-click "Process this order"
+workflow. Before 13c, processing did three things: download photos,
+write Darkroom .txt, update Sytist order status. Creating the
+ShipStation order was a separate manual click on the order detail
+page.
+
+With 13c, ship_to_home orders processed via "Process this order"
+ALSO get auto-created in ShipStation using the packaging engine
+from 13b — same payload, same routing rules, no human in the loop
+for the standard case. The manual Send button on the Shipping
+card stays available for one-off overrides.
+
+═══════════════════════════════════════════════════════
+THE FLOW
+═══════════════════════════════════════════════════════
+
+  1. Operator clicks "Process this order"
+  2. Sub-orders process (download photos, write .txt, generate slip)
+  3. If all sub-orders succeeded AND workflow === 'ship_to_home':
+     a. Engine builds the SS payload
+     b. Check for existing local link → adopt + skip create
+     c. Check SS by orderNumber → adopt existing if found
+     d. Otherwise create SS order, store link in shipstation_links
+  4. If sub-orders OK AND (SS succeeded OR was legitimately skipped
+     OR workflow doesn't apply):
+     → update Sytist status as before
+  5. If sub-orders OK but SS step FAILED:
+     → leave Sytist status untouched. Operator sees the failure in
+       the result panel and reprocesses after fixing the issue.
+
+Workflows that bypass SS entirely (ship_to_managers, ship_to_league)
+still get their status updated normally — those orders ship
+internally and never touch SS.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/services/processingService.js
+    + DEFAULT_SETTINGS gains autoShipStation (default true). Kill
+      switch if operators want to fall back to manual-only sends.
+    + processOrder now has a Phase 13c block between sub-order
+      success and status update. Status update now gated on
+      `allOk AND shipstationStepOk`.
+    + New private method _tryCreateShipStation that encapsulates:
+        - existing local link → adopt (reprocess case)
+        - payload build (catches errors as non-throwing return)
+        - engine __skipShipStation → legit skip
+        - lookup by orderNumber → adopt existing
+        - createOrder → record link, detect packageCode drift
+    + All error paths log to the server console and return a
+      structured outcome rather than throwing — processOrder's
+      result object always includes a shipstation field on home
+      orders, never crashes from this step.
+
+  client/src/pages/OrderDetailPage.js
+    + Parent component lifts a shippingRefreshTrigger so the
+      ShippingBlock refetches after Process completes (otherwise
+      it'd still show "click Send" even though Process just
+      auto-created the SS order).
+    + ProcessOrderBlock takes onProcessComplete prop and calls it
+      after a successful response.
+    + ShippingBlock takes refreshTrigger prop, useEffect depends
+      on it. No other behavior change.
+    + ProcessResultDisplay renders a new ShipStation row showing:
+        ✓ Created SS#NNNN  (green) — fresh create
+        ↻ Skipped         (gray) — non-home, all-digital, or
+                                   already-linked
+        ✗ Failed          (red) — with explanation that Sytist
+                                  status was NOT updated
+    + Drift warning when SS reassigns the packageCode server-side
+      (sent=large_envelope_or_flat, stored=package). This usually
+      means SS overrode based on the chosen carrier/service combo.
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+Unit tested _tryCreateShipStation against 8 scenarios:
+  ✓ Happy path → ok=true, fresh create, SS#12345
+  ✓ Already linked locally → ok=true, skipped='already_linked'
+  ✓ Engine __skipShipStation → ok=true, skipped='no_shippable_items'
+  ✓ Build fails → ok=false, error surfaced
+  ✓ Duplicate on SS → ok=true, skipped='adopted_existing'
+  ✓ Lookup fails → falls back to create, succeeds (non-fatal)
+  ✓ Create fails (SS 400 / network) → ok=false, error surfaced
+  ✓ Drift detection → ok=true, drift=true logged with ⚠
+
+UI rendering tested against 5 result shapes:
+  ✓ No SS (older response without .shipstation) — renders cleanly
+  ✓ SS success — green "Created SS#NNNN" row
+  ✓ SS skipped — gray "Skipped" row with reason
+  ✓ SS failed — red row with retry guidance
+  ✓ SS drift — amber drift warning
+
+Status-update gating verified:
+  ✓ allOk && ssOk → status update fires
+  ✓ allOk && ssSkipped (legit) → status update fires
+  ✓ allOk && ssFailed → status update SKIPPED (correct: operator
+    must fix and reprocess)
+  ✓ !allOk → status update SKIPPED regardless of SS (pre-13c
+    behavior preserved)
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-13c.tar.gz --strip-components=1
+
+Nodemon restarts. No config file deletions needed; new settings
+default to autoShipStation=true and write through on first save.
+
+Ctrl+Shift+R in the browser.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+For ship_to_home orders (normal case):
+  1. Find an unprocessed ship_to_home order that doesn't already
+     have a ShipStation link.
+  2. Click "Process this order." Confirm.
+  3. Result panel should show:
+       ✓ Processed 1 sub-order successfully (status → X)
+       ✓ ShipStation: created SS#NNNNNN
+  4. The Shipping card below auto-refreshes to its linked state
+     ("Sent to ShipStation — SS#NNNNNN") with Re-fetch / Mark
+     shipped / Delete buttons.
+  5. Open ShipStation in another tab → order should appear in
+     Awaiting Shipment with the expected packaging.
+
+For reprocess case:
+  6. Click "Process this order" again on the same order.
+  7. Result should show:
+       ✓ ShipStation: skipped
+       message: "Already linked to ShipStation order NNNN"
+  8. Sytist status updates again (since SS was a legit skip).
+
+For non-home order (ship_to_managers / ship_to_league):
+  9. Process such an order.
+ 10. Result:
+       ✓ ShipStation: skipped
+       message: "Workflow ship_to_managers — ShipStation not applicable"
+
+If something fails:
+ 11. Disconnect from internet temporarily, click Process on a
+     home order. Result should be:
+       ✓ Sub-order succeeded
+       ✗ ShipStation: failed   (red row)
+       — Sytist status NOT updated
+ 12. Reconnect, click Process again. SS step retries and succeeds.
+
+═══════════════════════════════════════════════════════
+DESIGN DECISIONS WORTH NOTING
+═══════════════════════════════════════════════════════
+
+• Status update gated on SS success. Critical for "noticing" silent
+  failures. If we updated status anyway, an operator might glance
+  at the order, see it's marked done, and never realize SS didn't
+  receive it. The current design forces a visible error → reprocess
+  cycle.
+
+• Reprocess looks up by orderNumber AND checks the local link table.
+  Either match adopts the existing SS order; only a clean slate
+  (no local link, no SS match) actually creates. Operators who
+  truly want to start over should Delete the SS order from the
+  order detail page first.
+
+• autoShipStation defaults to TRUE. The whole point of 13c is to
+  make Process the standard one-click flow. Operators who want
+  manual-only can flip the switch via the existing processing
+  settings page.
+
+• packageCode drift logging. ShipStation sometimes reassigns the
+  packageCode server-side (e.g. it pairs Stamps.com Ground Advantage
+  with packageCode=package even when we send large_envelope_or_flat).
+  The drift warning lets us notice when this happens without
+  treating it as an error. Cosmetic only — the actual carrier and
+  service are what matters, and those go through unchanged.
+
+• ShippingBlock refetches via a refreshTrigger counter. Could have
+  used a forceRefresh callback or a parent-owned state object, but
+  the counter is the simplest pattern that doesn't risk stale-state
+  bugs from useEffect closures. Bumping the counter is unambiguous:
+  every increment is a new value, which dependency comparison
+  catches immediately.
+
+═══════════════════════════════════════════════════════
+WHAT'S DEFERRED
+═══════════════════════════════════════════════════════
+
+13d — Batch processing send
+  startBatchProcess + _runBatchJob currently loop calling processOrder.
+  Since processOrder now does SS too, the batch flow ALREADY does
+  per-order SS create. What 13d adds is a summary at end-of-batch
+  ("X sent, Y skipped, Z failed") plus retrying failed SS sends as
+  a single button rather than reprocessing the whole order.
+
+13e — Polling for shipped status
+  Background poller checks SS for orders that have moved to
+  'shipped' status. Updates local link with tracking info.
+
+13f — Dedicated ShipStation page
+  Three-tab UI for batch send, manage orders, mark shipped.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 13a            ShipStation scaffolding + single-order send
+✓ 13b            Packaging rules engine + settings UI
+✓ 13b hf1        Defaults match PhotoDay live config
+✓ 13b hf2        Weight breakdown diagnostics
+✓ 13b hf3        Bundle weights for Sytist's single-line model
+✓ 13c            Auto-create during processing ← here
+□ 13d            Batch processing send (largely free from 13c)
+□ 13e            Polling for shipped status
+□ 13f            Dedicated ShipStation page

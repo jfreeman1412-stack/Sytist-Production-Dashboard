@@ -68,6 +68,69 @@ function normalizeCountry(raw) {
   return 'US';
 }
 
+// Phase 13b hotfix #2: pretty-print the packaging engine's math so
+// operators can compare against scale weight. Output is grouped under
+// one console.log call (single line per item + summary) so it stays
+// readable when the server log is busy. Format:
+//
+//   [Packaging Trace] Order 110633
+//     Items:
+//       SKU 17 (4 Mini Magnets) × 1 = 1.7 oz [productWeights]
+//       SKU 10 (5x7 Individual Print) × 1 = 0.1 oz [productWeights]
+//     Items subtotal:    1.8 oz
+//     Packing slip:     +0.4 oz
+//     Packaging (6x8 Flat Mailer): +1.5 oz
+//     Pre-ceiling total: 3.7 oz
+//     Ceiling rounding: +0.3 oz
+//     ────────────────────────────
+//     FINAL:             4 oz  →  carrier=stamps_com service=usps_first_class_mail
+function _logPackagingTrace(orderId, packaging) {
+  const wb = packaging.weightBreakdown;
+  if (!wb) return;
+  const lines = [];
+  lines.push(`[Packaging Trace] Order ${orderId}`);
+  lines.push('  Items:');
+  if (wb.items.length === 0) {
+    lines.push('    (none)');
+  } else {
+    for (const it of wb.items) {
+      const flag =
+        it.source === 'fallback'
+          ? ' ⚠️ FALLBACK (no SKU config, defaulted to 1oz)'
+          : ` [${it.source}]`;
+      lines.push(
+        `    SKU ${it.sku} (${it.name}) × ${it.qty} = ${_fmt(
+          it.lineWeightOz
+        )} oz${flag}`
+      );
+    }
+  }
+  lines.push(`  Items subtotal:    ${_fmt(wb.itemsSubtotalOz)} oz`);
+  if (wb.packingSlipOz > 0) {
+    lines.push(`  Packing slip:     +${_fmt(wb.packingSlipOz)} oz`);
+  }
+  if (wb.packagingTypeName) {
+    lines.push(
+      `  Packaging (${wb.packagingTypeName}): +${_fmt(
+        wb.packagingBaseWeightOz
+      )} oz`
+    );
+  }
+  lines.push(`  Pre-ceiling total: ${_fmt(wb.preCeilingOz)} oz`);
+  if (wb.ceilingRemainderOz > 0.001) {
+    lines.push(`  Ceiling rounding: +${_fmt(wb.ceilingRemainderOz)} oz`);
+  }
+  lines.push('  ────────────────────────────');
+  lines.push(
+    `  FINAL:             ${wb.finalOz} oz  →  carrier=${packaging.carrierCode} service=${packaging.serviceCode}`
+  );
+  console.log(lines.join('\n'));
+}
+function _fmt(n) {
+  // Trim float noise without losing real precision on tiny values
+  return Number(n).toFixed(2).replace(/\.?0+$/, '');
+}
+
 class ShipStationService {
   constructor() {
     // We re-build the axios client lazily so credential changes via the
@@ -367,26 +430,67 @@ class ShipStationService {
       phone: customer.phone || shipTo.phone || '',
     };
 
-    // ─── Build items ────────────────────────────────────
-    // For 13a we don't have per-item packaging weights (that's the
-    // packaging engine in 13b). Set name/SKU/qty without weights and
-    // let the order-level weight stand. Once 13b lands we'll populate
-    // weight per item to dodge the SS line-item-sum truncation issue.
+    // ─── Consult the packaging engine ───────────────────
+    // Phase 13b: packagingService.determinePackaging analyzes the
+    // filtered order and returns suggested carrier/service/package/
+    // dimensions/weight + per-item weights. shipstationService keeps
+    // its own SKIP filtering (drop-shipped + SKIP_FLAGS) before
+    // handing the order off, since the engine doesn't know about
+    // those concerns.
+    //
+    // Failure mode: if the engine throws (corrupt config etc.), fall
+    // back to manual app-settings defaults. Operator can still ship,
+    // they just don't get the rule-based suggestion.
+    let packaging = null;
+    try {
+      const packagingService = require('./packagingService');
+      packaging = await packagingService.determinePackaging({
+        ...order,
+        lineItems: shippable, // engine works on shippable items only
+      });
+    } catch (err) {
+      console.warn(
+        `[ShipStation] Packaging engine error for order ${order.orderId}: ${err.message} — falling back to defaults`
+      );
+    }
+
+    // Phase 13b hotfix #2: log the weight breakdown so operators can
+    // compare engine output against scale weight when investigating
+    // ShipStation labels that don't match reality. The Test Calculator
+    // shows the same data in the browser.
+    if (packaging?.weightBreakdown) {
+      _logPackagingTrace(order.orderId, packaging);
+    }
+
+    // ─── Build items with per-item weights from the engine ──
+    // ShipStation sums line-item weights if any SKU has Product
+    // Defaults stored on its side. The engine emits per-line weights
+    // (in oz) that total exactly the order weight. We convert each
+    // line's TOTAL weight (qty × unit) back to per-unit grams since
+    // ShipStation multiplies its unit weight by quantity itself.
+    const itemWeightByKey = {};
+    if (packaging?.itemWeights) {
+      for (const iw of packaging.itemWeights) {
+        if (iw.lineItemKey) itemWeightByKey[iw.lineItemKey] = iw.weightOz;
+      }
+    }
+
     const items = shippable.map((li) => {
-      // ShipStation displays the `name` field on packing slips and in
-      // the orders list. Combining productName with the photo filename
-      // gives operators enough to verify the right item is being shipped.
       const namePieces = [];
       if (li.productName) namePieces.push(li.productName);
       if (li.photo?.originalFilename)
         namePieces.push(li.photo.originalFilename);
       const name = namePieces.join(' · ') || 'Photo Product';
 
-      return {
-        lineItemKey: String(li.cartId || ''),
+      const lineItemKey = String(li.cartId || '');
+      const qty = li.qty || 1;
+      const lineWeightOz = itemWeightByKey[lineItemKey];
+
+      const payload = {
+        lineItemKey,
         sku: String(li.sku || ''),
         name,
-        quantity: li.qty || 1,
+        quantity: qty,
         unitPrice: typeof li.price === 'number' ? li.price : 0,
         options: [
           { name: 'CartId', value: String(li.cartId || '') },
@@ -395,6 +499,17 @@ class ShipStationService {
             : null,
         ].filter(Boolean),
       };
+
+      // Per-unit weight in grams. Engine gives us LINE total (qty×unit)
+      // so divide back out first. Use grams because SS truncates
+      // fractional ounces per line when summing.
+      if (lineWeightOz !== undefined && qty > 0) {
+        const unitWeightOz = lineWeightOz / qty;
+        const unitWeightG = Math.max(1, Math.round(unitWeightOz * OZ_TO_G));
+        payload.weight = { value: unitWeightG, units: 'grams' };
+      }
+
+      return payload;
     });
 
     // ─── Order-level fields ─────────────────────────────
@@ -402,6 +517,8 @@ class ShipStationService {
 
     // Notes — operators / lab staff see these in the ShipStation UI.
     // Include enough to trace back to Sytist if something looks wrong.
+    // Phase 13b: also surface the engine's chosen packaging type so
+    // operators can sanity-check what the rules engine decided.
     const internalNotes = [
       `Sytist Order ID: ${order.orderId}`,
       `Workflow: ${order.shipping?.workflow || 'unknown'}`,
@@ -412,12 +529,19 @@ class ShipStationService {
             .map((s) => s.reason)
             .join(',')})`
         : null,
+      packaging
+        ? `Pkg: ${packaging.packageTypeName} (${packaging.carrierCode}/${packaging.serviceCode}/${packaging.packageCode})`
+        : null,
     ]
       .filter(Boolean)
       .join(' | ');
 
-    // ─── Weight + dimensions (manual for 13a) ───────────
-    // Defaults come from appSettings; overrides win.
+    // ─── Weight + dimensions ───────────────────────────
+    // Precedence: explicit overrides > engine output > app-settings
+    // defaults. Engine wins only when it produced a result; on
+    // engine failure or a fresh install with no SKUs registered yet,
+    // app-settings defaults take over.
+
     const defaultWeightOz = parseFloat(
       appSettings.getRawValueSync('defaultWeightOz') || '4'
     );
@@ -433,27 +557,44 @@ class ShipStationService {
     const defaultCarrier =
       appSettings.getRawValueSync('defaultCarrier') || 'stamps_com';
     const defaultService =
-      appSettings.getRawValueSync('defaultService') || 'usps_first_class_mail';
+      appSettings.getRawValueSync('defaultService') ||
+      'usps_first_class_mail';
     const defaultPackage =
       appSettings.getRawValueSync('defaultPackageCode') ||
       'large_envelope_or_flat';
 
-    const weightOz =
-      overrides.weight?.value != null
-        ? parseFloat(overrides.weight.value)
-        : defaultWeightOz;
+    // Order-level weight resolution: overrides > engine > app-settings.
+    let weightOz;
+    if (overrides.weight?.value != null) {
+      weightOz = parseFloat(overrides.weight.value);
+    } else if (packaging?.weight?.value != null) {
+      weightOz = packaging.weight.value;
+    } else {
+      weightOz = defaultWeightOz;
+    }
     const weightG = Math.max(1, Math.round(weightOz * OZ_TO_G));
 
-    const dimensions = overrides.dimensions || {
-      length: defaultLength,
-      width: defaultWidth,
-      height: defaultHeight,
-      units: 'inches',
-    };
+    // Dimensions resolution: overrides > engine > app-settings.
+    let dimensions;
+    if (overrides.dimensions) {
+      dimensions = overrides.dimensions;
+    } else if (packaging?.dimensions) {
+      dimensions = packaging.dimensions;
+    } else {
+      dimensions = {
+        length: defaultLength,
+        width: defaultWidth,
+        height: defaultHeight,
+        units: 'inches',
+      };
+    }
 
-    const carrierCode = overrides.carrierCode || defaultCarrier;
-    const serviceCode = overrides.serviceCode || defaultService;
-    const packageCode = overrides.packageCode || defaultPackage;
+    const carrierCode =
+      overrides.carrierCode || packaging?.carrierCode || defaultCarrier;
+    const serviceCode =
+      overrides.serviceCode || packaging?.serviceCode || defaultService;
+    const packageCode =
+      overrides.packageCode || packaging?.packageCode || defaultPackage;
 
     // ─── Final payload ──────────────────────────────────
     return {
@@ -474,6 +615,84 @@ class ShipStationService {
       packageCode,
       requestedShippingService: serviceCode,
     };
+  }
+
+  /**
+   * Preview-only path that returns the packaging engine's suggestion
+   * for an order without building a full SS payload. Used by the
+   * order detail page to pre-populate the Ship form, and by the
+   * Settings → Packaging "test calculator" to inspect engine output.
+   *
+   * Applies the same SKIP_FLAGS + drop-shipped filter that the
+   * real createOrder path does, so the preview matches reality.
+   *
+   * Returns:
+   *   {
+   *     ok: boolean,
+   *     packaging: { ...engine result... } | null,
+   *     skipped: [{ cartId, reason, sku }],
+   *     shippableCount,
+   *     error?: string,
+   *   }
+   */
+  async previewPackagingForOrder(order) {
+    const specialtyService = require('./specialtyService');
+    const packagingService = require('./packagingService');
+
+    const allLineItems = order.lineItems || [];
+    const shippable = [];
+    const skipped = [];
+    for (const li of allLineItems) {
+      const flagSkip = SKIP_FLAGS.find((f) => li.flags && li.flags[f]);
+      if (flagSkip) {
+        skipped.push({ cartId: li.cartId, reason: flagSkip, sku: li.sku });
+        continue;
+      }
+      try {
+        if (await specialtyService.isDropShipped(li.sku)) {
+          skipped.push({
+            cartId: li.cartId,
+            reason: 'dropShipped',
+            sku: li.sku,
+          });
+          continue;
+        }
+      } catch (e) {
+        // Defensive — same fallback as buildOrderFromSytist
+      }
+      shippable.push(li);
+    }
+
+    if (shippable.length === 0) {
+      return {
+        ok: false,
+        packaging: null,
+        skipped,
+        shippableCount: 0,
+        error: 'No shippable items',
+      };
+    }
+
+    try {
+      const packaging = await packagingService.determinePackaging({
+        ...order,
+        lineItems: shippable,
+      });
+      return {
+        ok: true,
+        packaging,
+        skipped,
+        shippableCount: shippable.length,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        packaging: null,
+        skipped,
+        shippableCount: shippable.length,
+        error: err.message,
+      };
+    }
   }
 }
 
