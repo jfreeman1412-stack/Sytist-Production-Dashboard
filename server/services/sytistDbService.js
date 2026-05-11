@@ -76,6 +76,76 @@ function categorizeShipping(optionName, cost) {
   return { workflow, uncategorized: true };
 }
 
+// Phase 14a: SQL predicate equivalent of categorizeShipping(), for use
+// in the WHERE clause when filtering by workflow. Must match the JS
+// function's behavior exactly so that the workflow-filtered list,
+// the order-counts endpoint, and per-order categorization all agree.
+//
+// The shape of the predicate is:
+//   (option_name IN (mapped names for this workflow))
+//   OR
+//   (option_name NOT IN (any mapped name) AND
+//      <numeric fallback predicate for this workflow>)
+//
+// The fallback bucket boundaries come from categorizeShipping:
+//   cost > 1.01    → ship_to_home
+//   cost === 1.0   → ship_to_managers
+//   cost <= 0.99   → ship_to_league
+//
+// Returns { sql, params } where `sql` is a single parenthesized
+// expression suitable for AND-joining into a WHERE clause. Returns
+// null if the workflow string isn't recognized.
+function _buildWorkflowSqlPredicate(workflow) {
+  const allMappedNames = [
+    ...SHIPPING_MAP.ship_to_home,
+    ...SHIPPING_MAP.ship_to_managers,
+    ...SHIPPING_MAP.ship_to_league,
+  ];
+
+  // Fallback predicates for orders whose option name isn't in any
+  // configured list. The 'else' bucket in categorizeShipping is
+  // ship_to_league, which means anything < 1.0 (and the operator
+  // didn't map). We use cost <= 0.99 to match the JS check that
+  // n is treated as `n <= 0.99` after the >1.01 and ===1.0 checks
+  // fail. Anything between 0.99 and 1.0 exclusive ends up in league
+  // per the JS logic, so we include that interval too.
+  const fallbackByWorkflow = {
+    ship_to_home: 'o.order_shipping > 1.01',
+    ship_to_managers: 'o.order_shipping = 1.00',
+    ship_to_league: 'o.order_shipping < 1.00 OR o.order_shipping IS NULL',
+  };
+
+  const mappedNames = SHIPPING_MAP[workflow];
+  const fallback = fallbackByWorkflow[workflow];
+  if (!mappedNames || !fallback) return null;
+
+  const params = [];
+  const parts = [];
+
+  // Branch 1: option name is explicitly in this workflow's mapping.
+  if (mappedNames.length > 0) {
+    // mysql2's pool.query() expands (?) when given an array, so we
+    // pass the array as a single param and emit a single placeholder.
+    parts.push('o.order_shipping_option IN (?)');
+    params.push(mappedNames);
+  }
+
+  // Branch 2: option name is NOT in any mapping → use numeric fallback.
+  // If the mapped-names list is empty for ALL workflows the user has
+  // a misconfigured shipping map, but the SQL still works (every order
+  // hits the fallback bucket).
+  const notInClause =
+    allMappedNames.length > 0 ? 'o.order_shipping_option NOT IN (?) AND ' : '';
+  if (allMappedNames.length > 0) {
+    params.push(allMappedNames);
+  }
+  parts.push(`(${notInClause}(${fallback}))`);
+
+  // Final predicate joins the branches with OR. Wrapped in parens so
+  // it composes safely with AND-joined siblings.
+  return { sql: `(${parts.join(' OR ')})`, params };
+}
+
 // ─── Subject field normalization ──────────────────────────
 //
 // Sytist stores extra fields as label/value pairs in 5 slots:
@@ -336,7 +406,22 @@ class SytistDbService {
     const pool = this.getPool();
     const start = Date.now();
 
-    // ─── Query 1: orders matching base filter ──────────────
+    // ─── Build the shared WHERE clause ─────────────────────
+    //
+    // Phase 14a fix: workflow filter must happen in SQL so that LIMIT
+    // and OFFSET work correctly. Previously this filter ran in JS
+    // AFTER the LIMITed result was already returned, which meant:
+    //   (1) Asking for ship_to_home with default LIMIT 50 would
+    //       fetch 50 orders of ANY workflow, then keep only the
+    //       ship_to_home ones — usually far fewer than 50.
+    //   (2) `total` reported `orders.length` (post-JS-filter), so
+    //       the UI couldn't tell how many ship_to_home orders
+    //       actually existed.
+    //
+    // The fix uses the SHIPPING_MAP option-name lists to build an
+    // IN(...) predicate, plus a numeric-cost predicate for the
+    // uncategorized fallback path (matching categorizeShipping's
+    // n>1.01 / n===1.0 / n<=0.99 buckets exactly).
     const where = [
       "o.order_payment_status = 'Completed'",
       'o.order_status = 0',
@@ -352,6 +437,15 @@ class SytistDbService {
     if (shippingOption) {
       where.push('o.order_shipping_option = ?');
       params.push(shippingOption);
+    }
+
+    // Workflow filter — in SQL now (Phase 14a fix).
+    if (workflow !== 'all') {
+      const wfPredicate = _buildWorkflowSqlPredicate(workflow);
+      if (wfPredicate) {
+        where.push(wfPredicate.sql);
+        params.push(...wfPredicate.params);
+      }
     }
 
     // Gallery filter requires a join to ms_cart, so we use EXISTS to avoid
@@ -379,6 +473,18 @@ class SytistDbService {
     const orderByClause =
       sort === 'date_desc' ? 'o.order_date DESC' : 'o.order_date ASC';
 
+    // ─── Query 0: TRUE total matching the filters ──────────
+    //
+    // Counts orders that match the full WHERE clause (now including
+    // workflow). Used by the UI to render "Showing X-Y of Z" so
+    // operators can see how many pages remain.
+    const [countRows] = await pool.query(
+      `SELECT COUNT(*) AS total FROM ms_orders o WHERE ${where.join(' AND ')}`,
+      params
+    );
+    const totalMatching = Number(countRows[0]?.total || 0);
+
+    // ─── Query 1: orders matching base filter ──────────────
     const [orderRows] = await pool.query(
       `
       SELECT
@@ -394,22 +500,15 @@ class SytistDbService {
     );
 
     if (orderRows.length === 0) {
-      return { orders: [], total: 0, elapsedMs: Date.now() - start };
+      return { orders: [], total: totalMatching, elapsedMs: Date.now() - start };
     }
 
-    // Workflow filter happens in JS because it can be string-based (mapping)
-    // OR numeric (fallback). We also do this AFTER fetch so the SQL stays
-    // simple and the canonical shape is the source of truth.
-    const orderRowsByWorkflow =
-      workflow === 'all'
-        ? orderRows
-        : orderRows.filter((r) => {
-            const cat = categorizeShipping(
-              r.order_shipping_option,
-              r.order_shipping
-            );
-            return cat.workflow === workflow;
-          });
+    // Workflow categorization is still applied in JS for the canonical
+    // shape (each order's `shipping.workflow` field). The SQL filter
+    // above ensures LIMIT/OFFSET respect the workflow, but the
+    // per-order categorization still needs to run so each returned
+    // order carries its workflow tag.
+    const orderRowsByWorkflow = orderRows;
 
     if (orderRowsByWorkflow.length === 0) {
       return { orders: [], total: 0, elapsedMs: Date.now() - start };
@@ -708,7 +807,12 @@ class SytistDbService {
 
     return {
       orders,
-      total: orders.length,
+      // Phase 14a fix: report the SQL COUNT(*) of the filtered set,
+      // not orders.length. orders.length is just the page size; the
+      // UI needs the absolute total to render "X-Y of Z" and decide
+      // whether to enable the Next button.
+      total: totalMatching,
+      pageSize: orders.length,
       elapsedMs: Date.now() - start,
     };
   }
