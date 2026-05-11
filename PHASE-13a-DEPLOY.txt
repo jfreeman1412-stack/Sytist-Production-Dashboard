@@ -1,0 +1,280 @@
+Phase 13a — ShipStation integration (scaffolding + single-order send)
+
+═══════════════════════════════════════════════════════
+SCOPE
+═══════════════════════════════════════════════════════
+
+This is the FIRST of several phases bringing ShipStation
+integration to the Sytist dashboard, ported from the PhotoDay
+dashboard. It establishes:
+
+  - Masked-secrets settings store (appSettings.js)
+  - API Keys settings page (new sidebar entry under
+    "Integrations")
+  - ShipStation V1 API client (auth, error handling, payload
+    builder for Sytist order shape)
+  - Local SQLite tracking table (shipstation_links)
+  - "Shipping" card on the order detail page with:
+      • Eligibility display
+      • Manual override of carrier/service/package/weight/dims
+      • Send to ShipStation
+      • Re-fetch status
+      • Manual mark-as-shipped
+      • Delete SS order
+
+This phase is INTENTIONALLY manual. The packaging rules engine
+(13b), the auto-create-during-processing wiring (13c), batch
+send (13d), polling for shipped status (13e), and the dedicated
+ShipStation page (13f) come in subsequent phases.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+NEW FILES:
+  server/config/appSettings.js
+    Field-definition-driven settings store. Backs the API Keys
+    UI. Storage at server/config/app-settings.json (auto-created).
+    Applies saved values to process.env on init() so anything
+    reading from env picks them up automatically.
+
+  server/services/shipstationLinkService.js
+    Tracks per-Sytist-order ShipStation linkage. Uses the same
+    sytist-dashboard.db file the auth + override services use.
+    Schema: shipstation_links (order_id PK, ss_order_id, status,
+    tracking, carrier/service/package, payload JSON, timestamps).
+    Idempotent init(); prepared statements for read paths.
+
+  server/services/shipstationService.js
+    Direct port from PhotoDay with two adaptations:
+      1. buildOrderFromPDX → buildOrderFromSytist. Maps
+         Sytist's order shape (sytistDbService) to the SS
+         payload. Filters out:
+           • Items with SKIP_FLAGS (download, giftCert,
+             creditProduct, booking, preSell)
+           • Items flagged dropShipped via specialtyService
+         Returns { __skipShipStation: true, reason, message,
+         skipped } if nothing's left to ship.
+      2. Credentials come from appSettings instead of a
+         require('../config') module that doesn't exist in
+         Sytist. The settings store applies them to process.env
+         at startup and on save, so getRawValueSync() pulls them
+         fresh on every request.
+    Preserves PhotoDay's quirks:
+      • Raw https.request for createOrder (axios workaround
+        comment from original)
+      • _stripNulls helper
+      • Per-item + order-level weight in GRAMS (avoids SS
+        per-line oz truncation on multi-item orders)
+      • Lazy axios client with credential-change invalidation
+
+  server/routes/shipstation.js
+    Endpoints (assumes requireAuth applied at mount):
+      GET  /app-settings
+      PUT  /app-settings
+      GET  /orders/:orderId/status   → {linked, link|eligibility}
+      GET  /orders/:orderId/eligibility
+      POST /orders/:orderId/create    body: overrides
+      POST /orders/:orderId/refresh
+      DELETE /orders/:orderId/link
+      POST /orders/:orderId/mark-shipped
+      GET  /carriers
+      GET  /carriers/:carrierCode/services
+    The create endpoint:
+      • Returns 409 if a link already exists
+      • Pre-checks SS by orderNumber and ADOPTS an existing
+        ShipStation order rather than creating a duplicate
+      • Surfaces __skipShipStation as 400 with reason
+
+  client/src/pages/settings/ApiKeysPage.js
+    Generic settings page. Reads field definitions from the
+    server, groups by section, renders TextInput per field.
+    Secrets get type=password and a "••••••••" placeholder
+    that means "no change" on save.
+
+MODIFIED FILES:
+  client/src/components/AppLayout.js
+    + Import ApiKeysPage
+    + Route /settings/api-keys
+
+  client/src/pages/settings/SettingsLayout.js
+    + "Integrations" section in the sidebar
+    + SidebarLink to api-keys
+
+  client/src/pages/OrderDetailPage.js
+    + <ShippingBlock /> rendered below LogoWarningBanner
+    + ShippingBlock + LinkedShippingPanel components (with
+      states: loading, not-eligible, eligible-form, sent, shipped)
+    + Inline FormField / TextField / SecondaryButton helpers
+      (didn't pull from SettingsForm because the styling differs
+      and the page doesn't already import it)
+
+═══════════════════════════════════════════════════════
+SERVER WIRING (server/index.js — manual edit needed)
+═══════════════════════════════════════════════════════
+
+You'll need to add TWO things to server/index.js. I'm leaving
+these as manual edits per our phased-deploy convention so you
+can review where they go in your file.
+
+1) AT STARTUP, before other service registration:
+
+   await require('./config/appSettings').init();
+
+   This applies any saved settings (API key, secret, defaults)
+   from server/config/app-settings.json to process.env so the
+   shipstation service picks them up.
+
+2) MOUNT THE ROUTES, with requireAuth:
+
+   app.use(
+     '/api/shipstation',
+     requireAuth,
+     require('./routes/shipstation')
+   );
+
+   Adjust the requireAuth import to wherever your auth middleware
+   lives — matches the pattern other routes use.
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-13a.tar.gz --strip-components=1
+
+  # Then manually edit server/index.js per the two-item wiring
+  # above.
+
+  npm run dev
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+  1. Open Settings → sidebar should show a new "Integrations"
+     section with "API Keys" beneath it.
+  2. Click API Keys. Form loads with sections for ShipStation
+     and Shipping defaults. Existing values shown; secrets
+     masked as ••••••••.
+  3. Paste your ShipStation V1 API key + secret. Save. Banner:
+     "Saved at HH:MM:SS. Changes take effect immediately — no
+     restart needed."
+  4. Open any order. New "Shipping" card appears below
+     Process / LogoWarningBanner.
+  5. For an order with non-physical items only (all downloads
+     etc.), the card shows "Not eligible" with the reason.
+  6. For an eligible order, the card shows the form populated
+     with your defaults. Tweak if needed, click "Send to
+     ShipStation." Confirm. The card flips to "✓ Sent to
+     ShipStation — SS#NNNN" with Re-fetch / Mark shipped /
+     Delete buttons.
+  7. "Re-fetch status" → updates the locally-cached SS state.
+  8. "Mark shipped" → expand form, enter tracking, submit.
+     Card flips to "✓ Shipped — USPS 9400…".
+  9. "Delete SS order" → confirm, deletes from SS and clears
+     local link. Card flips back to the eligible/send state.
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+✓ All 8 files parse via @babel/parser
+✓ buildOrderFromSytist with mixed cart:
+    Input: 1 Memory Mate + 1 digital download + 1 drop-shipped acrylic
+    Output: 1 item in SS payload (just the Memory Mate)
+    shipTo composed from firstName + lastName
+    address1/city/state/zip mapped correctly
+    weight = 113g (4oz default, converted)
+    carrier/service/package from defaults
+    internalNotes mentions "2 line item(s) skipped (download,dropShipped)"
+✓ buildOrderFromSytist all-digital cart:
+    Returns __skipShipStation: true, reason: 'no_shippable_items'
+✓ buildOrderFromSytist with overrides:
+    Custom carrier/service/package/weight honored
+✓ ApiKeysPage SSR: title rendered, shows "Loading…" pre-effects
+✓ ShippingBlock SSR: title rendered, shows "Loading…" pre-effects
+✓ SettingsLayout diff vs Phase 11: pure addition, nothing removed
+✓ AppLayout diff vs Phase 11: pure addition, nothing removed
+
+═══════════════════════════════════════════════════════
+WHAT'S DEFERRED (later sub-phases)
+═══════════════════════════════════════════════════════
+
+13b — Packaging rules engine port
+  Port PhotoDay's packagingService.js + its rule configs.
+  Engine reads order items, decides packaging type, dimensions,
+  weight, carrier, service code, per-item weights. Hooks into
+  buildOrderFromSytist via the `overrides` channel.
+
+13c — Auto-create during processing
+  Wire shipstationService.buildOrderFromSytist + createOrder
+  into processingService.processOrder as step 5 (after slip
+  generation, before final DB update). Only fires for
+  ship_to_home orders; others remain manual-only via the
+  order detail card.
+
+13d — Batch processing
+  When operator processes a batch of orders from the orders
+  list, each ship-to-home order gets sent to SS automatically.
+  Summary at end: "X of Y sent, Z errors."
+
+13e — Polling for shipped status (optional)
+  Background poller (similar to PhotoDay's scheduler) detects
+  when SS orders have been marked shipped. Updates the local
+  link row with tracking info. Future: also triggers customer
+  notification when that subsystem is built.
+
+13f — Dedicated ShipStation page
+  Three-tab UI like PhotoDay's: "Create from PDX-equivalent"
+  (batch), "Manage Orders", "Mark Shipped".
+
+═══════════════════════════════════════════════════════
+DESIGN DECISIONS WORTH NOTING
+═══════════════════════════════════════════════════════
+
+• Why settings under /api/shipstation/app-settings rather
+  than /api/settings/app-settings? Keeps the ShipStation
+  feature self-contained for 13a. Will extract to a shared
+  /api/settings/app-settings route when 13b adds more
+  integrations.
+
+• Why a NEW SQLite table rather than extending order_overrides?
+  Different lifecycle. Overrides are per-cartId edits the
+  operator makes; SS links are per-order tracking of an
+  external system's state. Mixing them would muddle the
+  schema and complicate the orderOverrideService API.
+
+• Why default notifyCustomer=true in mark-shipped? Until
+  Sytist has its own customer notification subsystem, having
+  ShipStation send the customer email is the safer default.
+  When we build customer notifications in a future phase,
+  we'll flip this to false and route through Sytist's pipeline.
+
+• Why does the eligibility check live in routes/shipstation.js
+  rather than the service? Two reasons. First, it's used both
+  by the status endpoint AND would be useful for an
+  orders-list-badge endpoint later — keeping it in the route
+  layer avoids the service having to expose it as a public
+  method that's mostly redundant with buildOrderFromSytist's
+  internal filter logic. Second, it returns a UI-friendly
+  shape (per-category counts + reason string) rather than the
+  payload-builder's internal {shippable, skipped} arrays.
+
+• Why does buildOrderFromSytist fall back to "include this
+  line item" when isDropShipped throws? Easier to refund a
+  shipping label than fail to ship a paid order. Errors in
+  specialtyService shouldn't drop physical items from the
+  shipping list.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 12c          150px aspect-correct thumbnails
+✓ 13a          ShipStation scaffolding + single-order send ← here
+□ 13b          Packaging rules engine
+□ 13c          Auto-create during processing
+□ 13d          Batch processing send
+□ 13e          Polling for shipped status
+□ 13f          Dedicated ShipStation page

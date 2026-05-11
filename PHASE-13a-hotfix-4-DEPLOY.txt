@@ -1,0 +1,130 @@
+Phase 13a hotfix #4 — server/index.js wired up
+
+═══════════════════════════════════════════════════════
+WHAT THIS REPLACES
+═══════════════════════════════════════════════════════
+
+Supersedes hotfix-3. Carries everything from hotfix-3 (the auth
+fix inside routes/shipstation.js, the error UI for OrderDetailPage
+and ApiKeysPage) AND adds the missing piece:
+
+  server/index.js — pre-edited with the three additions needed
+  to mount the ShipStation routes.
+
+The previous hotfixes asked you to make these edits manually.
+This one just ships the edited file.
+
+═══════════════════════════════════════════════════════
+WHAT WAS GOING WRONG
+═══════════════════════════════════════════════════════
+
+Server log showed nodemon restarting but never mentioned anything
+about ShipStation or appSettings — confirming the routes weren't
+being registered. The "Not found" was coming from this existing
+catch-all in your index.js:
+
+    // 404 catch-all for /api/*
+    app.use('/api', (req, res) => {
+      res.status(404).json({ error: 'Not found', path: req.originalUrl });
+    });
+
+With shipstationRoutes mounted at /api/shipstation BEFORE that
+catch-all, the new route takes priority.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/index.js
+    + Import of shipstationRoutes near the other route imports
+    + Try/catch wrapping require('./config/appSettings').init()
+      after the existing sytistDb.init() block
+    + app.use('/api/shipstation', shipstationRoutes) alongside
+      the other route mounts
+
+  server/routes/shipstation.js
+    (Same as hotfix-3 — requireAuth applied internally via
+     router.use, no longer relies on mount-time middleware.)
+
+  client/src/pages/OrderDetailPage.js
+    (Same as hotfix-1/2/3 — error state for ShippingBlock when
+     status fetch fails.)
+
+  client/src/pages/settings/ApiKeysPage.js
+    (Same as hotfix-2/3 — error state for ApiKeysPage when
+     settings fetch fails.)
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-13a-hotfix-4.tar.gz --strip-components=1
+
+This OVERWRITES your server/index.js with the edited version.
+If you have any uncommitted local changes to index.js that I
+might be clobbering, check git status first:
+
+  git diff server/index.js
+
+If git diff is clean (no local changes other than my edits),
+you're fine. If there ARE other changes, let me know and I'll
+do a targeted merge.
+
+Restart whatever's running (Ctrl-C then npm run dev) so nodemon
+picks up the new file.
+
+Ctrl+Shift+R in the browser.
+
+═══════════════════════════════════════════════════════
+EXPECTED SERVER LOG AFTER RESTART
+═══════════════════════════════════════════════════════
+
+You should NOW see something like this on startup:
+
+  [SytistDB] Loaded shipping mappings: 2 home, 2 managers, 1 league
+  [Database] Initialized at ...
+  [SytistDB] Pool created → ...
+  [sytist-dashboard] server listening on http://localhost:3011
+  ...
+
+If appSettings.init throws (e.g. file permissions on the JSON
+file), you'll see a warning:
+
+  [startup] appSettings init failed: <reason>
+
+But the server will still come up — the appSettings init is
+non-fatal. ShipStation just won't work until the underlying
+issue is fixed.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+  1. Settings → API Keys. Should now render the form:
+       ShipStation section:
+         ShipStation API Key       [••••••••]  (or empty)
+         ShipStation API Secret    [••••••••]  (or empty)
+         ShipStation API Base URL  [https://ssapi.shipstation.com]
+       Shipping defaults section:
+         Default Carrier Code      [stamps_com]
+         Default Service Code      [usps_first_class_mail]
+         Default Package Code      [large_envelope_or_flat]
+         Default Weight (oz)       [4]
+         Default Length (in)       [10]
+         Default Width (in)        [8]
+         Default Height (in)       [0.5]
+       And a "Save changes" button.
+
+  2. Paste your ShipStation V1 API key + secret into the
+     password fields. Click Save. Banner: "Saved at HH:MM:SS.
+     Changes take effect immediately — no restart needed."
+     Secrets re-mask to ••••••••.
+
+  3. Open any order. The "Shipping" card should now render
+     real eligibility info instead of the "Not found" error.
+
+  4. For an eligible order, click "Send to ShipStation."
+     Card flips to "✓ Sent — SS#NNNN" with the three buttons
+     (Re-fetch status, Mark shipped, Delete SS order).

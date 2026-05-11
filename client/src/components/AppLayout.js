@@ -18,6 +18,8 @@ import CompositesSettings from '../pages/settings/CompositesSettings';
 import LayoutDesignerPage from '../pages/settings/LayoutDesignerPage';
 import OrderOverridesPage from '../pages/settings/OrderOverridesPage';
 import OverrideEditorPage from '../pages/settings/OverrideEditorPage';
+// Phase 13a: ShipStation integration settings
+import ApiKeysPage from '../pages/settings/ApiKeysPage';
 
 /**
  * App shell shown to authenticated users.
@@ -107,6 +109,8 @@ export default function AppLayout({ user, onLogout }) {
               element={<OverrideEditorPage />}
             />
             <Route path="process-history" element={<ProcessHistoryPage />} />
+            {/* Phase 13a: API integrations */}
+            <Route path="api-keys" element={<ApiKeysPage />} />
           </Route>
 
           {/* Unknown paths fall back to home. Could be a 404 page later. */}

@@ -1,0 +1,82 @@
+Phase 13a hotfix #2 — honest error states on API Keys + Shipping
+
+═══════════════════════════════════════════════════════
+WHAT THIS REPLACES
+═══════════════════════════════════════════════════════
+
+This supersedes hotfix-1. It carries the OrderDetailPage error
+fix from hotfix-1 AND adds an equivalent fix on ApiKeysPage.
+
+If you already deployed hotfix-1, just deploy this on top — same
+OrderDetailPage.js plus the new ApiKeysPage.js.
+
+═══════════════════════════════════════════════════════
+THE PROBLEM
+═══════════════════════════════════════════════════════
+
+Both the Shipping card and the API Keys page were rendering
+misleadingly when the /api/shipstation/* endpoints returned 404
+(routes not mounted on the server). Both showed an error banner
+AND a half-functional UI — Save button with no fields, "Not
+eligible" with no real eligibility check.
+
+═══════════════════════════════════════════════════════
+THE FIX
+═══════════════════════════════════════════════════════
+
+When the load fails AND we have no data to show, render a
+dedicated error state with:
+  - An explicit "Couldn't load …" banner
+  - A helpful diagnosis if the error looks like "Not found"
+    (pointing at the missing server/index.js wiring)
+  - A Retry button
+  - NO half-functional Save button / form
+  - NO misleading "Not eligible" fallthrough
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/pages/OrderDetailPage.js
+    (Same as hotfix-1 — adds the !status && error branch in
+    ShippingBlock with a Retry button.)
+
+  client/src/pages/settings/ApiKeysPage.js
+    + Centralized loadSettings() function used by both the
+      mount-effect and a new Retry button
+    + New fields.length === 0 && error branch that renders
+      a dedicated error state instead of a phantom form
+    + Helpful guidance when the error is "Not found" pointing
+      at the server wiring
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-13a-hotfix-2.tar.gz --strip-components=1
+
+Client-only. Ctrl+Shift+R.
+
+═══════════════════════════════════════════════════════
+REAL UNDERLYING FIX (still required!)
+═══════════════════════════════════════════════════════
+
+The hotfix only improves the error UI. The reason you're seeing
+"Not found" is that the server isn't serving /api/shipstation/*.
+
+To fix that, add to server/index.js (look at how /api/sytist is
+registered for the pattern):
+
+  await require('./config/appSettings').init();
+
+  app.use(
+    '/api/shipstation',
+    requireAuth,
+    require('./routes/shipstation')
+  );
+
+Match the requireAuth import name your project actually uses.
+Restart the server, hard-refresh the browser, and the API Keys
+page should show form fields for credentials + shipping defaults.

@@ -14,6 +14,7 @@ const sytistDb = require('./services/sytistDbService');
 
 const authRoutes = require('./routes/auth');
 const sytistRoutes = require('./routes/sytist');
+const shipstationRoutes = require('./routes/shipstation');
 
 const PORT = process.env.PORT || 3011;
 const NODE_ENV = process.env.NODE_ENV || 'development';
@@ -29,6 +30,17 @@ try {
 } catch (err) {
   console.warn(`[startup] Sytist DB pool not initialized: ${err.message}`);
   console.warn('[startup] /api/sytist/* endpoints will fail until SYTIST_DB_* env vars are set.');
+}
+
+// ─── Phase 13a: app settings + ShipStation ─────────────────
+// appSettings persists ShipStation API credentials and shipping
+// defaults to a JSON file and applies them to process.env so the
+// shipstation service picks them up. Done early so it runs before
+// any service registration that reads from env.
+try {
+  require('./config/appSettings').init();
+} catch (err) {
+  console.warn(`[startup] appSettings init failed: ${err.message}`);
 }
 
 // ─── Initial admin bootstrap ───────────────────────────────
@@ -87,6 +99,7 @@ app.get('/api/health', (req, res) => {
 
 app.use('/api/auth', authRoutes);
 app.use('/api/sytist', sytistRoutes);
+app.use('/api/shipstation', shipstationRoutes);
 
 // 404 catch-all for /api/*
 app.use('/api', (req, res) => {

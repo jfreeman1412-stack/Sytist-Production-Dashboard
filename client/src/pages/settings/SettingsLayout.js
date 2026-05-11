@@ -96,6 +96,23 @@ function Sidebar() {
         <SidebarLink to="composites" label="Composites" />
         <SidebarLink to="overrides" label="Order Overrides" />
 
+        {/* Phase 13a: API integrations */}
+        <div
+          style={{
+            margin: '12px 12px 8px',
+            paddingTop: 8,
+            borderTop: '1px solid var(--border-color)',
+            fontSize: 10,
+            fontWeight: 600,
+            textTransform: 'uppercase',
+            letterSpacing: 0.5,
+            color: 'var(--text-muted)',
+          }}
+        >
+          Integrations
+        </div>
+        <SidebarLink to="api-keys" label="API Keys" />
+
         <div
           style={{
             margin: '12px 12px 8px',

@@ -1,0 +1,129 @@
+Phase 13a hotfix #5 — fs-extra dependency removed
+
+═══════════════════════════════════════════════════════
+WHAT THIS REPLACES
+═══════════════════════════════════════════════════════
+
+Supersedes hotfix-4. Carries everything (server/index.js
+wiring, requireAuth inside route file, error UI states) and
+fixes a missing-dependency crash.
+
+═══════════════════════════════════════════════════════
+WHAT WAS CRASHING
+═══════════════════════════════════════════════════════
+
+Server log showed:
+
+  MODULE_NOT_FOUND
+  requireStack:
+    C:\...\server\config\appSettings.js
+    C:\...\server\services\shipstationService.js
+    C:\...\server\routes\shipstation.js
+    C:\...\server\index.js
+
+appSettings.js was using `fs-extra`, which the PhotoDay project
+had as a dependency but Sytist doesn't. The crash happened on the
+require chain triggered by my new index.js edits.
+
+═══════════════════════════════════════════════════════
+THE FIX
+═══════════════════════════════════════════════════════
+
+Rewrote appSettings.js to use Node's built-in `fs` module
+(already used by orderOverrideService and databaseService in
+your project). Same JSON file format on disk, same public API,
+zero new dependencies.
+
+Specifically:
+  - Replaced `require('fs-extra')` with `require('fs')` +
+    `fs.promises`
+  - Added four small local helpers (readJsonAsync,
+    writeJsonAsync, readJsonSync, writeJsonSync) that do what
+    fs-extra's helpers did, two lines each
+  - Updated the six call sites in _ensureConfig, _read,
+    _write, getRawValueSync
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/config/appSettings.js
+    + No more fs-extra dependency. Built-in fs only.
+    + Local JSON helpers replace fs-extra's readJson/writeJson
+    + Same on-disk format (app-settings.json), same API surface
+
+  server/index.js
+    (Same as hotfix-4 — three additions for route mount and
+     appSettings init.)
+
+  server/routes/shipstation.js
+    (Same as hotfix-3 — requireAuth applied internally.)
+
+  client/src/pages/OrderDetailPage.js
+    (Same as hotfix-1/2/3/4 — error state in ShippingBlock.)
+
+  client/src/pages/settings/ApiKeysPage.js
+    (Same as hotfix-2/3/4 — error state in ApiKeysPage.)
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+✓ File parses cleanly
+✓ init() creates app-settings.json if missing
+✓ getSettings() returns the full field map
+✓ updateSettings() persists values and applies to process.env
+✓ getRawValueSync() returns the live value for service consumers
+✓ Masked secret save behavior preserved: saving ••••••••
+  as the value for a secret field does NOT clear it (this is
+  the critical UI safety the original had — operators load
+  the page and could accidentally re-save with the mask
+  visible; the secret must survive that)
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-13a-hotfix-5.tar.gz --strip-components=1
+
+Nodemon should restart automatically. Watch the server log —
+you should NO longer see the MODULE_NOT_FOUND crash.
+
+Ctrl+Shift+R in the browser.
+
+═══════════════════════════════════════════════════════
+WHAT TO LOOK FOR IN THE SERVER LOG
+═══════════════════════════════════════════════════════
+
+After deploy, the startup log should look about the same as
+before, with no crash:
+
+  [SytistDB] Loaded shipping mappings: ...
+  [Database] Initialized at ...
+  [SytistDB] Pool created → ...
+  [sytist-dashboard] server listening on http://localhost:3011
+
+If you don't see any "[startup] appSettings init failed: ..."
+warning, appSettings loaded clean.
+
+If the link service has trouble initializing (e.g.
+better-sqlite3 not installed — though it probably is since
+you use SQLite for auth + overrides), you'll see:
+
+  [shipstation] link service init failed: <reason>
+
+That'd be a separate fix; let me know what it says if it fires.
+
+═══════════════════════════════════════════════════════
+WHY THE LIBRARIES ARE INCONSISTENT
+═══════════════════════════════════════════════════════
+
+Honest answer: I ported PhotoDay's appSettings.js as-is in 13a
+without auditing dependencies. PhotoDay used fs-extra throughout
+its codebase; Sytist uses built-in fs. The right move was to
+adapt to Sytist's conventions at port time. I'll be more careful
+about this on the remaining 13b/13c/13d/13e/13f ports — every
+service from PhotoDay needs a quick scan for project-specific
+deps before bundling.

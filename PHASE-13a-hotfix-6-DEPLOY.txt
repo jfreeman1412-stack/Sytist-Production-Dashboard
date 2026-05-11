@@ -1,0 +1,96 @@
+Phase 13a hotfix #6 — country code normalization
+
+═══════════════════════════════════════════════════════
+WHAT WAS WRONG
+═══════════════════════════════════════════════════════
+
+First real Send to ShipStation surfaced this:
+
+  [ShipStation] createOrder 400: The request is invalid.
+    apiOrder.billTo.country: Please use a 2 character country code
+    apiOrder.shipTo.country: Please use a 2 character country code
+
+Sytist orders store the country as the full name ("United
+States") rather than an ISO code ("US"). The original
+buildOrderFromSytist was passing the value through unchanged
+with just a `|| 'US'` fallback for empty. ShipStation rejects
+anything that's not exactly 2 characters.
+
+═══════════════════════════════════════════════════════
+THE FIX
+═══════════════════════════════════════════════════════
+
+New normalizeCountry() helper at the top of shipstationService.js
+that:
+  - Returns 2-letter codes unchanged (uppercased)
+  - Maps common full-name variants to ISO codes:
+      "United States", "USA", "U.S.A.", "America" → US
+      "Canada" → CA
+      "Mexico" → MX
+      "United Kingdom", "UK", "Great Britain" → GB
+  - Defaults unknown values to 'US' and logs a warning so we
+    notice if a real foreign customer order arrives — the
+    warning tells future-you to add the variant to the alias
+    map rather than silently mis-shipping
+
+Called from both shipToAddress and billToAddress build steps.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/services/shipstationService.js
+    + COUNTRY_ALIASES constant + normalizeCountry() helper
+    + shipToAddress.country uses normalizeCountry()
+    + billToAddress.country uses normalizeCountry()
+
+(No other files. Hotfix-5 still applies for everything else.)
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+11 cases verified:
+✓ "United States" → US        (the real-world failing case)
+✓ "US"            → US        (already a code)
+✓ "us"            → US        (lowercase)
+✓ "USA"           → US        (alias)
+✓ "U.S.A."        → US        (with dots)
+✓ "United States " → US       (with trailing space)
+✓ "Canada"        → CA
+✓ "CA"            → CA
+✓ ""              → US        (empty)
+✓ null            → US        (missing)
+✓ "Atlantis"      → US + console.warn  (unknown — defaults safely)
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-13a-hotfix-6.tar.gz --strip-components=1
+
+Nodemon picks it up automatically. No browser refresh needed
+(server-only change). Just retry "Send to ShipStation" on the
+order you tried earlier — the country fields will now serialize
+as "US" and the create call should succeed.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+  1. Open the same order (110633) you tried before.
+  2. Click "Send to ShipStation," confirm.
+  3. Card should flip to "✓ Sent to ShipStation — SS#NNNNNNN".
+  4. Open ShipStation in another tab → Awaiting Shipment.
+     You should see order 110633 with Kari Grawburg's Rogers MN
+     address and both line items.
+
+If you ever get a foreign-country order and see a warning in
+the server log like:
+  [ShipStation] Unknown country "..." — defaulting to "US".
+Open server/services/shipstationService.js, find the
+COUNTRY_ALIASES map, and add the variant. Restart isn't strictly
+needed (require cache holds the module but the map is read on
+each call), but you can restart to be safe.

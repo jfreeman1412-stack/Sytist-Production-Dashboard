@@ -1,0 +1,171 @@
+Phase 13a hotfix #3 — server route file fixes + exact index.js diff
+
+═══════════════════════════════════════════════════════
+WHAT THIS REPLACES
+═══════════════════════════════════════════════════════
+
+Supersedes hotfix-2. Carries everything from hotfix-1 and
+hotfix-2 (the OrderDetailPage and ApiKeysPage error-state
+fixes) AND fixes a security issue in the ShipStation route
+file:
+
+  - The routes/shipstation.js file claimed in a comment to
+    "assume requireAuth applied at mount time," but if the
+    operator wired up the mount without auth middleware, every
+    ShipStation endpoint would be public. Now the route file
+    applies requireAuth itself via router.use() at the top,
+    matching the pattern routes/sytist.js already uses. The
+    mount in server/index.js can now be a plain app.use().
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/routes/shipstation.js
+    + Imports { requireAuth } from '../middleware/auth'
+    + Calls router.use(requireAuth) before any route
+      definition. Every endpoint in the file is now authed
+      regardless of how it's mounted.
+    + Updated header comment to reflect the new pattern.
+
+  client/src/pages/OrderDetailPage.js
+    (Same as hotfix-1 + hotfix-2 — error state for status fetch.)
+
+  client/src/pages/settings/ApiKeysPage.js
+    (Same as hotfix-2 — error state for settings load.)
+
+═══════════════════════════════════════════════════════
+SERVER WIRING — EXACT DIFF FOR server/index.js
+═══════════════════════════════════════════════════════
+
+I have your current server/index.js in hand. Here are the two
+exact additions you need:
+
+────── 1) Add the appSettings init alongside other startup ──────
+
+Current code around line 30 looks like:
+
+    try {
+      sytistDb.init();
+    } catch (err) {
+      console.warn(`[startup] Sytist DB pool not initialized: ${err.message}`);
+      console.warn('[startup] /api/sytist/* endpoints will fail until SYTIST_DB_* env vars are set.');
+    }
+
+Right AFTER that block (before the bootstrapInitialAdmin function),
+add this:
+
+    // ─── Apply saved app settings to process.env ───────────────
+    // Phase 13a: appSettings persists overrides to a JSON file and applies
+    // them to process.env at startup. Done synchronously so they're in place
+    // before any service registration that reads from env.
+    try {
+      require('./config/appSettings').init();
+    } catch (err) {
+      console.warn(`[startup] appSettings init failed: ${err.message}`);
+    }
+
+Note: I'm using sync style (no `await`) since your existing startup
+is sync. appSettings.init() returns a Promise but the side effect
+(populating process.env) happens early in the async function and
+the rest is just file I/O — fire-and-forget is safe here. If you
+prefer to await it, you'd need to wrap the rest of startup in an
+async IIFE which is a bigger refactor.
+
+────── 2) Add the routes import + mount alongside the others ──────
+
+Top of file, around line 13, you have:
+
+    const authRoutes = require('./routes/auth');
+    const sytistRoutes = require('./routes/sytist');
+
+Add a line right after that:
+
+    const shipstationRoutes = require('./routes/shipstation');
+
+Then later, around line 81-82 you have:
+
+    app.use('/api/auth', authRoutes);
+    app.use('/api/sytist', sytistRoutes);
+
+Add a line right after that:
+
+    app.use('/api/shipstation', shipstationRoutes);
+
+No requireAuth needed at the mount because the routes file
+applies it internally. (You could ALSO add it at the mount
+point as belt-and-suspenders; redundant but harmless.)
+
+════════════════════════════════════════════════════════
+THAT'S IT.
+════════════════════════════════════════════════════════
+
+Net change to server/index.js: +3 functional lines (one import,
+one mount, one init call). Pattern matches how sytistRoutes are
+wired exactly.
+
+If you'd rather paste this for me to do as a precise str-replace
+deploy, I can do that too — just say the word.
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-13a-hotfix-3.tar.gz --strip-components=1
+
+  # Then edit server/index.js per the diff above.
+
+  # Restart the server (Ctrl-C if running, then npm run dev).
+  # Hard refresh the browser (Ctrl+Shift+R).
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+After deploy + server restart:
+
+  1. Open Settings → API Keys. The form should now render with:
+       ShipStation section: API Key, API Secret, Base URL
+       Shipping defaults section: Carrier, Service, Package,
+                                  Weight, Length, Width, Height
+     If you still see "Not found," the server didn't pick up the
+     new route — verify the index.js edits and check the server
+     log for require errors.
+
+  2. Paste your ShipStation API key + secret. Click "Save changes."
+     Banner: "Saved at HH:MM:SS." Secrets re-mask to ••••••••.
+
+  3. Open any order. The "Shipping" card should now show real
+     eligibility info (or the eligible-form, depending on the
+     order's contents).
+
+  4. For a ship_to_home order with physical items, click "Send
+     to ShipStation." Card flips to "✓ Sent — SS#NNNN" with
+     Re-fetch / Mark shipped / Delete buttons.
+
+═══════════════════════════════════════════════════════
+DESIGN NOTE: WHY ROUTE FILE OWNS THE AUTH
+═══════════════════════════════════════════════════════
+
+I had two patterns to choose from:
+
+  (a) Apply requireAuth at the mount point in server/index.js
+  (b) Apply requireAuth inside the route file with router.use()
+
+I went with (b) because:
+
+  - It matches how routes/sytist.js does it (consistency)
+  - It eliminates a class of mistake: forgetting to add the
+    auth middleware at mount time, leaving endpoints public
+  - The Phase 13a deploy notes asked you to add requireAuth
+    at the mount, which means it WAS the operator's job to
+    get this right — moving it inside the route file makes
+    that job impossible to forget
+
+Trade-off: if someone in the future wants ONE route in this
+file to be public (e.g. an unauthenticated webhook from
+ShipStation), they'd need to put it ABOVE the router.use()
+line. That's the same constraint sytist.js handles for its
+public preview endpoint, and it's well-precedented.

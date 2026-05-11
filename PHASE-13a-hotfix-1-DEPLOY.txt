@@ -1,0 +1,94 @@
+Phase 13a hotfix #1 — clearer error state on Shipping card
+
+═══════════════════════════════════════════════════════
+THE PROBLEM
+═══════════════════════════════════════════════════════
+
+When /api/shipstation/orders/:orderId/status returns an error
+(e.g. 404 because the routes aren't mounted yet), the Shipping
+card was rendering BOTH the error AND a misleading "Not eligible:
+Status unavailable" line that looked like a legitimate eligibility
+verdict.
+
+Two issues with that:
+  - Looks like the order isn't eligible, when really we just
+    couldn't ASK whether it's eligible
+  - No retry path, and no hint about what to do
+
+═══════════════════════════════════════════════════════
+THE FIX
+═══════════════════════════════════════════════════════
+
+When status is null AND error is set, render a dedicated error
+state instead of falling through to the eligibility branch:
+
+  ┌──────────────────────────────────────────────┐
+  │ Shipping                          ShipStation│
+  │                                              │
+  │ Couldn't load ShipStation status: Not found  │
+  │                                              │
+  │ If you see "Not found" here, the ShipStation │
+  │ routes probably aren't mounted in            │
+  │ server/index.js yet — see the Phase 13a      │
+  │ deploy notes. Otherwise, check the server    │
+  │ log for details.                             │
+  │                                              │
+  │ [Retry]                                      │
+  └──────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/pages/OrderDetailPage.js
+    + New !status && error branch in ShippingBlock that
+      renders an explicit error card with a Retry button.
+    + Old fall-through to "Not eligible: Status unavailable"
+      no longer fires when the request fails — that path
+      only renders when we got a successful response with
+      eligibility={eligible:false}.
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-13a-hotfix-1.tar.gz --strip-components=1
+
+Client-only. Ctrl+Shift+R.
+
+═══════════════════════════════════════════════════════
+BUT YOU STILL NEED TO FIX THE UNDERLYING SERVER ISSUE
+═══════════════════════════════════════════════════════
+
+This hotfix only improves the error display. The reason you're
+SEEING that error is that /api/shipstation/* is returning 404 —
+the routes aren't mounted on the server.
+
+Open server/index.js and find the section where other routes
+are registered (look for app.use('/api/sytist', ...) or similar).
+Add these two things:
+
+1) Near the top, after appSettings or other startup, BEFORE
+   other route registration:
+
+      await require('./config/appSettings').init();
+
+   (If your startup is sync, you can drop the await — init()
+   is safe to fire-and-forget; it just won't be finished by
+   the time the first request hits.)
+
+2) Alongside the other app.use('/api/...') calls:
+
+      app.use(
+        '/api/shipstation',
+        requireAuth,
+        require('./routes/shipstation')
+      );
+
+   Use whatever middleware variable name your other authed
+   routes use. The pattern should match.
+
+Then restart the server. After Ctrl+Shift+R the Shipping card
+should load real status / eligibility instead of the error.

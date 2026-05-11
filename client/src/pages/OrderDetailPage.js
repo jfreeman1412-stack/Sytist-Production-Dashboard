@@ -112,6 +112,12 @@ export default function OrderDetailPage() {
         galleryId={order.galleryId}
       />
 
+      {/* Phase 13a: ShipStation integration. Renders status of the
+          order's relationship to ShipStation — eligible / not yet
+          sent / sent / shipped — and provides controls to send and
+          mark-as-shipped manually. */}
+      <ShippingBlock order={order} />
+
       <div style={twoColumnStyle}>
         <CustomerBlock customer={order.customer} />
         <ShipToBlock shipTo={order.shipTo} />
@@ -2320,6 +2326,694 @@ function LogoWarningBanner({ galleryId }) {
     </div>
   );
 }
+
+// ──────────────────────────────────────────────────────────
+// ShippingBlock (Phase 13a — ShipStation integration)
+// ──────────────────────────────────────────────────────────
+//
+// Renders the order's ShipStation status with controls to send,
+// re-fetch, delete, and manually mark-shipped. Three visual states:
+//
+//   1. Not linked + ineligible → muted info card, no controls
+//   2. Not linked + eligible   → form with carrier/service/weight/dims
+//                                + "Send to ShipStation" button
+//   3. Linked (sent)           → status panel with re-fetch + delete
+//   4. Shipped                 → ✓ banner with carrier + tracking
+//
+// On mount, hits /api/shipstation/orders/:orderId/status to figure
+// out which state we're in. Re-fetches after any action.
+
+function ShippingBlock({ order }) {
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [status, setStatus] = useState(null);
+
+  // Form values for the "Send" action. Initialized from app-settings
+  // defaults once, then operator can override per-send. Not stored
+  // back to settings — that'd require explicit "Save defaults"
+  // controls, out of scope for 13a.
+  const [carrierCode, setCarrierCode] = useState('');
+  const [serviceCode, setServiceCode] = useState('');
+  const [packageCode, setPackageCode] = useState('');
+  const [weightOz, setWeightOz] = useState('');
+  const [dimLength, setDimLength] = useState('');
+  const [dimWidth, setDimWidth] = useState('');
+  const [dimHeight, setDimHeight] = useState('');
+  const [defaultsLoaded, setDefaultsLoaded] = useState(false);
+
+  // Action state
+  const [sending, setSending] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [markingShipped, setMarkingShipped] = useState(false);
+
+  // Mark-shipped form (collapsed by default)
+  const [showShipForm, setShowShipForm] = useState(false);
+  const [shipTrackingNumber, setShipTrackingNumber] = useState('');
+  const [shipCarrier, setShipCarrier] = useState('usps');
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchStatus();
+    fetchDefaults();
+    return () => {
+      cancelled = true;
+    };
+
+    async function fetchStatus() {
+      try {
+        const data = await api.get(
+          `/api/shipstation/orders/${order.orderId}/status`
+        );
+        if (cancelled) return;
+        setStatus(data);
+      } catch (err) {
+        if (!cancelled) setError(err.message);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+
+    async function fetchDefaults() {
+      // Pull app-settings to populate the form's initial values. Only
+      // does this once — re-renders shouldn't clobber operator edits.
+      try {
+        const data = await api.get('/api/shipstation/app-settings');
+        if (cancelled) return;
+        const s = data.settings || {};
+        setCarrierCode(s.defaultCarrier?.value || 'stamps_com');
+        setServiceCode(s.defaultService?.value || 'usps_first_class_mail');
+        setPackageCode(s.defaultPackageCode?.value || 'large_envelope_or_flat');
+        setWeightOz(s.defaultWeightOz?.value || '4');
+        setDimLength(s.defaultLengthIn?.value || '10');
+        setDimWidth(s.defaultWidthIn?.value || '8');
+        setDimHeight(s.defaultHeightIn?.value || '0.5');
+        setDefaultsLoaded(true);
+      } catch (err) {
+        // Soft-fail: fall back to hard-coded defaults so the form
+        // still works even if the settings endpoint isn't reachable.
+        if (!cancelled) {
+          setCarrierCode('stamps_com');
+          setServiceCode('usps_first_class_mail');
+          setPackageCode('large_envelope_or_flat');
+          setWeightOz('4');
+          setDimLength('10');
+          setDimWidth('8');
+          setDimHeight('0.5');
+          setDefaultsLoaded(true);
+        }
+      }
+    }
+  }, [order.orderId]);
+
+  async function refreshStatus() {
+    try {
+      const data = await api.get(
+        `/api/shipstation/orders/${order.orderId}/status`
+      );
+      setStatus(data);
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function handleSend() {
+    if (
+      !window.confirm(
+        `Send order ${order.orderNumber || order.orderId} to ShipStation?`
+      )
+    ) {
+      return;
+    }
+    setSending(true);
+    setError(null);
+    try {
+      const overrides = {
+        carrierCode,
+        serviceCode,
+        packageCode,
+        weight: { value: parseFloat(weightOz) || 0, units: 'ounces' },
+        dimensions: {
+          length: parseFloat(dimLength) || 0,
+          width: parseFloat(dimWidth) || 0,
+          height: parseFloat(dimHeight) || 0,
+          units: 'inches',
+        },
+      };
+      await api.post(
+        `/api/shipstation/orders/${order.orderId}/create`,
+        overrides
+      );
+      await refreshStatus();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSending(false);
+    }
+  }
+
+  async function handleRefetch() {
+    setRefreshing(true);
+    setError(null);
+    try {
+      await api.post(`/api/shipstation/orders/${order.orderId}/refresh`, {});
+      await refreshStatus();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  async function handleDelete() {
+    if (
+      !window.confirm(
+        `Delete this order from ShipStation? You can re-send it after deletion.`
+      )
+    ) {
+      return;
+    }
+    setDeleting(true);
+    setError(null);
+    try {
+      await api.del(`/api/shipstation/orders/${order.orderId}/link`);
+      await refreshStatus();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  async function handleMarkShipped() {
+    if (!shipTrackingNumber) {
+      setError('Tracking number required');
+      return;
+    }
+    setMarkingShipped(true);
+    setError(null);
+    try {
+      await api.post(
+        `/api/shipstation/orders/${order.orderId}/mark-shipped`,
+        {
+          carrierCode: shipCarrier,
+          trackingNumber: shipTrackingNumber,
+        }
+      );
+      setShowShipForm(false);
+      setShipTrackingNumber('');
+      await refreshStatus();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setMarkingShipped(false);
+    }
+  }
+
+  // ─── render ────────────────────────────────────────────
+
+  if (loading) {
+    return (
+      <div style={containerStyle}>
+        <div style={headerStyle}>Shipping</div>
+        <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Loading…</div>
+      </div>
+    );
+  }
+
+  // CASE: status fetch failed entirely. We have nothing useful to
+  // render — eligibility, linked-state, all of it depend on the
+  // status payload. Show the error honestly and offer a retry rather
+  // than pretending this is a "not eligible" result. The most common
+  // cause is that the /api/shipstation/* routes aren't mounted on the
+  // server yet (see PHASE-13a-DEPLOY.txt for the server/index.js
+  // wiring).
+  if (!status && error) {
+    return (
+      <div style={containerStyle}>
+        <div style={headerRowStyle}>
+          <div style={headerStyle}>Shipping</div>
+          <div
+            style={{
+              fontSize: 11,
+              color: 'var(--text-muted)',
+              textTransform: 'uppercase',
+              letterSpacing: 0.5,
+            }}
+          >
+            ShipStation
+          </div>
+        </div>
+        <div style={shippingErrorBoxStyle}>
+          <strong>Couldn't load ShipStation status:</strong> {error}
+        </div>
+        <div
+          style={{
+            fontSize: 12,
+            color: 'var(--text-muted)',
+            marginBottom: 12,
+            lineHeight: 1.5,
+          }}
+        >
+          If you see <code>Not found</code> here, the ShipStation routes
+          probably aren't mounted in <code>server/index.js</code> yet —
+          see the Phase 13a deploy notes. Otherwise, check the server
+          log for details.
+        </div>
+        <button
+          onClick={async () => {
+            setError(null);
+            setLoading(true);
+            try {
+              const data = await api.get(
+                `/api/shipstation/orders/${order.orderId}/status`
+              );
+              setStatus(data);
+            } catch (err) {
+              setError(err.message);
+            } finally {
+              setLoading(false);
+            }
+          }}
+          style={{
+            background: 'transparent',
+            border: '1px solid var(--border-color)',
+            color: 'var(--text-secondary)',
+            padding: '6px 12px',
+            borderRadius: 6,
+            fontSize: 12,
+            fontWeight: 500,
+            cursor: 'pointer',
+            fontFamily: 'inherit',
+          }}
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  // CASE: linked (already sent to ShipStation)
+  if (status?.linked && status.link) {
+    return (
+      <LinkedShippingPanel
+        link={status.link}
+        error={error}
+        refreshing={refreshing}
+        deleting={deleting}
+        markingShipped={markingShipped}
+        showShipForm={showShipForm}
+        setShowShipForm={setShowShipForm}
+        shipTrackingNumber={shipTrackingNumber}
+        setShipTrackingNumber={setShipTrackingNumber}
+        shipCarrier={shipCarrier}
+        setShipCarrier={setShipCarrier}
+        onRefetch={handleRefetch}
+        onDelete={handleDelete}
+        onMarkShipped={handleMarkShipped}
+      />
+    );
+  }
+
+  // CASE: not linked. Show eligibility and (if eligible) the send form.
+  const eligibility = status?.eligibility || {};
+  const isEligible = !!eligibility.eligible;
+
+  return (
+    <div style={containerStyle}>
+      <div style={headerRowStyle}>
+        <div style={headerStyle}>Shipping</div>
+        <div
+          style={{
+            fontSize: 11,
+            color: 'var(--text-muted)',
+            textTransform: 'uppercase',
+            letterSpacing: 0.5,
+          }}
+        >
+          ShipStation
+        </div>
+      </div>
+
+      {error && (
+        <div style={shippingErrorBoxStyle}>{error}</div>
+      )}
+
+      <div
+        style={{
+          fontSize: 13,
+          color: 'var(--text-secondary)',
+          marginBottom: isEligible ? 16 : 0,
+        }}
+      >
+        <strong style={{ color: isEligible ? '#4caf50' : 'var(--text-muted)' }}>
+          {isEligible ? 'Eligible:' : 'Not eligible:'}
+        </strong>{' '}
+        {eligibility.reason || 'Status unavailable.'}
+        {eligibility.workflow && eligibility.workflow !== 'ship_to_home' && (
+          <div
+            style={{
+              fontSize: 11,
+              color: 'var(--text-muted)',
+              marginTop: 4,
+            }}
+          >
+            Workflow is <code>{eligibility.workflow}</code> — auto-create
+            during processing only fires for ship-to-home orders. You can
+            still send manually below.
+          </div>
+        )}
+      </div>
+
+      {isEligible && defaultsLoaded && (
+        <>
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(3, 1fr)',
+              gap: 12,
+              marginBottom: 12,
+            }}
+          >
+            <FormField label="Carrier code">
+              <TextField value={carrierCode} onChange={setCarrierCode} />
+            </FormField>
+            <FormField label="Service code">
+              <TextField value={serviceCode} onChange={setServiceCode} />
+            </FormField>
+            <FormField label="Package code">
+              <TextField value={packageCode} onChange={setPackageCode} />
+            </FormField>
+          </div>
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(4, 1fr)',
+              gap: 12,
+              marginBottom: 16,
+            }}
+          >
+            <FormField label="Weight (oz)">
+              <TextField
+                value={weightOz}
+                onChange={setWeightOz}
+                type="number"
+              />
+            </FormField>
+            <FormField label="Length (in)">
+              <TextField
+                value={dimLength}
+                onChange={setDimLength}
+                type="number"
+              />
+            </FormField>
+            <FormField label="Width (in)">
+              <TextField
+                value={dimWidth}
+                onChange={setDimWidth}
+                type="number"
+              />
+            </FormField>
+            <FormField label="Height (in)">
+              <TextField
+                value={dimHeight}
+                onChange={setDimHeight}
+                type="number"
+              />
+            </FormField>
+          </div>
+
+          <button
+            onClick={handleSend}
+            disabled={sending}
+            style={{
+              background: '#4a7fc1',
+              border: '1px solid #4a7fc1',
+              color: '#fff',
+              padding: '8px 18px',
+              borderRadius: 6,
+              fontSize: 13,
+              fontWeight: 600,
+              cursor: sending ? 'wait' : 'pointer',
+              fontFamily: 'inherit',
+              opacity: sending ? 0.6 : 1,
+            }}
+          >
+            {sending ? 'Sending…' : 'Send to ShipStation'}
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── sub-component: linked (sent) state ─────────────────────
+
+function LinkedShippingPanel({
+  link,
+  error,
+  refreshing,
+  deleting,
+  markingShipped,
+  showShipForm,
+  setShowShipForm,
+  shipTrackingNumber,
+  setShipTrackingNumber,
+  shipCarrier,
+  setShipCarrier,
+  onRefetch,
+  onDelete,
+  onMarkShipped,
+}) {
+  const isShipped = link.ss_order_status === 'shipped';
+
+  return (
+    <div style={containerStyle}>
+      <div style={headerRowStyle}>
+        <div style={headerStyle}>Shipping</div>
+        <div
+          style={{
+            fontSize: 11,
+            color: 'var(--text-muted)',
+            textTransform: 'uppercase',
+            letterSpacing: 0.5,
+          }}
+        >
+          ShipStation
+        </div>
+      </div>
+
+      {error && <div style={shippingErrorBoxStyle}>{error}</div>}
+
+      {isShipped ? (
+        <div
+          style={{
+            fontSize: 14,
+            color: '#4caf50',
+            marginBottom: 12,
+          }}
+        >
+          <strong>✓ Shipped</strong>
+          {link.tracking_number ? (
+            <>
+              {' — '}
+              <span style={{ color: 'var(--text-primary)' }}>
+                {(link.carrier_code || 'carrier').toUpperCase()}{' '}
+                <code style={{ fontFamily: 'var(--font-mono, monospace)' }}>
+                  {link.tracking_number}
+                </code>
+              </span>
+            </>
+          ) : null}
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+            SS#{link.ss_order_id}
+            {link.shipped_at &&
+              ` · shipped ${new Date(link.shipped_at).toLocaleString()}`}
+          </div>
+        </div>
+      ) : (
+        <div style={{ fontSize: 14, marginBottom: 12 }}>
+          <strong style={{ color: '#4caf50' }}>✓ Sent to ShipStation</strong>{' '}
+          — SS#{link.ss_order_id}
+          <div
+            style={{
+              fontSize: 12,
+              color: 'var(--text-secondary)',
+              marginTop: 4,
+            }}
+          >
+            Status:{' '}
+            <code>{link.ss_order_status || 'unknown'}</code>
+            {link.carrier_code && link.service_code && (
+              <>
+                {' '}
+                · {link.carrier_code}/{link.service_code}
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <SecondaryButton onClick={onRefetch} disabled={refreshing}>
+          {refreshing ? 'Re-fetching…' : 'Re-fetch status'}
+        </SecondaryButton>
+        {!isShipped && (
+          <SecondaryButton
+            onClick={() => setShowShipForm((v) => !v)}
+            disabled={markingShipped}
+          >
+            {showShipForm ? 'Hide' : 'Mark shipped'}
+          </SecondaryButton>
+        )}
+        <SecondaryButton onClick={onDelete} disabled={deleting} danger>
+          {deleting ? 'Deleting…' : 'Delete SS order'}
+        </SecondaryButton>
+      </div>
+
+      {showShipForm && !isShipped && (
+        <div
+          style={{
+            marginTop: 16,
+            padding: 12,
+            background: 'var(--bg-input)',
+            border: '1px solid var(--border-color)',
+            borderRadius: 6,
+            display: 'grid',
+            gridTemplateColumns: '1fr 2fr auto',
+            gap: 8,
+            alignItems: 'end',
+          }}
+        >
+          <FormField label="Carrier">
+            <TextField value={shipCarrier} onChange={setShipCarrier} />
+          </FormField>
+          <FormField label="Tracking number">
+            <TextField
+              value={shipTrackingNumber}
+              onChange={setShipTrackingNumber}
+            />
+          </FormField>
+          <button
+            onClick={onMarkShipped}
+            disabled={markingShipped || !shipTrackingNumber}
+            style={{
+              background: '#4caf50',
+              border: '1px solid #4caf50',
+              color: '#fff',
+              padding: '8px 14px',
+              borderRadius: 6,
+              fontSize: 13,
+              fontWeight: 600,
+              cursor:
+                markingShipped || !shipTrackingNumber ? 'default' : 'pointer',
+              fontFamily: 'inherit',
+              opacity: markingShipped || !shipTrackingNumber ? 0.6 : 1,
+            }}
+          >
+            {markingShipped ? 'Marking…' : 'Mark shipped'}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── small local primitives ─────────────────────────────────
+// Inline rather than pulled from SettingsForm because the order
+// detail page doesn't already import those, and the styling here
+// is slightly different from the settings pages.
+
+function FormField({ label, children }) {
+  return (
+    <label
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 4,
+        fontSize: 11,
+        color: 'var(--text-muted)',
+        textTransform: 'uppercase',
+        letterSpacing: 0.5,
+      }}
+    >
+      {label}
+      {children}
+    </label>
+  );
+}
+
+function TextField({ value, onChange, type = 'text' }) {
+  return (
+    <input
+      type={type}
+      value={value ?? ''}
+      onChange={(e) => onChange(e.target.value)}
+      style={{
+        padding: '6px 10px',
+        background: 'var(--bg-input)',
+        border: '1px solid var(--border-color)',
+        borderRadius: 4,
+        color: 'var(--text-primary)',
+        fontSize: 13,
+        fontFamily: 'inherit',
+        textTransform: 'none',
+        letterSpacing: 0,
+      }}
+    />
+  );
+}
+
+function SecondaryButton({ onClick, disabled, danger, children }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        background: 'transparent',
+        border: `1px solid ${danger ? 'rgba(220,53,69,0.4)' : 'var(--border-color)'}`,
+        color: danger ? '#dc3545' : 'var(--text-secondary)',
+        padding: '6px 12px',
+        borderRadius: 6,
+        fontSize: 12,
+        fontWeight: 500,
+        cursor: disabled ? 'wait' : 'pointer',
+        fontFamily: 'inherit',
+        opacity: disabled ? 0.5 : 1,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+// Shared styles for ShippingBlock + LinkedShippingPanel
+const containerStyle = {
+  marginBottom: 20,
+  padding: 16,
+  background: 'var(--bg-card)',
+  border: '1px solid var(--border-color)',
+  borderRadius: 8,
+};
+const headerStyle = {
+  fontSize: 14,
+  fontWeight: 600,
+};
+const headerRowStyle = {
+  display: 'flex',
+  justifyContent: 'space-between',
+  alignItems: 'center',
+  marginBottom: 12,
+};
+const shippingErrorBoxStyle = {
+  marginBottom: 12,
+  padding: '8px 12px',
+  background: 'rgba(220,53,69,0.08)',
+  border: '1px solid rgba(220,53,69,0.3)',
+  borderRadius: 6,
+  color: '#dc3545',
+  fontSize: 12,
+};
 
 function ProcessResultDisplay({ result }) {
   const allOk = result.subOrders.every((s) => s.success);
