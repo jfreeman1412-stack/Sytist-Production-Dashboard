@@ -1,0 +1,145 @@
+Phase 11e — un-watermarked player photo + correct layer order during drag
+
+═══════════════════════════════════════════════════════
+TWO BUGS FROM YOUR SCREENSHOT
+═══════════════════════════════════════════════════════
+
+BUG 1: Watermarked player photo.
+  The live overlay was using `largeUrl` from the line item. Turns
+  out `largeUrl` is the watermarked version (Sportsline Photography
+  watermark across the player). Operators were dragging a
+  watermarked photo around — confusing about what the actual render
+  will look like.
+
+  Fix: Switch to `fullUrl` (the un-watermarked original). May be
+  2-5MB but loads once and the browser caches it; subsequent
+  drag/scale is instant from cache. The composite engine also uses
+  `fullUrl` for the real render, so we're now using the same
+  source image.
+
+BUG 2: Player photo drawing ON TOP of graphics/logos/text.
+  The live overlay rendered the player at its slot's SVG position,
+  but it appeared above other slots that were SUPPOSED to be layered
+  on top in the JSON order. Why: in backdrop mode, the canvas
+  suppresses inline rendering for graphics, logos, and text (they're
+  "already in the backdrop"). So the live player overlay paints
+  onto an effectively empty SVG layer with no graphics/text/logo
+  pixels above it to cover the player as it moves.
+
+  Fix: When live overlays are active (i.e., the override editor is
+  using the canvas), the canvas ALSO renders inline:
+    - Static graphics (already had URLs)
+    - Logo (new — passed via logoUrl prop, fetched from the
+      existing public gallery-assets/logos preview endpoint)
+    - Text content (already had the text in slot.text — just
+      stopped suppressing it)
+
+  With those all rendering at their slot positions in JSON array
+  order, SVG natural paint order handles layering correctly. The
+  player photo paints first, then teamPhoto outline, then graphic
+  image, then logo image, then text — text on top, player at the
+  bottom of the stack.
+
+═══════════════════════════════════════════════════════
+WHAT YOU'LL SEE
+═══════════════════════════════════════════════════════
+
+Drag the player photo:
+  - No watermark on the moving photo
+  - When you drag it into an area where the graphic, logo, or text
+    is supposed to be on top, those elements actually cover the
+    player photo as expected
+  - Layer order matches what the final composite will look like
+
+The server backdrop still loads underneath as a reference (1.5s
+debounce). It refreshes after you stop dragging. But during the
+drag, the canvas is fully WYSIWYG via live SVG rendering — what
+you see while dragging IS the layer order the render will produce.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/components/LayoutCanvas.js
+    + New logoUrl prop
+    + liveOverlaysActive flag (true when any live URL provided)
+    + In backdrop mode, when liveOverlaysActive:
+      - Static graphics render inline (not suppressed)
+      - Logo slots render the logoUrl inline
+      - Text slots render their text content (not suppressed)
+    + Designer-mode behavior preserved (no live URLs → all the
+      existing suppression still applies, no double-drawing in
+      backdrop preview)
+
+  client/src/pages/settings/OverrideEditorPage.js
+    + Switch from largeUrl to fullUrl for player photo + background
+    + Pass logoUrl built from the order's galleryId
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-11e.tar.gz --strip-components=1
+
+No server changes. Ctrl+Shift+R.
+
+Note: the first time the editor opens for an order, the un-
+watermarked fullUrl will need to download from S3 — typically
+2-5MB. That's a one-time cost per order; subsequent edits use
+the browser cache. If you see a brief delay before the player
+photo appears on first load, that's why.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+  1. Open an override editor with a layout that has BOTH a player
+     photo AND a static graphic AND a logo AND text.
+  2. The player photo should appear WITHOUT a watermark.
+  3. Drag the player photo around the canvas.
+  4. When you drag it into the area where the graphic / logo /
+     text is positioned, those elements should appear ON TOP of
+     the player, not under it.
+  5. Layer order in the layers panel matches what you see on
+     canvas.
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+✓ Live overlays active → all elements render inline
+✓ Layer order: player photo → static graphic → logo → text
+  (each subsequent layer paints over the previous)
+✓ Designer mode unchanged: live URLs absent → suppression
+  preserved, backdrop renders normally
+✓ Backdrop still loads alongside (server validation)
+
+═══════════════════════════════════════════════════════
+KNOWN LIMITATIONS / FUTURE
+═══════════════════════════════════════════════════════
+
+- TEAM PHOTO doesn't have a live overlay yet. If you drag the
+  team photo slot, the OUTLINE follows the cursor but the actual
+  team photo doesn't move until the backdrop refreshes. We'd need
+  to expose a public team-photo preview endpoint to support this.
+  Add it if dragging team photo becomes a real workflow need.
+
+- BACKDROP RENDERING during the override editor session is still
+  running (debounced 1.5s after edits). It's mostly redundant now
+  since the canvas renders everything live. Could remove it
+  entirely to save server load, but it serves as a visual sanity
+  check (does the SVG approximation match the real render?). For
+  now, keeping it.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 11           Per-order layout overrides
+✓ 11a          Blank page fix + in-editor switcher
+✓ 11b          Layers panel
+✓ 11c          Auto-lock + click-through
+✓ 11d          Live photo overlay during drag
+✓ 11e          Un-watermarked + layer-order fix ← here

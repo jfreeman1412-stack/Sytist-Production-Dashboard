@@ -1,0 +1,307 @@
+Phase 11 — per-order layout overrides
+
+═══════════════════════════════════════════════════════
+WHAT THIS DELIVERS
+═══════════════════════════════════════════════════════
+
+A new "Order Overrides" feature for fixing one-off layout issues
+without modifying the underlying layout. When a customer's photo
+crops poorly, the player is positioned awkwardly, etc., the operator:
+
+  1. Opens Settings → Order Overrides
+  2. Types the order ID, clicks Load
+  3. Picks the line item that needs fixing
+  4. Lands in the override editor — same canvas as the layout
+     designer, but trimmed for fast adjustments
+  5. Drags slots, scrolls the mouse wheel to scale them, nudges
+     x/y/w/h numerically in the side panel
+  6. Clicks Apply (Overwrite) or Apply (Reprint)
+
+The original layout is NEVER modified. Other orders keep using it
+normally. The override is a snapshot of the layout JSON saved
+against (orderId, cartId).
+
+═══════════════════════════════════════════════════════
+TWO APPLY MODES
+═══════════════════════════════════════════════════════
+
+APPLY (OVERWRITE):
+  Use when the order hasn't been printed yet — the printer noticed
+  the issue and wants the bad output replaced. The composite image
+  is rerendered with the override applied, written to the SAME
+  filename as the original. The existing whole-order .txt file
+  doesn't change because it already references that filename. The
+  printer reloads and gets the corrected image.
+
+APPLY (REPRINT):
+  Use when the order already printed and one item needs a redo.
+  A new composite is written with a "_REPRINT" suffix in the same
+  output folder. A new single-item .txt file is also written next
+  to it (also with _REPRINT in the name, plus the cart ID for
+  uniqueness). The original files are untouched. The new .txt
+  preserves the original line item's qty.
+
+REMOVE OVERRIDE:
+  Deletes the saved override AND re-renders with the original
+  layout to restore the on-disk image to its pre-override state.
+  Confirmation prompt before removing.
+
+═══════════════════════════════════════════════════════
+EDITOR UX DIFFERENCES VS LAYOUT DESIGNER
+═══════════════════════════════════════════════════════
+
+Smaller, faster, fewer knobs:
+
+  - Real-data preview is the default and only mode (operators are
+    fixing a specific customer's render — placeholder mode would
+    defeat the purpose)
+  - Mouse wheel over the canvas scales the selected slot (5% per
+    notch, scales around slot center, respects sheet bounds)
+  - Click any slot to select; drag to move; edge handles still
+    work for resize
+  - Quick-edit panel only exposes x/y/w/h numerically, plus
+    fontSize for text slots. Font family/color/weight are not
+    editable here — those are layout-level decisions; if they
+    need to change for an order, fix the layout itself
+  - No variant picker — the variant is fixed at override creation
+    (matched to the player photo's orientation)
+  - No add/delete slots — overrides are about nudging existing
+    slots, not restructuring the layout
+
+═══════════════════════════════════════════════════════
+DRIFT DETECTION
+═══════════════════════════════════════════════════════
+
+If the underlying base layout has been modified since the override
+was created, a banner appears in the editor telling the operator.
+The override still works (snapshot semantics — the override has
+its own copy of the layout JSON). The banner just informs.
+
+To start fresh from the current layout, click "Remove override"
+first, then create a new one.
+
+═══════════════════════════════════════════════════════
+STORAGE
+═══════════════════════════════════════════════════════
+
+Overrides live in a new SQLite table `order_overrides` in the
+existing dashboard auth database at:
+
+  server/config/sytist-dashboard.db
+
+Schema (created automatically on first server start, idempotent):
+
+  CREATE TABLE order_overrides (
+    order_id INTEGER NOT NULL,
+    cart_id INTEGER NOT NULL,
+    layout_id TEXT NOT NULL,
+    variant TEXT NOT NULL,
+    layout_snapshot TEXT NOT NULL,
+    original_composite_filename TEXT,
+    reprint_composite_filename TEXT,
+    created_at TEXT NOT NULL,
+    created_by TEXT,
+    updated_at TEXT,
+    PRIMARY KEY (order_id, cart_id)
+  );
+
+The Sytist MySQL DB is NOT touched. Per project rules, that DB
+remains read-only except for status updates that already exist.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+NEW:
+  server/services/orderOverrideService.js     CRUD on the SQLite
+                                              table; snapshot helpers
+  client/src/pages/settings/OrderOverridesPage.js
+                                              Order picker landing
+                                              page (mirrors the
+                                              Phase 10a designer
+                                              picker pattern)
+  client/src/pages/settings/OverrideEditorPage.js
+                                              The trimmed-down
+                                              designer — canvas,
+                                              quick-edit panel,
+                                              three action buttons
+
+MODIFIED:
+  server/routes/sytist.js                     5 new endpoints:
+                                                GET /overrides/:o/:c
+                                                GET /overrides/by-order/:o
+                                                POST /overrides/:o/:c
+                                                DELETE /overrides/:o/:c
+                                                POST /overrides/:o/:c/render
+                                              Plus shared helper
+                                              renderOverrideForOrder()
+                                              that fetches order assets
+                                              and dispatches to the
+                                              composite engine.
+
+  client/src/components/LayoutCanvas.js       New enableWheelScale prop
+                                              (off by default). When
+                                              true, mouse wheel over
+                                              the SVG scales the
+                                              selected slot 5% per
+                                              notch around slot center.
+
+  client/src/components/AppLayout.js          Added 2 routes:
+                                                /settings/overrides
+                                                /settings/overrides/:o/:c
+
+  client/src/pages/settings/SettingsLayout.js Added "Order Overrides"
+                                              sidebar nav link below
+                                              Composites.
+
+7 files total.
+
+═══════════════════════════════════════════════════════
+DEPENDENCIES
+═══════════════════════════════════════════════════════
+
+Uses better-sqlite3, which I'm assuming is already installed
+because the dashboard auth DB at sytist-dashboard.db works. If
+better-sqlite3 is NOT installed for some reason:
+
+  npm install better-sqlite3 --save
+
+If installation fails (needs node-gyp / build tools), let me
+know — the service is structured to gracefully no-op rather
+than crash the server, but the override feature won't work
+until better-sqlite3 builds.
+
+═══════════════════════════════════════════════════════
+PREREQUISITES
+═══════════════════════════════════════════════════════
+
+Phases 10/10a/10b/10c deployed. This phase relies on:
+  - playerBackground slot kind (Phase 10)
+  - Background fetch in preview endpoint (Phase 10b)
+  - The composite preview endpoint (existing, used for live preview)
+  - The /api/sytist/orders/:orderId endpoint (existing)
+  - The /api/sytist/composite/* endpoints (existing)
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-11.tar.gz --strip-components=1
+  npm run dev
+
+The new SQLite table is created automatically the first time the
+server starts — no manual migration needed. Look for this line in
+the server log:
+
+  [orderOverrideService] Initialized at .../sytist-dashboard.db
+
+Then Ctrl+Shift+R in the dashboard to reload the JS bundle. The
+new "Order Overrides" link should appear in the settings sidebar.
+
+═══════════════════════════════════════════════════════
+HOW TO TEST
+═══════════════════════════════════════════════════════
+
+1. Process an order through the normal pipeline so it has a
+   composite output. Find the order ID and look up the cart ID
+   of the photo line item (or use the new picker — see step 3).
+
+2. In the dashboard, navigate to Settings → Order Overrides.
+
+3. Type the order ID, click Load. Line items appear with thumbnails
+   (mirrors the picker from Phase 10a).
+
+4. Click the line item you want to override. The editor opens.
+
+5. The canvas shows the actual rendered composite as the backdrop.
+   Click any slot to select it. Drag to move. Scroll the mouse
+   wheel up/down over the canvas to scale the selected slot.
+
+6. Click "Apply (Overwrite original)" — wait 5-10s for the rerender.
+   The original composite file is replaced with your overridden
+   version. The whole-order .txt is unchanged.
+
+7. To test reprint mode: click "Apply (Reprint single item)" — a
+   new _REPRINT image and a new _REPRINT .txt file are written
+   alongside the originals.
+
+8. To test restoration: click "Remove override". Confirms, deletes
+   the override row, re-renders with the original layout to
+   overwrite the file back to its pre-override state.
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+Server-side:
+  ✓ orderOverrideService: 5/5 tests pass
+    - get() returns null for missing override
+    - upsert() creates with full layout JSON snapshot
+    - get() retrieves and deserializes snapshot
+    - upsert() preserves originalCompositeFilename across updates
+      (the key correctness property — first save wins)
+    - remove() deletes; subsequent get() returns null
+  ✓ All server files parse cleanly
+
+Client-side:
+  ✓ LayoutCanvas renders with enableWheelScale prop
+  ✓ OrderOverridesPage initial render shows order picker, no
+    line items until Load clicked
+  ✓ QuickEditPanel for image slot: X/Y/W/H, no font controls
+  ✓ QuickEditPanel for text slot: X/Y/W/H + Font size only,
+    NO font family/color/weight (per design)
+  ✓ All client files parse cleanly
+
+═══════════════════════════════════════════════════════
+KNOWN GAPS (potential future work)
+═══════════════════════════════════════════════════════
+
+- ENTRY POINT IS DEDICATED PAGE ONLY: no "Fix layout" button on
+  the orders list page. Could add later.
+
+- SINGLE-SLOT SELECT: shift-click multi-select isn't supported
+  (per your decision — skip for v1).
+
+- NO UNDO HISTORY in the editor: if you mess something up, hit
+  refresh — your unsaved canvas changes go away. The saved
+  override state on the server is unaffected by a refresh.
+
+- THE preview ENDPOINT DEBOUNCE IS 500ms: same as the layout
+  designer. Big edits feel responsive. Many tiny edits (e.g.,
+  rapid wheel scrolls) feel laggy because each one waits 500ms
+  before triggering the next preview. Acceptable but could
+  optimize with a higher debounce or by computing preview
+  client-side for some edits.
+
+- REPRINT .TXT FILENAME PATTERN is the original whole-order .txt
+  filename + "_<cartId>_REPRINT" suffix. If the underlying
+  filename pattern changes (operator edits darkroom config),
+  the reprint .txt's stem follows the new pattern automatically
+  since we use darkroomService's normal builder.
+
+═══════════════════════════════════════════════════════
+IMPLEMENTATION NOTES (FOR FUTURE-ME)
+═══════════════════════════════════════════════════════
+
+renderOverrideForOrder() in routes/sytist.js is largely
+duplicate logic with /composite/preview and processingService —
+fetch player photo, fetch team photo, fetch logo, fetch
+background, load static graphics, call buildSheetBuffer. A
+future refactor should extract a shared fetchOrderAssets()
+helper. Three places now do the same dance.
+
+The override snapshots include the FULL layout JSON, not just
+the modified slots. ~10-50KB per override. Hundreds of
+overrides over a year = a few MB. Not a storage concern.
+
+The DELETE handler captures the override row BEFORE deleting
+so the restore step has access to originalCompositeFilename.
+Sequence is order-sensitive — don't reverse it.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 10/10a-c     playerBackground slot + designer integration
+✓ 11           Per-order layout overrides ← here

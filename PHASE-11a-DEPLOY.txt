@@ -1,0 +1,101 @@
+Phase 11a — fix blank page bug + in-editor order switcher
+
+═══════════════════════════════════════════════════════
+WHAT THIS FIXES
+═══════════════════════════════════════════════════════
+
+BUG: blank page after clicking a line item from the picker.
+
+Root cause: response shape mismatch. The composite layout GET
+endpoint returns the layout directly (`res.json(layout)`), but my
+Phase 11 OverrideEditorPage expected `{ layout: ... }`. Result:
+the layout state stayed null, the editor's render guard returned
+null, blank page. No error banner because no error was thrown —
+just a silent null.
+
+Fix:
+  - Treat the response as the layout itself
+  - Use `layoutResp.id` as the validity check
+  - If the response shape really is broken (defensive), set an
+    error instead of going blank
+  - The final fallback render no longer returns null — it shows a
+    "could not load" banner with a back button, so any future
+    silent-null bug is visible instead of invisible
+
+ALSO ADDED: in-editor order switcher.
+
+Before: to fix another order, you had to navigate "Back to order
+picker" → type new order → load → click line item. Four clicks.
+
+Now: a collapsible "Switch to a different order" section at the
+top of the editor. Type order ID, click Load, see line items, click
+one. Two clicks if it's already expanded. The editor re-mounts
+with the new params automatically.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/pages/settings/OverrideEditorPage.js
+    + Layout response shape fix (2 places: drift detection +
+      mapping fallback)
+    + Defensive fallback if layout loads with unexpected shape
+    + Final "blank page" guard replaced with an error banner
+    + New OrderSwitcher component (collapsible, starts collapsed)
+    + Switcher state and loader functions
+    + Switcher wired at top of main render
+
+═══════════════════════════════════════════════════════
+PREREQUISITES
+═══════════════════════════════════════════════════════
+
+Phase 11 deployed.
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-11a.tar.gz --strip-components=1
+
+No server changes, no need to restart the server. Just Ctrl+Shift+R
+in the dashboard to reload the JS bundle.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+THE BLANK PAGE FIX:
+  1. Settings → Order Overrides
+  2. Type an order ID, click Load
+  3. Click a line item (one that should have a mapped layout)
+  4. The editor should now load with the canvas, side panel,
+     and action buttons — not blank.
+  If a line item's SKU has NO composite mapping, you'll now see
+  an error banner explaining that instead of going blank.
+
+THE ORDER SWITCHER:
+  1. From inside the editor, click "▶ Switch to a different order"
+     at the top of the page. It expands.
+  2. Type a new order ID, click Load
+  3. The order's line items appear as a dropdown list
+  4. Click any line item → the editor swaps to that override
+     (current cart line is marked "CURRENT" and not clickable)
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+✓ OrderSwitcher renders collapsed by default
+✓ Shows "Switch to a different order" header
+✓ No input field rendered when collapsed (clean UI)
+✓ QuickEditPanel still intact (didn't break anything else)
+✓ File parses cleanly
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 11           Per-order layout overrides
+✓ 11a          Blank-page fix + in-editor switcher ← here

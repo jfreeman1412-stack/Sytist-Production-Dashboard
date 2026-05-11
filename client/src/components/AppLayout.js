@@ -16,6 +16,8 @@ import ProcessHistoryPage from '../pages/settings/ProcessHistoryPage';
 import GalleryAssetsSettings from '../pages/settings/GalleryAssetsSettings';
 import CompositesSettings from '../pages/settings/CompositesSettings';
 import LayoutDesignerPage from '../pages/settings/LayoutDesignerPage';
+import OrderOverridesPage from '../pages/settings/OrderOverridesPage';
+import OverrideEditorPage from '../pages/settings/OverrideEditorPage';
 
 /**
  * App shell shown to authenticated users.
@@ -97,6 +99,12 @@ export default function AppLayout({ user, onLogout }) {
             <Route
               path="composites/designer/:layoutId"
               element={<LayoutDesignerPage />}
+            />
+            {/* Phase 11: per-order layout overrides */}
+            <Route path="overrides" element={<OrderOverridesPage />} />
+            <Route
+              path="overrides/:orderId/:cartId"
+              element={<OverrideEditorPage />}
             />
             <Route path="process-history" element={<ProcessHistoryPage />} />
           </Route>

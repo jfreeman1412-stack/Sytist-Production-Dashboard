@@ -1,0 +1,102 @@
+Phase 11h — Enter-to-load + larger picker UI
+
+═══════════════════════════════════════════════════════
+TWO IMPROVEMENTS
+═══════════════════════════════════════════════════════
+
+1) ENTER KEY TRIGGERS LOAD
+
+   On both the OrderOverridesPage landing page AND the
+   in-editor "Switch to a different order" panel, pressing
+   Enter inside the Order ID field now triggers Load — same
+   as clicking the button. The landing page's Order ID field
+   also receives autoFocus so the operator can land on the
+   page and just start typing.
+
+   Saves a mouse trip on every order lookup. Operators run
+   this flow repeatedly when working through overrides for
+   different orders.
+
+2) LARGER PICKER UI
+
+   The "Find an order" card and the line items list were
+   small and cramped. Bumped up:
+
+   - Order ID input:   fontSize 13 → 16, padding 8 → 10/12
+   - Load button:      fontSize 13 → 15, padding 8/14 → 11/22
+   - Line item rows:   thumbnails 56→88px (landing) / 44→72px (switcher)
+                       padding 10/12 → 14/16
+                       gap 12 → 16
+   - Item title:       fontSize 13 → 16 (landing) / 12 → 15 (switcher)
+                       added 3px bottom margin so subtitle has air
+   - Item subtitle:    fontSize 11 → 13 (landing) / 10 → 12 (switcher)
+   - "OVERRIDE" badge: fontSize 10 → 12, more padding
+   - Chevron (›):      fontSize 18 → 22 (landing)
+   - Hint text:        fontSize 12 → 13, hint mentions Enter
+
+   The line items list in the switcher also got a higher
+   maxHeight (320 → 400) since rows are taller.
+
+   Thumbnails now use largeUrl preferentially since thumbUrl
+   at the larger sizes scales poorly. largeUrl is bigger but
+   still fast enough at this resolution.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/components/SettingsForm.js
+    + TextInput now merges caller-supplied `style` on top of
+      baseInputStyle (was: caller style clobbered everything).
+      Backward compatible — existing usages don't pass style.
+
+  client/src/pages/settings/OrderOverridesPage.js
+    + onKeyDown handler on Order ID input — Enter triggers Load
+    + autoFocus on Order ID input
+    + Bigger input, button, line item rows, thumbnails, fonts
+    + Hint text updated to mention Enter
+
+  client/src/pages/settings/OverrideEditorPage.js
+    + onKeyDown handler on the switcher's Order ID input
+    + Bigger switcher input, button, header, line item rows
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-11h.tar.gz --strip-components=1
+
+Client-only. Ctrl+Shift+R.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+LANDING PAGE:
+  1. Settings → Order Overrides
+  2. Cursor should be in the Order ID field automatically
+  3. Type an order ID + Enter — order loads, line items appear
+  4. Items are visibly larger (bigger thumbnails, bigger text)
+
+IN-EDITOR SWITCHER:
+  1. Inside the override editor, click "Switch to a different order"
+  2. Type an order ID + Enter — same flow, line items appear
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+✓ Bigger fontSize:16 on input renders
+✓ Bigger button padding renders
+✓ Hint mentions "press Enter"
+✓ autoFocus attribute applied to landing-page input
+✓ All files parse cleanly
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 11g          Rules-of-hooks fix
+✓ 11h          Enter-to-load + larger picker UI ← here

@@ -18,6 +18,8 @@ const teamPhotoService = require('../services/teamPhotoService');
 const galleryAssetsService = require('../services/galleryAssetsService');
 const compositeService = require('../services/compositeService');
 const compositeGraphicsService = require('../services/compositeGraphicsService');
+// Phase 11: per-order layout overrides
+const orderOverrideService = require('../services/orderOverrideService');
 const { requireAuth, requireRole } = require('../middleware/auth');
 
 // ─── Public routes (registered before auth middleware) ───────
@@ -2207,6 +2209,439 @@ router.post('/composite/preview', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ─── Phase 11: per-order, per-cart-line layout overrides ──────
+//
+// When a customer's photo is positioned poorly by the standard layout,
+// an operator opens the override editor and nudges slot positions/sizes
+// for THAT cart line only. The original layout stays untouched. Other
+// orders keep using it normally.
+//
+// Endpoints:
+//   GET    /overrides/:orderId/:cartId       — fetch existing override
+//   POST   /overrides/:orderId/:cartId       — save (create or update)
+//   DELETE /overrides/:orderId/:cartId       — remove the override
+//   POST   /overrides/:orderId/:cartId/render — apply override and write
+//                                              composite + .txt files.
+//                                              Body: { mode: 'overwrite'|'reprint' }
+//   GET    /overrides/by-order/:orderId      — list overrides for an order
+
+/**
+ * GET /api/sytist/overrides/:orderId/:cartId
+ * Returns the override or null if none exists.
+ */
+router.get('/overrides/:orderId/:cartId', async (req, res) => {
+  try {
+    const orderId = parseInt(req.params.orderId, 10);
+    const cartId = parseInt(req.params.cartId, 10);
+    const override = orderOverrideService.get(orderId, cartId);
+    res.json({ override });
+  } catch (err) {
+    console.error('[sytist/overrides GET]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/sytist/overrides/by-order/:orderId
+ * Light list of overrides for an order — no full snapshots. For
+ * UI badges showing which cart lines have overrides.
+ */
+router.get('/overrides/by-order/:orderId', async (req, res) => {
+  try {
+    const orderId = parseInt(req.params.orderId, 10);
+    const overrides = orderOverrideService.listByOrder(orderId);
+    res.json({ overrides });
+  } catch (err) {
+    console.error('[sytist/overrides by-order GET]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/sytist/overrides/:orderId/:cartId
+ * Body: { layoutId, variant, layoutSnapshot, originalCompositeFilename? }
+ *
+ * Creates or updates an override. layoutSnapshot is the entire layout
+ * JSON, snapshotted at edit time. Original composite filename is set
+ * on first create and preserved across updates.
+ */
+router.post(
+  '/overrides/:orderId/:cartId',
+  requireRole('admin', 'operator'),
+  async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.orderId, 10);
+      const cartId = parseInt(req.params.cartId, 10);
+      const {
+        layoutId,
+        variant,
+        layoutSnapshot,
+        originalCompositeFilename,
+      } = req.body || {};
+      if (!layoutId || !variant || !layoutSnapshot) {
+        return res.status(400).json({
+          error: 'layoutId, variant, layoutSnapshot are required',
+        });
+      }
+      const override = orderOverrideService.upsert({
+        orderId,
+        cartId,
+        layoutId,
+        variant,
+        layoutSnapshot,
+        originalCompositeFilename,
+        createdBy: req.user?.username || null,
+      });
+      res.json({ success: true, override });
+    } catch (err) {
+      console.error('[sytist/overrides POST]', err);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+/**
+ * DELETE /api/sytist/overrides/:orderId/:cartId
+ * Removes the override row. If body has rerenderOriginal=true, also
+ * re-renders the cart line using the ORIGINAL layout (the one mapped
+ * to the SKU) so the on-disk image is restored to a pre-override
+ * state.
+ */
+router.delete(
+  '/overrides/:orderId/:cartId',
+  requireRole('admin', 'operator'),
+  async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.orderId, 10);
+      const cartId = parseInt(req.params.cartId, 10);
+      const { rerenderOriginal } = req.body || {};
+
+      // Capture the override before deleting so we know what filename
+      // to overwrite if rerenderOriginal is requested.
+      const before = orderOverrideService.get(orderId, cartId);
+      const removed = orderOverrideService.remove(orderId, cartId);
+
+      let restoreResult = null;
+      if (removed && rerenderOriginal && before) {
+        try {
+          restoreResult = await renderOverrideForOrder({
+            orderId,
+            cartId,
+            layout: null, // null → use SKU's mapped layout (original)
+            mode: 'overwrite',
+            // Use the captured original filename so we overwrite the
+            // right file, not whatever the renderer would compute.
+            forcedOutputFilename:
+              before.originalCompositeFilename || null,
+          });
+        } catch (err) {
+          // The override IS removed at this point — surface the
+          // restore failure but don't undo the delete.
+          return res.json({
+            success: true,
+            removed: true,
+            restoreError: err.message,
+          });
+        }
+      }
+
+      res.json({
+        success: true,
+        removed,
+        restored: !!restoreResult,
+        restoreResult,
+      });
+    } catch (err) {
+      console.error('[sytist/overrides DELETE]', err);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+/**
+ * POST /api/sytist/overrides/:orderId/:cartId/render
+ * Body: { mode: 'overwrite' | 'reprint' }
+ *
+ * Apply the saved override and write the composite (and .txt for
+ * reprint) to disk.
+ *
+ *   mode='overwrite': writes the composite to the original filename
+ *     under the global output path. The existing whole-order .txt file
+ *     already references that filename, so no .txt change needed.
+ *
+ *   mode='reprint': writes a new composite with _REPRINT suffix in the
+ *     same folder, plus a single-item .txt file pointing to it. The
+ *     reprint qty matches the original cart line's qty.
+ */
+router.post(
+  '/overrides/:orderId/:cartId/render',
+  requireRole('admin', 'operator'),
+  async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.orderId, 10);
+      const cartId = parseInt(req.params.cartId, 10);
+      const { mode } = req.body || {};
+      if (mode !== 'overwrite' && mode !== 'reprint') {
+        return res.status(400).json({
+          error: "mode must be 'overwrite' or 'reprint'",
+        });
+      }
+      const result = await renderOverrideForOrder({
+        orderId,
+        cartId,
+        mode,
+      });
+      res.json({ success: true, ...result });
+    } catch (err) {
+      console.error('[sytist/overrides render POST]', err);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+/**
+ * Shared renderer used by override save+render and override delete+restore.
+ * Pulls the order, line item, photos, and layout (overridden or original);
+ * runs the composite engine; writes outputs.
+ *
+ * Args:
+ *   orderId, cartId — what to render
+ *   layout — optional explicit layout. If null, uses override (if exists)
+ *            else SKU's mapped layout.
+ *   mode — 'overwrite' (replace original file) or 'reprint' (new _REPRINT
+ *          file + single-item .txt)
+ *   forcedOutputFilename — optional. If set, overrides the computed
+ *                          filename. Used for restore-after-delete.
+ *
+ * Returns: { mode, compositeFilename, compositePath, txtPath?, warnings }
+ */
+async function renderOverrideForOrder({
+  orderId,
+  cartId,
+  layout: explicitLayout = null,
+  mode,
+  forcedOutputFilename = null,
+}) {
+  const path = require('path');
+  const fsp = require('fs').promises;
+
+  // ─── Resolve order and line item ──────────────────────
+  const order = await sytistDb.getOrderById(orderId);
+  if (!order) throw new Error(`Order ${orderId} not found`);
+  const lineItem = (order.lineItems || []).find(
+    (li) => String(li.cartId) === String(cartId)
+  );
+  if (!lineItem) {
+    throw new Error(`Cart ${cartId} not found in order ${orderId}`);
+  }
+  if (!lineItem.photo || !lineItem.photo.fullUrl) {
+    throw new Error(`Line item has no player photo URL`);
+  }
+
+  // ─── Resolve layout: explicit > override > mapping ─────
+  let layout = explicitLayout;
+  if (!layout) {
+    const override = orderOverrideService.get(orderId, cartId);
+    if (override) {
+      layout = override.layoutSnapshot;
+    } else {
+      const mapping = await compositeService.findMapping(lineItem.sku);
+      if (!mapping) {
+        throw new Error(
+          `No composite mapping for SKU "${lineItem.sku}" and no override exists`
+        );
+      }
+      layout = await compositeService.getLayout(mapping.layoutId);
+      if (!layout) {
+        throw new Error(`Mapped layout "${mapping.layoutId}" missing`);
+      }
+    }
+  }
+
+  // ─── Fetch player photo, team photo, logo, background ──
+  const playerResp = await fetch(lineItem.photo.fullUrl);
+  if (!playerResp.ok) {
+    throw new Error(`Player photo fetch failed: HTTP ${playerResp.status}`);
+  }
+  const playerPhoto = Buffer.from(await playerResp.arrayBuffer());
+
+  const variant = compositeService.pickVariant(
+    layout,
+    lineItem.photo.width || 0,
+    lineItem.photo.height || 0
+  );
+
+  const teamLookup = await teamPhotoService.findTeamPhoto(
+    lineItem.subGalleryId
+  );
+  let teamPhotoBuffer = null;
+  if (teamLookup.found && teamLookup.photo.fullUrl) {
+    try {
+      const tpResp = await fetch(teamLookup.photo.fullUrl);
+      if (tpResp.ok) {
+        teamPhotoBuffer = Buffer.from(await tpResp.arrayBuffer());
+      }
+    } catch (err) {
+      console.warn(`[Override render] team photo fetch: ${err.message}`);
+    }
+  }
+
+  let logoBuffer = null;
+  const galleryId = lineItem.galleryId || order.galleryId || null;
+  if (galleryId) {
+    logoBuffer = await galleryAssetsService.readLogoBuffer(galleryId);
+  }
+
+  // Background photo (Phase 10 / 10b pattern)
+  const variantDef = layout.variants?.[variant] || { slots: [] };
+  let playerBackgroundBuffer = null;
+  const layoutHasBackgroundSlot = (variantDef.slots || []).some(
+    (s) => s.kind === 'playerBackground'
+  );
+  if (layoutHasBackgroundSlot && lineItem.backgroundPhoto?.fullUrl) {
+    try {
+      const bgResp = await fetch(lineItem.backgroundPhoto.fullUrl);
+      if (bgResp.ok) {
+        playerBackgroundBuffer = Buffer.from(await bgResp.arrayBuffer());
+      }
+    } catch (err) {
+      console.warn(
+        `[Override render] background photo fetch: ${err.message}`
+      );
+    }
+  }
+
+  const tokens = compositeService.buildTokensFromOrder(order, lineItem);
+
+  // Static graphics
+  const graphicsMap = {};
+  const seenKeys = new Set();
+  for (const s of variantDef.slots || []) {
+    if (s.kind !== 'staticGraphic' && s.kind !== 'overlay') continue;
+    const key = s.graphicKey || s.overlayId;
+    if (!key || seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    const meta = layout.graphics ? layout.graphics[key] : null;
+    try {
+      const buf = await compositeGraphicsService.readGraphicBuffer({
+        layoutId: layout.id,
+        key,
+        filename: meta && meta.filename,
+      });
+      if (buf) graphicsMap[key] = buf;
+    } catch {}
+  }
+  tokens.overlays = graphicsMap;
+
+  const result = await compositeService.buildSheetBuffer({
+    layout,
+    variant,
+    playerPhoto,
+    teamPhoto: teamPhotoBuffer,
+    logo: logoBuffer,
+    playerBackground: playerBackgroundBuffer,
+    tokens,
+  });
+
+  // ─── Determine output path + filename ─────────────────
+  // Use the SAME path resolver that the production pipeline uses.
+  // This way overrides land in the same place as normal output.
+  const outputDir = pathsService.resolveFullPath(
+    'downloadBase',
+    order,
+    [] // no folder-sort segments — overrides go to the order's root output
+  );
+  await fsp.mkdir(outputDir, { recursive: true });
+
+  // Compute filenames.
+  const baseFilename =
+    forcedOutputFilename ||
+    `${orderId}_${cartId}_composite_${layout.id}.jpg`;
+  const compositeFilename =
+    mode === 'reprint'
+      ? baseFilename.replace(/\.jpg$/i, '_REPRINT.jpg')
+      : baseFilename;
+  const compositePath = path.win32.join(outputDir, compositeFilename);
+
+  // Write image atomically
+  const tmpPath = compositePath + '.tmp';
+  await fsp.writeFile(tmpPath, result.buffer);
+  await fsp.rename(tmpPath, compositePath);
+
+  // ─── For reprint mode, also write a single-item .txt ───
+  let txtPath = null;
+  if (mode === 'reprint') {
+    // Build a single-line-item view of the order so darkroom's
+    // buildOrderTxt only emits one Qty/Size/Filepath block. Qty is
+    // preserved from the original cart line — operator's intent is
+    // "reprint exactly what the customer ordered, with the corrected
+    // image".
+    const reprintLineItem = {
+      ...lineItem,
+      // Swap the photo's filename so darkroom's Filepath= uses the new
+      // _REPRINT image we just wrote.
+      photo: {
+        ...lineItem.photo,
+        originalFilename: compositeFilename,
+      },
+    };
+    const reprintOrder = {
+      ...order,
+      lineItems: [reprintLineItem],
+    };
+
+    const txtBuild = await darkroomService.buildOrderTxt(reprintOrder, {});
+    if (txtBuild) {
+      // Rename the .txt's path to include a _REPRINT suffix and the
+      // cart ID (so two reprints from the same order don't collide
+      // and so it's distinguishable from the original whole-order .txt).
+      const origTxtPath = txtBuild.filePath;
+      const ext = path.win32.extname(origTxtPath);
+      const baseNoExt = origTxtPath.slice(0, -ext.length);
+      const reprintTxtPath = `${baseNoExt}_${cartId}_REPRINT${ext}`;
+      const reprintTxtFilename = path.win32.basename(reprintTxtPath);
+      const txtBuildAdjusted = {
+        ...txtBuild,
+        filePath: reprintTxtPath,
+        filename: reprintTxtFilename,
+      };
+      const txtResult = await darkroomService.writeTxtFile(
+        txtBuildAdjusted,
+        {}
+      );
+      txtPath = txtResult ? txtResult.filePath : null;
+    }
+
+    // Update the override row with the reprint filename for tracking
+    try {
+      orderOverrideService.setReprintFilename(
+        orderId,
+        cartId,
+        compositeFilename
+      );
+    } catch (e) {
+      // Non-fatal — the file is written, the override row just won't
+      // record it. Surface in warnings.
+      result.warnings = [
+        ...(result.warnings || []),
+        {
+          type: 'override_record_update_failed',
+          message: `Could not record reprint filename: ${e.message}`,
+        },
+      ];
+    }
+  }
+
+  return {
+    mode,
+    compositeFilename,
+    compositePath,
+    txtPath,
+    variant,
+    warnings: result.warnings || [],
+  };
+}
 
 // ─── Composite graphics (Phase 9c) ────────────────────────
 //

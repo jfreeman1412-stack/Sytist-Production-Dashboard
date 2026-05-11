@@ -70,6 +70,29 @@ export default function LayoutCanvas({
   // render normally but ignore mouse interactions.
   hiddenSlots = {},
   lockedSlots = {},
+  // Phase 11: wheel-to-scale. When enabled, mouse wheel over a slot
+  // scales that slot proportionally around the cursor position.
+  // Used by the override editor for fast adjustments. Off by default
+  // — the layout designer doesn't want surprise scaling on scroll.
+  enableWheelScale = false,
+  // Phase 11d: live photo overlays. When supplied, playerPhoto and
+  // playerBackground slots render the actual image inline at their
+  // current position/size — instantly tracking drag/resize. Lets the
+  // operator see where the photo will end up while moving the slot,
+  // without waiting for the server-rendered backdrop to catch up.
+  // The slot still tracks via SVG x/y/w/h, so movement is as fast
+  // as React state updates.
+  livePhotoUrl = null,
+  liveBackgroundUrl = null,
+  // Phase 11e: logo URL. When supplied, logo slots render the actual
+  // logo image inline at slot position. Used together with the live
+  // photo overlay so the logo correctly layers ON TOP of a moving
+  // player photo (when the player drags into the logo's area, the
+  // logo covers it as in the final composite).
+  logoUrl = null,
+  // Phase 11f: team photo URL. Same pattern — when supplied, the
+  // teamPhoto slot renders the actual image inline.
+  liveTeamPhotoUrl = null,
 }) {
   const svgRef = useRef(null);
 
@@ -300,6 +323,45 @@ export default function LayoutCanvas({
     }
   }
 
+  // Phase 11: mouse wheel scales the selected slot proportionally
+  // around its center. Scroll up = bigger, scroll down = smaller.
+  // Step is 5% per wheel notch — feels responsive without being
+  // jumpy. Min size 0.1 inch (same minimum as resize). Max size
+  // limited by the sheet bounds.
+  //
+  // We don't scale around the cursor position because the operator
+  // wants the slot to grow/shrink AT ITS CURRENT POSITION, not jump
+  // toward the cursor. Scaling around center keeps the slot anchored.
+  function handleWheel(e) {
+    if (!enableWheelScale) return;
+    if (!interactive) return;
+    if (selectedIndex === null) return;
+    const slot = slots[selectedIndex];
+    if (!slot) return;
+    if (lockedSlots[selectedIndex] || hiddenSlots[selectedIndex]) return;
+
+    e.preventDefault();
+
+    // 5% scale per wheel tick. Sign convention: deltaY < 0 means
+    // wheel rolled up (toward user) = grow.
+    const factor = e.deltaY < 0 ? 1.05 : 1 / 1.05;
+    const newW = slot.w * factor;
+    const newH = slot.h * factor;
+    const cx = (slot.x || 0) + (slot.w || 0) / 2;
+    const cy = (slot.y || 0) + (slot.h || 0) / 2;
+    let nx = cx - newW / 2;
+    let ny = cy - newH / 2;
+
+    const next = constrainSize({
+      ...slot,
+      x: nx,
+      y: ny,
+      w: newW,
+      h: newH,
+    });
+    onSlotChange(selectedIndex, next);
+  }
+
   return (
     <div
       style={{
@@ -329,6 +391,7 @@ export default function LayoutCanvas({
           }
         }}
         onClick={handleBackgroundClick}
+        onWheel={handleWheel}
         style={{ display: 'block' }}
       >
         {/* Sheet background */}
@@ -394,6 +457,10 @@ export default function LayoutCanvas({
               isLocked={isLocked}
               hasBackdrop={!!backgroundImageDataUrl}
               graphicsUrls={graphicsUrls}
+              livePhotoUrl={livePhotoUrl}
+              liveBackgroundUrl={liveBackgroundUrl}
+              liveTeamPhotoUrl={liveTeamPhotoUrl}
+              logoUrl={logoUrl}
               onMouseDown={
                 isLocked ? null : (e) => startDrag(e, idx, slot)
               }
@@ -440,7 +507,21 @@ export default function LayoutCanvas({
 
 // ─── Sub-components ─────────────────────────────────────────
 
-function SlotShape({ slot, sampleTokens, isSelected, interactive, isLocked, hasBackdrop, graphicsUrls, onMouseDown, onSelect }) {
+function SlotShape({
+  slot,
+  sampleTokens,
+  isSelected,
+  interactive,
+  isLocked,
+  hasBackdrop,
+  graphicsUrls,
+  livePhotoUrl,
+  liveBackgroundUrl,
+  liveTeamPhotoUrl,
+  logoUrl,
+  onMouseDown,
+  onSelect,
+}) {
   const style = SLOT_STYLES[slot.kind] || FALLBACK_STYLE;
   const x = slot.x || 0;
   const y = slot.y || 0;
@@ -470,10 +551,33 @@ function SlotShape({ slot, sampleTokens, isSelected, interactive, isLocked, hasB
   // unless explicitly null), 'not-allowed' when locked.
   const cursor = isLocked ? 'not-allowed' : interactive ? 'move' : 'pointer';
 
+  // Phase 11c: locked slots are CLICK-THROUGH. Setting pointer-events
+  // none on the SVG group lets the browser route clicks to whatever's
+  // underneath, instead of locked slots becoming dead zones. This
+  // matters most in the override editor where overlapping graphics
+  // would otherwise block clicks on the player photo underneath.
+  // Same behavior is fine for the designer — locked there also means
+  // "don't accidentally drag," and you'd want clicks to pass through.
+  const groupStyle = isLocked
+    ? { cursor, pointerEvents: 'none' }
+    : { cursor };
+
+  // Phase 11e: detect override-editor mode by presence of any live
+  // overlay URL. When true, the canvas renders all slot contents
+  // inline (graphics, logos, text) so they layer correctly above
+  // moving player overlays. Otherwise (designer flow), backdrop
+  // mode suppresses those to avoid double-drawing.
+  const liveOverlaysActive = !!(
+    livePhotoUrl ||
+    liveBackgroundUrl ||
+    liveTeamPhotoUrl ||
+    logoUrl
+  );
+
   if (slot.kind === 'text') {
     return (
       <g
-        style={{ cursor }}
+        style={groupStyle}
         onMouseDown={handleMouseDown}
         onClick={handleClick}
       >
@@ -487,9 +591,11 @@ function SlotShape({ slot, sampleTokens, isSelected, interactive, isLocked, hasB
         {/* Phase 9g: skip the rendered text in backdrop mode. The
             backdrop already contains the real text from the server-
             rendered preview, so drawing the placeholder text here
-            would just stack two copies. The dashed outline still
-            shows where the slot is positioned. */}
-        {!hasBackdrop && (
+            would just stack two copies.
+            Phase 11e exception: when live overlays are active
+            (override editor), DO render text so it layers correctly
+            above the moving player photo. */}
+        {(!hasBackdrop || liveOverlaysActive) && (
           <SlotText slot={slot} sampleTokens={sampleTokens} x={x} y={y} w={w} h={h} />
         )}
       </g>
@@ -498,24 +604,61 @@ function SlotShape({ slot, sampleTokens, isSelected, interactive, isLocked, hasB
 
   // Phase 9c: if this is a staticGraphic / overlay slot AND we have a
   // URL for its uploaded image, render the actual image inline so the
-  // operator sees what they're working with. Falls back to the colored
-  // placeholder rect when no upload exists yet.
+  // operator sees what they're working with.
   //
-  // Phase 9g: when a backdrop preview is active, suppress the inline
-  // static-graphic image — it'd duplicate what's already baked into
-  // the backdrop. Slot outline still renders for positioning ref.
+  // Phase 9g: when a backdrop preview is active, the canvas would
+  // normally suppress inline graphics (the backdrop already shows
+  // them). Phase 11e exception: when live photo overlays are in use
+  // (override editor), graphics MUST render inline so they layer
+  // above the moving player photo at the correct SVG z-index. Mode
+  // selection:
+  //   - hasBackdrop + no live overlays  → suppress graphic, just outline
+  //     (designer's "real-data preview" mode — backdrop has it baked in)
+  //   - hasBackdrop + live overlays     → render graphic inline so it
+  //     layers correctly above moving player photo (override editor)
+  //   - no backdrop                     → render graphic inline (designer
+  //     placeholder mode, or graphics-only renders)
   const isStaticGraphic = slot.kind === 'staticGraphic' || slot.kind === 'overlay';
   const graphicKey = slot.graphicKey || slot.overlayId;
   const graphicUrl =
-    isStaticGraphic && graphicKey && graphicsUrls && !hasBackdrop
-      ? graphicsUrls[graphicKey]
+    isStaticGraphic && graphicKey && graphicsUrls
+      ? !hasBackdrop || liveOverlaysActive
+        ? graphicsUrls[graphicKey]
+        : null
       : null;
 
   const labelFontSize = Math.min(w, h) * 0.08;
 
+  // Phase 11d: determine live photo URL for this slot's kind.
+  // When a backdrop preview is active, drawing the actual photo
+  // inside the slot would normally double-up with the backdrop
+  // (the backdrop already shows the photo). BUT during a drag,
+  // the backdrop is stale — it shows the photo at its previous
+  // position. The live overlay tracks the cursor in real time so
+  // the operator can see where the photo will actually end up.
+  // We render it always when a live URL is available for this
+  // slot kind; the extra <image> over the backdrop's stale photo
+  // is acceptable — it's the same image, just in the right place.
+  const livePhotoForThisSlot =
+    slot.kind === 'playerPhoto'
+      ? livePhotoUrl
+      : slot.kind === 'playerBackground'
+      ? liveBackgroundUrl
+      : slot.kind === 'teamPhoto'
+      ? liveTeamPhotoUrl
+      : null;
+
+  // Phase 11e: logo live overlay. When the override editor passes
+  // a logoUrl AND this is a logo slot, render the actual logo at
+  // the slot's coordinates so it correctly layers above a moving
+  // player photo. Same pattern as graphics: only active when the
+  // editor opts in via live overlays.
+  const liveLogoForThisSlot =
+    slot.kind === 'logo' && logoUrl && liveOverlaysActive ? logoUrl : null;
+
   return (
     <g
-      style={{ cursor }}
+      style={groupStyle}
       onMouseDown={handleMouseDown}
       onClick={handleClick}
     >
@@ -532,6 +675,52 @@ function SlotShape({ slot, sampleTokens, isSelected, interactive, isLocked, hasB
         <>
           <image
             href={graphicUrl}
+            x={x} y={y} width={w} height={h}
+            preserveAspectRatio={
+              slot.fit === 'cover'
+                ? 'xMidYMid slice'
+                : 'xMidYMid meet'
+            }
+            opacity={1}
+          />
+          <rect
+            x={x} y={y} width={w} height={h}
+            fill="transparent"
+            stroke={strokeColor}
+            strokeWidth={strokeWidth}
+          />
+        </>
+      ) : liveLogoForThisSlot ? (
+        // Phase 11e: logo live overlay.
+        <>
+          <image
+            href={liveLogoForThisSlot}
+            x={x} y={y} width={w} height={h}
+            preserveAspectRatio={
+              slot.fit === 'cover'
+                ? 'xMidYMid slice'
+                : 'xMidYMid meet'
+            }
+            opacity={1}
+          />
+          <rect
+            x={x} y={y} width={w} height={h}
+            fill="transparent"
+            stroke={strokeColor}
+            strokeWidth={strokeWidth}
+          />
+        </>
+      ) : livePhotoForThisSlot ? (
+        // Phase 11d: live overlay for player photo / background /
+        // team photo. SVG <image> placed at the current slot coords —
+        // tracks drag/resize in real time.
+        // Phase 11f: removed the hasBackdrop requirement. With no
+        // backdrop at all in the override editor, we render the
+        // live photo directly. Layer order is automatic from SVG
+        // paint order (slots later in the JSON array paint on top).
+        <>
+          <image
+            href={livePhotoForThisSlot}
             x={x} y={y} width={w} height={h}
             preserveAspectRatio={
               slot.fit === 'cover'

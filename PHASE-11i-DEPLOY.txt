@@ -1,0 +1,90 @@
+Phase 11i — un-watermarked + bigger thumbnails in pickers
+
+═══════════════════════════════════════════════════════
+WHAT THIS FIXES
+═══════════════════════════════════════════════════════
+
+In 11h I bumped picker thumbnails to 88px (landing) and 72px
+(switcher), but I sourced them from `li.photo.largeUrl` —
+which is the watermarked version. Same mistake I made in the
+override editor in 11d that I fixed in 11e. Pattern:
+"largeUrl" sounds like a sensible default but it's always the
+watermarked one. fullUrl is the un-watermarked original.
+
+═══════════════════════════════════════════════════════
+THE FIX
+═══════════════════════════════════════════════════════
+
+  1. Thumbnail source: fullUrl first, fall back through
+     largeUrl → thumbUrl. Same approach the override editor
+     canvas uses for the live overlay.
+
+  2. Bigger sizes:
+     - Landing page: 88px → 140px (square thumb tile)
+                     padding 14/16 → 16/18, gap 16 → 18
+     - In-editor switcher: 72px → 110px
+                     padding 12/14 → 14/16, gap 14 → 16
+
+═══════════════════════════════════════════════════════
+COST/BENEFIT
+═══════════════════════════════════════════════════════
+
+The fullUrl is the original photo (~2-5MB per item). For an
+order with 6 line items, that's potentially 12-30MB of image
+downloads when the operator clicks Load. In practice:
+  - Browsers parallel-fetch images, so it's fast
+  - Browser caches per URL, so re-loads are instant
+  - Most operators load 1-3 orders per session
+
+Operators get un-watermarked, big-enough-to-see thumbnails.
+The bandwidth tradeoff is worth it.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/pages/settings/OrderOverridesPage.js
+    + Thumbnail source: fullUrl → largeUrl → thumbUrl
+    + Thumbnail size: 88px → 140px
+    + Row padding bumped slightly
+
+  client/src/pages/settings/OverrideEditorPage.js
+    + In-editor switcher: same source fallback
+    + Thumbnail size: 72px → 110px
+    + Row padding bumped slightly
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-11i.tar.gz --strip-components=1
+
+Client-only. Ctrl+Shift+R.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+  1. Settings → Order Overrides → type order ID + Enter
+  2. Line items should appear with large, clear, un-watermarked
+     thumbnails (140px tall)
+  3. Same un-watermarked thumbnails in the in-editor switcher,
+     at 110px
+
+═══════════════════════════════════════════════════════
+HONEST POST-MORTEM
+═══════════════════════════════════════════════════════
+
+Third time I've made the "largeUrl is watermarked" mistake.
+Going to internalize: photoRow.pic_large = watermarked thumb,
+pic_th = watermarked tiny, pic_full = original un-watermarked.
+For anything user-facing, default to fullUrl.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 11h          Enter-to-load + larger picker UI
+✓ 11i          Un-watermarked + bigger thumbnails ← here

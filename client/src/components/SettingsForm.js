@@ -144,7 +144,7 @@ const baseInputStyle = {
   boxSizing: 'border-box',
 };
 
-export function TextInput({ value, onChange, placeholder, monospace, ...rest }) {
+export function TextInput({ value, onChange, placeholder, monospace, style, ...rest }) {
   return (
     <input
       type="text"
@@ -154,6 +154,11 @@ export function TextInput({ value, onChange, placeholder, monospace, ...rest }) 
       style={{
         ...baseInputStyle,
         fontFamily: monospace ? 'var(--font-mono, monospace)' : 'inherit',
+        // Phase 11h: allow callers to override base style (e.g. larger
+        // fontSize/padding for the order-overrides picker). Pull style
+        // out of rest so it doesn't clobber baseInputStyle wholesale —
+        // merge it on top instead.
+        ...(style || {}),
       }}
       {...rest}
     />

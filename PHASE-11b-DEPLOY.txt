@@ -1,0 +1,107 @@
+Phase 11b — layers panel in the override editor
+
+═══════════════════════════════════════════════════════
+THE PROBLEM
+═══════════════════════════════════════════════════════
+
+In the override editor canvas, clicking on the player or team
+photo was selecting the static graphic on top of them instead.
+There was no other way to select a slot, so the player/team
+slots were effectively un-editable when a graphic overlay
+existed.
+
+This was because static graphics are rendered last in the layer
+order (so they appear on top in the composite), which means they
+also sit on top in the SVG and intercept all mouse clicks for
+slots beneath them.
+
+═══════════════════════════════════════════════════════
+THE FIX
+═══════════════════════════════════════════════════════
+
+Added a Layers panel to the editor's right sidebar, above
+"Selected slot."
+
+  - One row per slot
+  - Shows the slot kind (Player photo, Static graphic, Logo, etc.)
+    with a colored swatch matching the canvas swatches
+  - Text slots also show their text content for distinguishing
+    multiple text layers
+  - REVERSE display order — top of the visual stack appears first
+    in the list (same convention as the layout designer's panel)
+  - Click any row to select that layer. Selecting from the panel
+    works even when the slot is fully obscured on canvas.
+
+Canvas click-to-select still works for unobstructed slots — the
+layers panel is the fallback when clicking is blocked by an
+overlapping slot.
+
+═══════════════════════════════════════════════════════
+WHY NOT ALSO MAKE GRAPHICS NON-CLICKABLE
+═══════════════════════════════════════════════════════
+
+I considered making static graphics ignore canvas clicks so
+that clicking through a graphic always lands on the layer
+underneath. It'd be nicer for direct manipulation. But:
+
+  - It complicates the canvas (the override editor would need
+    its own variant of LayoutCanvas behavior)
+  - The layers panel solves the immediate problem cleanly
+  - If you find graphics still get in the way during real use,
+    I can add the click-through behavior as a follow-up
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/pages/settings/OverrideEditorPage.js
+    + New LayersList component
+    + SLOT_KIND_COLORS / SLOT_KIND_LABELS maps (kept inline to
+      avoid coupling to the designer's internals)
+    + Layers section added at top of right-side panel
+    + Updated empty-state message in Selected slot section to
+      mention the new layers panel
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-11b.tar.gz --strip-components=1
+
+No server changes. Just Ctrl+Shift+R to reload the JS bundle.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+1. Open an override that has a static graphic over the player
+   photo
+2. Look at the right sidebar — Layers section appears above
+   Selected slot
+3. Click "Player photo" in the layers list — it selects, the
+   quick-edit panel populates with x/y/w/h, the canvas shows
+   resize handles around the player photo slot
+4. Click "Static graphic" → graphic is selected instead
+5. Edit values, scale with mouse wheel, drag — all works as
+   before, just with reliable selection
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+✓ LayersList renders all slots in correct reverse order
+  (topmost stack layer first in the list)
+✓ Selected layer highlighted with blue tint + left border
+✓ Text slots show their text content as a secondary line
+✓ Empty state shows "No layers in this variant" message
+✓ QuickEditPanel still works as before
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 11           Per-order layout overrides
+✓ 11a          Blank page fix + in-editor switcher
+✓ 11b          Layers panel ← here

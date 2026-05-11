@@ -1,0 +1,88 @@
+Phase 11g — fix React rules-of-hooks error from 11f
+
+═══════════════════════════════════════════════════════
+THE BUG
+═══════════════════════════════════════════════════════
+
+ESLint error from 11f:
+  Line 544:24: React Hook "useMemo" is called conditionally.
+  React Hooks must be called in the exact same order in every
+  component render.
+
+I put the new `graphicsUrls` useMemo AFTER the render guards
+(`if (loading) return ...`, `if (error) return ...`, `if (!layout
+|| !lineItem || !order) return ...`). When those guards fire on
+early renders (before data loads), the useMemo doesn't execute.
+When data is ready and guards pass, the useMemo DOES execute.
+That conditional hook execution is a rules-of-hooks violation
+and React's lint catches it.
+
+Same mistake I made back in 9c-hotfix. Pattern recognition fail.
+
+Also warnings about unused preview state I forgot to clean up
+when removing the backdrop in 11f.
+
+═══════════════════════════════════════════════════════
+THE FIX
+═══════════════════════════════════════════════════════
+
+  - Moved `graphicsUrls` useMemo up to live alongside the other
+    top-of-component hooks (right after `layoutDrifted`, both
+    before the early-return guards).
+  - The useMemo's body returns `{}` when layout isn't loaded yet,
+    so callers downstream get a safe empty map. Subsequent renders
+    after layout loads pick up the populated map via the dep.
+  - Removed dead `previewImageDataUrl` / `previewLoading` /
+    `previewError` / `previewTimerRef` / `previewSeqRef` state.
+    These were leftovers from 11f's backdrop removal — I forgot
+    to clean up the state declarations after removing the effect.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/pages/settings/OverrideEditorPage.js
+    + graphicsUrls useMemo moved above early-return guards
+    + Removed unused preview state (5 declarations)
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-11g.tar.gz --strip-components=1
+
+The server's hot-reload should pick it up; if not, Ctrl+Shift+R
+in the browser.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+  - Webpack compile should succeed with no errors and no warnings
+    (at least none from OverrideEditorPage.js)
+  - Override editor opens normally — no functional change, just
+    a fix to satisfy React's lint
+
+═══════════════════════════════════════════════════════
+HONEST POST-MORTEM
+═══════════════════════════════════════════════════════
+
+When inserting a new hook (useMemo, useEffect, useState, useRef)
+into an existing component, the new hook MUST go above any early
+returns. Got tripped up because the natural place to define
+`graphicsUrls` is right before I use it (near the render JSX), but
+React doesn't allow hooks below conditional returns.
+
+Going forward: when adding a hook, scan upward for early returns.
+If any exist, the new hook goes ABOVE all of them, in the
+"top-of-component hooks" block. Even if it makes the code feel
+slightly less colocated.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 11f          Pure SVG canvas, no backdrop
+✓ 11g          Rules-of-hooks fix ← here

@@ -94,6 +94,7 @@ function Sidebar() {
         <SidebarLink to="specialty" label="Specialty" />
         <SidebarLink to="gallery-assets" label="Gallery Assets" />
         <SidebarLink to="composites" label="Composites" />
+        <SidebarLink to="overrides" label="Order Overrides" />
 
         <div
           style={{

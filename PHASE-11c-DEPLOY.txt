@@ -1,0 +1,155 @@
+Phase 11c — auto-lock graphics + click-through locked slots
+
+═══════════════════════════════════════════════════════
+THE PROBLEM
+═══════════════════════════════════════════════════════
+
+Even with the layers panel from Phase 11b, you couldn't actually
+DRAG the player photo. Selecting "Player photo" from the layers
+panel worked, but as soon as you clicked the canvas to start
+dragging, the click hit the static graphic on top and re-selected
+that instead. You were back to square one — the topmost slot
+intercepting your interaction.
+
+Root cause: in the canvas, locked slots blocked clicks (calling
+stopPropagation), but they also didn't let those clicks fall
+through to the layer beneath. They were a dead zone.
+
+═══════════════════════════════════════════════════════
+THE FIX (two parts)
+═══════════════════════════════════════════════════════
+
+PART 1: Canvas — locked slots are click-through
+
+  Added `pointer-events: none` on the SVG group when a slot is
+  locked. The browser routes clicks past the locked slot to
+  whatever is underneath. The locked slot still renders visually
+  (so the operator sees it as context) but no longer intercepts
+  mouse events.
+
+  This also applies in the layout designer — locked slots there
+  used to be dead zones too. Click-through is the right behavior
+  in both places: "locked" means "protected from edits," which
+  by extension means "shouldn't block edits to other slots."
+
+PART 2: Override editor — auto-lock graphics + backgrounds + a
+        per-layer lock toggle
+
+  When a layout loads in the override editor, slots of kind
+  `staticGraphic`, `overlay`, and `playerBackground` are
+  automatically locked. These are typically background elements
+  that don't need per-order adjustment.
+
+  Each row in the layers panel now has a 🔒/🔓 icon at the right.
+  Click to toggle. Unlock a layer to edit it; lock it again to
+  protect it.
+
+  Locked layers show in the panel with reduced opacity so the
+  operator can see at a glance which layers are protected.
+
+  If you select a locked layer (from the panel or anywhere else),
+  the "Selected slot" section shows "🔒 This layer is locked —
+  click the 🔒 icon in the layers list to unlock" instead of the
+  editable property fields. Prevents accidental edits via the
+  number inputs.
+
+═══════════════════════════════════════════════════════
+WORKFLOW NOW
+═══════════════════════════════════════════════════════
+
+Open an override editor that has a graphic over the player photo:
+
+  Layers (click any row to select)
+  ┌─────────────────────────────────┐
+  │ ▣ Static graphic           🔒  │  ← auto-locked
+  │ ▣ Player photo             🔓  │  ← editable
+  │ ▣ Player background        🔒  │  ← auto-locked
+  └─────────────────────────────────┘
+
+You click the player photo area on the canvas → selects player
+photo (graphic is click-through). Drag → player moves. Wheel
+scrolls → player scales.
+
+If you decide you DO need to adjust the graphic position for
+this one order, click its 🔒 icon. It becomes 🔓. Now canvas
+clicks land on it and you can drag/resize/scale as normal. Lock
+it again afterward to keep it from getting in the way.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/components/LayoutCanvas.js
+    + Locked slots get pointer-events:none on their SVG group
+    + Clicks pass through to layers underneath
+
+  client/src/pages/settings/OverrideEditorPage.js
+    + Per-variant lockedSlotsByVariant state
+    + Auto-lock effect: seeds graphics + playerBackground as
+      locked when a layout first loads (runs once per layout.id
+      change so it doesn't clobber manual unlocks)
+    + toggleSlotLocked function passed to LayersList
+    + LayersList extended: accepts lockedSlots + onToggleLocked
+      props, renders 🔒/🔓 button at right of each row
+    + Locked rows have reduced opacity for visual clarity
+    + Quick-edit panel shows "This layer is locked" notice
+      instead of editable fields when selected slot is locked
+    + LayoutCanvas receives lockedSlots prop
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-11c.tar.gz --strip-components=1
+
+No server changes. Ctrl+Shift+R to reload the JS bundle.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+  1. Open an override editor that has a static graphic over the
+     player photo.
+  2. In the layers panel, "Static graphic" should show 🔒 by
+     default. "Player photo" should show 🔓.
+  3. Click anywhere on the canvas where the graphic is visible.
+     The player photo (underneath) selects, not the graphic.
+  4. Drag the player photo — it should move freely. Mouse wheel
+     scales it.
+  5. Click the 🔒 next to "Static graphic" in the layers panel
+     — it becomes 🔓. Now you can click and drag the graphic too.
+  6. Click 🔓 to re-lock when done.
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+✓ LayersList renders 🔓 on all rows when nothing locked
+✓ LayersList renders 🔒 on locked rows
+✓ Locked rows have reduced opacity
+✓ Lock toggle gracefully hides if onToggleLocked not provided
+✓ Both files parse cleanly
+
+═══════════════════════════════════════════════════════
+ALSO AFFECTS THE LAYOUT DESIGNER (heads-up)
+═══════════════════════════════════════════════════════
+
+The click-through behavior for locked slots is in the shared
+LayoutCanvas, so it also applies in the layout designer. If you
+were used to clicks "absorbing" into locked slots in the
+designer, they'll now pass through to whatever's underneath.
+
+This is the right behavior (and what most graphics tools do —
+locked layers are click-through), but flagging it because it's
+a subtle change to existing functionality you've been using.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 11           Per-order layout overrides
+✓ 11a          Blank page fix + in-editor switcher
+✓ 11b          Layers panel
+✓ 11c          Auto-lock graphics + click-through ← here
