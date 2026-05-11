@@ -1,0 +1,130 @@
+Phase 12 — order detail page polish + logo warning
+
+═══════════════════════════════════════════════════════
+THREE THINGS
+═══════════════════════════════════════════════════════
+
+1) UN-WATERMARKED THUMBNAIL ON ORDER DETAIL PAGE
+
+   The line item thumbnail on the order detail page was using
+   photo.thumbUrl (watermarked). Switched to fullUrl first,
+   falling back through largeUrl → thumbUrl. Same fix that
+   went into the override editor pickers (Phase 11i).
+
+2) REMOVED "GENERATE TEAM DIVIDERS" CHECKBOX
+
+   Dividers are a batch-printing concept — they separate teams
+   when multiple orders print together. At the single-order
+   level they don't apply, so the checkbox was confusing UI.
+   Removed from ProcessOrderBlock; server defaults the flag
+   to false when absent. The dividers FEATURE is preserved
+   server-side for the future multi-order batch flow.
+
+3) LOGO WARNING BANNER
+
+   New banner on the order detail page (just below the Process
+   block) that warns if the order's gallery has no logo set.
+   Catches "operator forgets to upload a logo, then renders a
+   batch of composites with placeholder logos" before any work
+   gets wasted.
+
+   Mechanism:
+     - New server endpoint: GET /api/sytist/gallery-assets/logos/
+       :galleryId/exists → { exists: boolean, filename? }
+       Cheap — just checks meta, no image bytes.
+     - Client component LogoWarningBanner calls the endpoint
+       on mount. Renders nothing while loading, on error, or
+       when logo exists. Shows a red-bordered banner when the
+       logo is definitively missing.
+     - Banner text: "No logo set for this gallery. Any composite
+       that uses a logo slot will render a 'no logo' placeholder.
+       Upload one at Settings → Gallery Assets before processing
+       if a logo is expected."
+
+   Why a banner, not a confirm dialog:
+     - The banner is visible from page load — operator catches
+       it the moment they open the order, not at click time
+     - Doesn't add extra mouse trips for orders where the logo
+       is intentionally absent (rare but possible)
+     - The Process result already shows composite_missing_logo
+       warnings after-the-fact, so this is just earlier signal
+       not a hard block
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/routes/sytist.js
+    + GET /gallery-assets/logos/:galleryId/exists
+
+  client/src/pages/OrderDetailPage.js
+    + Thumbnail src: thumbUrl → fullUrl (with fallback)
+    + Removed generateDivider checkbox + state
+    + Process POST body sent as {} (no flag = server defaults
+      to false; behavior unchanged for single-order)
+    + New LogoWarningBanner component rendered below
+      ProcessOrderBlock
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-12.tar.gz --strip-components=1
+  npm run dev  (or restart whatever you have running)
+
+Server changed, so a restart is needed to pick up the new
+endpoint. Ctrl+Shift+R in the browser afterwards.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+  1. Open an order detail page where the gallery DOES have a
+     logo set. Banner should NOT appear.
+  2. Open an order detail page where the gallery has NO logo
+     set. Red warning banner appears just below the Process
+     block.
+  3. The thumbnail in the line items section should be
+     un-watermarked (open the order detail page for an order
+     where you can recognize the watermark by sight).
+  4. The "Generate team dividers" checkbox is gone from the
+     Process block. The Process button still works the same
+     way; no dividers are generated.
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+✓ Both files parse cleanly
+✓ LogoWarningBanner renders nothing while loading (correct;
+  SSR doesn't trigger effects)
+✓ LogoWarningBanner renders nothing with null galleryId
+
+═══════════════════════════════════════════════════════
+FOLLOW-UP IDEAS
+═══════════════════════════════════════════════════════
+
+- Dashboard summary: list active galleries missing logos.
+  Would need an aggregate endpoint that joins orders/galleries
+  with the gallery-assets table. Separate phase — flag if you
+  want it.
+
+- Process-time confirm: the current confirm dialog doesn't
+  mention the logo state. Could add "(no logo set!)" inline
+  if the banner has fired. Not added now since the banner
+  already does the job and a second prompt would be noise.
+
+- More granular check: only warn if any line item's mapped
+  layout actually USES a logo slot. Skipped because it
+  doubles the implementation complexity for a very narrow
+  false-positive case (gallery has no logo + no layout
+  needs one).
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 11i          Un-watermarked + bigger thumbs
+✓ 12           Order detail polish + logo warning ← here

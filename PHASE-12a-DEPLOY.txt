@@ -1,0 +1,120 @@
+Phase 12a — background photo inset on green-screen line items
+
+═══════════════════════════════════════════════════════
+THE PROBLEM
+═══════════════════════════════════════════════════════
+
+Order detail page thumbnails for green-screen line items
+showed only the raw player photo (with the green still in
+the background). Operator couldn't tell what background the
+customer had chosen — that info was hiding in the underlying
+data but never surfaced in the UI.
+
+═══════════════════════════════════════════════════════
+THE FIX
+═══════════════════════════════════════════════════════
+
+When a line item has a `backgroundPhoto` (i.e., customer
+selected a green-screen background), a small 28×28 inset of
+the chosen background photo now sits in the bottom-right
+corner of the player thumbnail. The operator immediately sees:
+
+  ┌──────────────┐
+  │              │
+  │   PLAYER     │
+  │              │
+  │         ┌──┐ │
+  │         │BG│ │
+  │         └──┘ │
+  └──────────────┘
+
+Why an inset rather than a real composite preview:
+  - The chroma-key (removing green) is a server-side render
+    operation. Doing it client-side would mean either
+    fetching/computing it on every page load (expensive) or
+    adding a new endpoint with caching. Out of scope for a
+    thumbnail.
+  - The inset is honest: it shows both inputs to the
+    composite, which is what the operator actually needs to
+    verify — "right player photo + right background photo."
+  - The green pixels of the player photo are still visible
+    (the inset doesn't try to "fake" the composite), so the
+    operator knows this is a preview of INPUTS, not a final
+    render.
+
+The inset also has its own click-through to open the full-size
+background photo in a new tab (separate from the player's
+click-through), and a tooltip showing the background's
+filename.
+
+Both URLs prefer fullUrl for un-watermarked. Falls back through
+largeUrl → thumbUrl if fullUrl is missing.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/pages/OrderDetailPage.js
+    + LineItemRow now pulls backgroundPhoto from the line item
+    + Uses helper bgUrl / playerUrl with the standard fallback
+      chain (fullUrl → largeUrl → thumbUrl)
+    + New inset <a><img> in bottom-right of the thumbnail
+      container when bgUrl is present
+    + Inset has its own title + click-through to full-size
+      background photo
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-12a.tar.gz --strip-components=1
+
+Client-only. Ctrl+Shift+R.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+  1. Open an order that has a green-screen line item with a
+     selected background.
+  2. The thumbnail should show the player photo (un-watermarked)
+     with a small inset of the background in the bottom-right.
+  3. Hover the inset — tooltip shows the background's filename.
+  4. Click the inset — opens the full-size background in a new
+     tab (separate click target from the player photo).
+  5. Open a regular (non-green-screen) line item. Thumbnail
+     looks the same as before — no inset.
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+✓ Green-screen item: player + background inset both rendered
+  with fullUrl, "Green Screen" chip visible, background
+  tooltip present
+✓ Normal item: player rendered, no background inset, no
+  Green Screen chip
+✓ No-photo item: "no photo" message, no image tags
+✓ File parses cleanly
+
+═══════════════════════════════════════════════════════
+FOLLOW-UP IDEAS (not in this phase)
+═══════════════════════════════════════════════════════
+
+- Actual server-rendered composite preview. Would need:
+    - New endpoint that does the chroma-key + composite
+    - Cache the rendered thumb so subsequent loads are fast
+    - Fall back gracefully if composite fails
+  Worth it if operators want to verify the FINAL output
+  before processing. The inset suffices for "which inputs"
+  but not for "did the chroma-key work right" — that needs
+  the real render.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 12           Order detail polish + logo warning
+✓ 12a          Green-screen background inset ← here

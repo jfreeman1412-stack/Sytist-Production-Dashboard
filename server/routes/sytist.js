@@ -2883,6 +2883,32 @@ router.get('/gallery-assets/logos', async (req, res) => {
 });
 
 /**
+ * GET /api/sytist/gallery-assets/logos/:galleryId/exists
+ *
+ * Phase 12: lightweight check used by the order-detail page to warn
+ * the operator BEFORE they hit Process if the order's gallery has
+ * no logo set. Returns { exists, filename? } — no image bytes, so
+ * cheap to call on page load.
+ */
+router.get('/gallery-assets/logos/:galleryId/exists', async (req, res) => {
+  try {
+    const galleryId = parseInt(req.params.galleryId, 10);
+    if (!galleryId || galleryId <= 0) {
+      return res
+        .status(400)
+        .json({ error: 'galleryId must be a positive integer' });
+    }
+    const meta = await galleryAssetsService.getLogo(galleryId);
+    if (!meta) {
+      return res.json({ exists: false });
+    }
+    res.json({ exists: true, filename: meta.logoFilename || null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
  * POST /api/sytist/gallery-assets/logos/:galleryId
  * Body: { filename: 'logo.png', dataBase64: '...' }
  *

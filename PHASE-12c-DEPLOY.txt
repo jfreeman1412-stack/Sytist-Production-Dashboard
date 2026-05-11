@@ -1,0 +1,75 @@
+Phase 12c — aspect-correct 150px thumbnails
+
+═══════════════════════════════════════════════════════
+WHAT CHANGED
+═══════════════════════════════════════════════════════
+
+Line item thumbnails on the order detail page were locked
+to 80×80, cropping via objectFit:cover. Now they scale to
+150px on the long edge with the short edge respecting the
+photo's native aspect ratio.
+
+  Vertical photo (e.g. 1920×2400): 120×150 tile
+  Horizontal photo (e.g. 4124×3299): 150×120 tile
+  Square photo: 150×150 tile
+  Photo with no width/height in API: fall back to 150×150
+
+Dimensions are computed from photo.width/photo.height in the
+API response BEFORE the image loads, so the page layout
+doesn't shift when the image finishes downloading.
+
+For green-screen items, the background and player still
+stack at the same tile dimensions — the player photo's
+aspect ratio drives the tile, and the background fills it
+behind. Final layout still arranges them per the layout
+slot specs at render time; this is just a thumbnail preview
+of which inputs go together.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/pages/OrderDetailPage.js
+    + LineItemRow computes tileWidth/tileHeight from photo
+      dimensions before render (no layout shift)
+    + Tile container uses tileWidth/tileHeight in place of
+      the hardcoded 80×80
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-12c.tar.gz --strip-components=1
+
+Client-only. Ctrl+Shift+R.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+  1. Open an order with vertical (portrait) photos → tile is
+     taller than wide, ~120 px wide × 150 px tall
+  2. Open an order with horizontal (landscape) photos → tile
+     is wider than tall, ~150 × 120
+  3. Green-screen items still composite the background under
+     the player PNG at the new tile size
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+✓ Vertical 1920×2400 → 120×150 (math correct)
+✓ Horizontal 4124×3299 → 150×120 (math correct)
+✓ Square 2000×2000 → 150×150
+✓ Missing dimensions → 150×150 fallback
+✓ Green-screen composite: tile sized to player aspect,
+  both images present, correct layer order
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 12b          Real stacked composite + slip text
+✓ 12c          150px aspect-correct thumbnails ← here

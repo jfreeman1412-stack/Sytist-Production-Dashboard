@@ -1,0 +1,113 @@
+Phase 12b — actual composite preview + clearer packing slip text
+
+═══════════════════════════════════════════════════════
+TWO FIXES
+═══════════════════════════════════════════════════════
+
+1) REAL COMPOSITE THUMBNAIL FOR GREEN-SCREEN ITEMS
+
+   Phase 12a put the background photo as a small corner inset
+   because I assumed we'd need server-side chroma-keying to
+   really composite a green-screen photo. Wrong assumption —
+   the player photos in this pipeline are already PNGs with
+   the green keyed out (transparent background). So a real
+   composite is trivial: layer the background photo
+   underneath the player PNG, browser handles the alpha.
+
+   Now the green-screen thumbnail shows what the actual
+   render will look like:
+
+     - Background photo fills the 80×80 tile (objectFit:cover)
+     - Player PNG layers on top (objectFit:cover, alpha shows
+       background through transparent regions)
+     - Player's click-through opens the player photo
+       full-size; tooltip names the chosen background
+
+   For non-green-screen items, only the player photo renders
+   (unchanged).
+
+2) CLEARER PACKING SLIP PREVIEW MESSAGE
+
+   The Darkroom TXT preview was saying:
+
+     Packing slip: not included (slip path not given)
+
+   ...which made it sound like the slip was misconfigured or
+   missing. The truth: this is a PREVIEW of the .txt without
+   the slip line, because slip generation only happens at
+   actual processing time. The slip IS included in the .txt
+   that gets written to disk when you click Process.
+
+   New text:
+
+     Packing slip: generated at processing time
+                   (not shown in this preview)
+
+   Same meaning, but doesn't sound like an error.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/pages/OrderDetailPage.js
+    + LineItemRow thumbnail: stacked background + player PNG
+      instead of inset
+    + Tooltip on composite: "Composite preview · Background:
+      <filename> · click to open player photo"
+    + Tooltip on non-composite: unchanged ("Open full-size in
+      new tab")
+    + Darkroom TXT preview "Packing slip:" line rephrased
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-12b.tar.gz --strip-components=1
+
+Client-only. Ctrl+Shift+R.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+  1. Open an order with green-screen items. Thumbnails now
+     show the player photo composited onto the chosen
+     background — what the actual render will look like.
+  2. Open an order with regular (non-green-screen) items.
+     Thumbnails show just the player photo (unchanged).
+  3. Open the Darkroom TXT preview card. Where it used to
+     say "not included (slip path not given)", it should now
+     say "generated at processing time (not shown in this
+     preview)".
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+✓ Green-screen item: background + player both rendered,
+  background BEFORE player in DOM (correct layer order),
+  composite tooltip mentions background filename
+✓ Regular item: only player rendered, only ONE img in
+  thumbnail (no background layer), regular tooltip
+✓ No-photo item: "no photo" placeholder, no images
+✓ File parses cleanly
+
+═══════════════════════════════════════════════════════
+HONEST POST-MORTEM
+═══════════════════════════════════════════════════════
+
+I overcomplicated 12a by assuming the player photos still
+had their green backgrounds. Should have checked the actual
+photo data shape first — the PNG-with-alpha discovery would
+have led me straight to the stacked composite in 12a. Will
+internalize: for compositing questions, check what's actually
+in the photo file before assuming chroma-key work is needed.
+
+═══════════════════════════════════════════════════════
+PHASE STATUS
+═══════════════════════════════════════════════════════
+
+✓ 12a          Background photo inset (superseded)
+✓ 12b          Real stacked composite + slip text ← here

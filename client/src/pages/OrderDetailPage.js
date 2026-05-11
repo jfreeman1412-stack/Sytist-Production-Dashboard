@@ -105,6 +105,13 @@ export default function OrderDetailPage() {
 
       <ProcessOrderBlock order={order} teamCount={teamCount} isBundledHome={isBundledHome} />
 
+      {/* Phase 12: warn if the gallery has no logo set. Composites that
+          include a logo slot will render with a placeholder if no logo
+          is uploaded — usually not what the operator wants. */}
+      <LogoWarningBanner
+        galleryId={order.galleryId}
+      />
+
       <div style={twoColumnStyle}>
         <CustomerBlock customer={order.customer} />
         <ShipToBlock shipTo={order.shipTo} />
@@ -398,6 +405,7 @@ function LineItemList({ lineItems }) {
 
 function LineItemRow({ lineItem }) {
   const photo = lineItem.photo;
+  const backgroundPhoto = lineItem.backgroundPhoto;
   const flags = lineItem.flags || {};
   const flagChips = [];
   if (flags.greenScreen) flagChips.push({ label: 'Green Screen', color: '#37b6cf' });
@@ -408,6 +416,38 @@ function LineItemRow({ lineItem }) {
   if (flags.giftCert) flagChips.push({ label: 'Gift Certificate', color: '#9c6ade' });
   if (flags.fromArchive) flagChips.push({ label: 'Archived Cart', color: '#9e9e9e' });
 
+  // Phase 12a: pick un-watermarked thumbnail URLs for both the
+  // player photo and (if green-screen) the chosen background.
+  const playerUrl = photo
+    ? photo.fullUrl || photo.largeUrl || photo.thumbUrl
+    : null;
+  const bgUrl = backgroundPhoto
+    ? backgroundPhoto.fullUrl ||
+      backgroundPhoto.largeUrl ||
+      backgroundPhoto.thumbUrl
+    : null;
+
+  // Phase 12c: aspect-correct thumbnail dimensions. 150px on the
+  // long edge, the short edge scales to match the photo's native
+  // aspect ratio. Falls back to 150×150 if width/height aren't
+  // known. Computed BEFORE the image loads (we have the dimensions
+  // from the API response), so the page layout doesn't shift when
+  // the image arrives.
+  const LONG_EDGE = 150;
+  let tileWidth = LONG_EDGE;
+  let tileHeight = LONG_EDGE;
+  if (photo && photo.width > 0 && photo.height > 0) {
+    if (photo.width >= photo.height) {
+      // Horizontal or square — width is the long edge.
+      tileWidth = LONG_EDGE;
+      tileHeight = Math.round((LONG_EDGE * photo.height) / photo.width);
+    } else {
+      // Vertical — height is the long edge.
+      tileHeight = LONG_EDGE;
+      tileWidth = Math.round((LONG_EDGE * photo.width) / photo.height);
+    }
+  }
+
   return (
     <div
       style={{
@@ -416,31 +456,74 @@ function LineItemRow({ lineItem }) {
         alignItems: 'flex-start',
       }}
     >
-      {/* Photo thumbnail (left) */}
+      {/* Photo thumbnail (left)
+
+          Phase 12b: when this is a green-screen item, the player photo
+          is already a PNG with the green keyed out (transparent
+          background). So we can render a REAL composite preview by
+          stacking the chosen background photo underneath the player
+          PNG — the browser handles the alpha natively. No chroma-key
+          needed; the keying's already done.
+
+          Layer order in DOM (and z-index by paint order):
+            1. Background photo  — fills the tile, bottom of stack
+            2. Player PNG        — on top, transparency shows through
+
+          For non-green-screen items, only the player photo renders
+          (same behavior as before). */}
       <div
         style={{
+          position: 'relative',
           flexShrink: 0,
-          width: 80,
-          height: 80,
+          width: tileWidth,
+          height: tileHeight,
           background: 'var(--bg-input)',
           border: '1px solid var(--border-color)',
           borderRadius: 4,
           overflow: 'hidden',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
         }}
       >
-        {photo && photo.thumbUrl ? (
+        {/* Background photo — only rendered for green-screen items.
+            Sits underneath the player PNG so its transparent areas
+            reveal it. */}
+        {bgUrl && (
+          <img
+            src={bgUrl}
+            alt=""
+            style={{
+              position: 'absolute',
+              inset: 0,
+              width: '100%',
+              height: '100%',
+              objectFit: 'cover',
+              display: 'block',
+            }}
+          />
+        )}
+
+        {playerUrl ? (
           <a
-            href={photo.fullUrl || photo.largeUrl || photo.thumbUrl}
+            href={playerUrl}
             target="_blank"
             rel="noopener noreferrer"
-            title="Open full-size in new tab"
-            style={{ display: 'block', width: '100%', height: '100%' }}
+            title={
+              bgUrl
+                ? `Composite preview · Background: ${
+                    backgroundPhoto.originalFilename || ''
+                  } · click to open player photo`
+                : 'Open full-size in new tab'
+            }
+            style={{
+              display: 'block',
+              width: '100%',
+              height: '100%',
+              position: 'relative',
+            }}
           >
             <img
-              src={photo.thumbUrl}
+              // Phase 12: prefer fullUrl (un-watermarked original)
+              // over thumbUrl/largeUrl (both watermarked).
+              src={playerUrl}
               alt={photo.originalFilename || ''}
               style={{
                 width: '100%',
@@ -451,7 +534,17 @@ function LineItemRow({ lineItem }) {
             />
           </a>
         ) : (
-          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>no photo</span>
+          <div
+            style={{
+              width: '100%',
+              height: '100%',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+            }}
+          >
+            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>no photo</span>
+          </div>
         )}
       </div>
 
@@ -1047,7 +1140,7 @@ function DarkroomPreviewContent({ data }) {
         <span>
           {data.packingSlip?.included
             ? `included (${data.packingSlip.position})`
-            : 'not included (slip path not given)'}
+            : 'generated at processing time (not shown in this preview)'}
         </span>
       </div>
 
@@ -2013,22 +2106,24 @@ function ImpositionItemRow({ order, lineItem }) {
 // ──────────────────────────────────────────────────────────
 //
 // Prominent top-of-page action: "Process this order". Triggers
-// processingService.processOrder via the API. For sibling non-home
-// orders, shows a checkbox for "Generate team dividers". Result is
-// rendered inline below the button — sub-orders, success/failure,
-// paths to written files, warnings.
+// processingService.processOrder via the API.
+//
+// Phase 12: removed the "Generate team dividers" checkbox from
+// the single-order view. Dividers are a batch-printing concept —
+// they separate teams when multiple orders are printed together,
+// which never happens at the single-order level. The dividers
+// feature is preserved server-side for the future multi-order
+// flow; this just keeps the UI honest about when it applies.
 
 function ProcessOrderBlock({ order, teamCount, isBundledHome }) {
   const [processing, setProcessing] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
-  const [generateDivider, setGenerateDivider] = useState(false);
 
   const isPerTeam =
     !isBundledHome &&
     (order.shipping?.workflow === 'ship_to_managers' ||
       order.shipping?.workflow === 'ship_to_league');
-  const showDividerOption = isPerTeam && teamCount >= 1;
 
   async function handleProcess() {
     if (
@@ -2047,7 +2142,9 @@ function ProcessOrderBlock({ order, teamCount, isBundledHome }) {
     try {
       const response = await api.post(
         `/api/sytist/process/order/${order.orderId}`,
-        { generateDivider }
+        // Phase 12: no generateDivider flag — single-order processing
+        // never produces dividers. Server defaults to false when absent.
+        {}
       );
       setResult(response.result);
     } catch (err) {
@@ -2091,27 +2188,6 @@ function ProcessOrderBlock({ order, teamCount, isBundledHome }) {
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-          {showDividerOption && (
-            <label
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 6,
-                fontSize: 12,
-                cursor: 'pointer',
-                color: 'var(--text-secondary)',
-              }}
-            >
-              <input
-                type="checkbox"
-                checked={generateDivider}
-                onChange={(e) => setGenerateDivider(e.target.checked)}
-                disabled={processing}
-              />
-              Generate team dividers
-            </label>
-          )}
-
           <button
             onClick={handleProcess}
             disabled={processing}
@@ -2149,6 +2225,98 @@ function ProcessOrderBlock({ order, teamCount, isBundledHome }) {
       )}
 
       {result && <ProcessResultDisplay result={result} />}
+    </div>
+  );
+}
+
+// ──────────────────────────────────────────────────────────
+// LogoWarningBanner (Phase 12)
+// ──────────────────────────────────────────────────────────
+//
+// Calls /api/sytist/gallery-assets/logos/:galleryId/exists when
+// mounted. If the gallery has no logo set, surfaces a warning
+// banner above the rest of the page so the operator catches it
+// BEFORE clicking Process. Wasted-render prevention.
+//
+// We don't bother checking whether any line item's layout has a
+// logo slot — that'd require fetching layouts and is more code
+// for the rare case where a gallery legitimately has no logo and
+// no layout uses one. The banner just says "this gallery has no
+// logo" and trusts the operator to know whether that's a problem
+// for these layouts. False positives are cheap (just a heads-up
+// they can ignore); false negatives would mean the wasted render
+// the user wanted to avoid.
+
+function LogoWarningBanner({ galleryId }) {
+  const [status, setStatus] = useState({ loading: true, exists: null });
+
+  useEffect(() => {
+    if (!galleryId) {
+      setStatus({ loading: false, exists: null });
+      return;
+    }
+    let cancelled = false;
+    api
+      .get(
+        `/api/sytist/gallery-assets/logos/${galleryId}/exists`
+      )
+      .then((r) => {
+        if (cancelled) return;
+        setStatus({ loading: false, exists: !!r?.exists });
+      })
+      .catch(() => {
+        // Soft-fail: if the check itself errors, don't display a
+        // false alarm. Worse case the operator processes without
+        // the warning, which is the existing behavior anyway.
+        if (!cancelled) setStatus({ loading: false, exists: null });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [galleryId]);
+
+  // Render nothing while loading, on error, or when the logo
+  // exists. Only display when we've definitively determined the
+  // logo is missing.
+  if (status.loading || status.exists !== false) return null;
+
+  return (
+    <div
+      style={{
+        marginBottom: 20,
+        padding: '12px 16px',
+        background: 'rgba(220, 53, 69, 0.08)',
+        border: '1px solid rgba(220, 53, 69, 0.4)',
+        borderRadius: 8,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 12,
+      }}
+    >
+      <span style={{ fontSize: 24 }}>⚠️</span>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div
+          style={{
+            fontSize: 14,
+            fontWeight: 600,
+            marginBottom: 3,
+            color: '#dc3545',
+          }}
+        >
+          No logo set for this gallery
+        </div>
+        <div
+          style={{
+            fontSize: 12,
+            color: 'var(--text-secondary)',
+          }}
+        >
+          Any composite that uses a logo slot will render a "no logo"
+          placeholder. Upload one at{' '}
+          <strong>Settings → Gallery Assets</strong> before processing
+          if a logo is expected.
+        </div>
+      </div>
     </div>
   );
 }
