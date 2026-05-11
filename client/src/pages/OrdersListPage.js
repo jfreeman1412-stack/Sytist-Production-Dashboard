@@ -511,6 +511,43 @@ export default function OrdersListPage() {
         </div>
       )}
 
+      {/* ─── Results count ──────────────────────────────────
+          Phase 14a: surface the absolute total above the table so
+          operators always know how many orders match their filters,
+          regardless of whether pagination is active. Especially
+          important for the "All" page-size mode where the
+          Pagination component isn't rendered. */}
+      {!loading && !error && (
+        <div
+          style={{
+            fontSize: 12,
+            color: 'var(--text-muted)',
+            marginBottom: 8,
+          }}
+        >
+          {total > 0 ? (
+            <>
+              <strong style={{ color: 'var(--text-secondary)' }}>
+                {total.toLocaleString()}
+              </strong>{' '}
+              order{total === 1 ? '' : 's'} match
+              {workflow !== 'all' ||
+              productionStatus !== 'all' ||
+              galleryId ||
+              subGalleryId ||
+              shippingOption
+                ? ' your filters'
+                : ''}
+              {pageSize !== 'all' &&
+                total > orders.length &&
+                ` (showing ${orders.length} on this page)`}
+            </>
+          ) : (
+            <>No orders match</>
+          )}
+        </div>
+      )}
+
       {/* ─── Results table ──────────────────────────────── */}
       {error && (
         <div
@@ -581,6 +618,7 @@ export default function OrdersListPage() {
               page={page}
               pageSize={parseInt(pageSize, 10)}
               currentBatchSize={orders.length}
+              total={total}
               onPageChange={(p) => updateParam('page', p)}
             />
           )}
@@ -933,13 +971,20 @@ function StatusBadge({ status }) {
   );
 }
 
-function Pagination({ page, pageSize, currentBatchSize, onPageChange }) {
-  // We don't know the absolute total from the server (only the current batch
-  // size), so pagination is "next disabled if batch < pageSize" style. Phase
-  // 12 polish could fetch a total count separately for "Page X of Y" display.
-  const isLastPage = currentBatchSize < pageSize;
+function Pagination({ page, pageSize, currentBatchSize, total, onPageChange }) {
+  // Phase 14a: now that the server returns an absolute total (the
+  // COUNT(*) of matching rows, not just the page batch size), use it
+  // for "X-Y of Z" and to gate the Next button precisely.
+  //
+  // When `total` is unknown (older API responses or pageSize='all'),
+  // we fall back to the pre-14a heuristic: assume there's more if
+  // the current page is full.
+  const hasTotal = Number.isFinite(total) && total >= 0;
   const startNum = (page - 1) * pageSize + 1;
   const endNum = startNum + currentBatchSize - 1;
+  const isLastPage = hasTotal
+    ? endNum >= total
+    : currentBatchSize < pageSize;
 
   return (
     <div
@@ -954,7 +999,18 @@ function Pagination({ page, pageSize, currentBatchSize, onPageChange }) {
     >
       <div>
         {currentBatchSize > 0 ? (
-          <>Showing {startNum}–{endNum}</>
+          hasTotal ? (
+            <>
+              Showing {startNum}–{endNum} of{' '}
+              <strong style={{ color: 'var(--text-secondary)' }}>
+                {total.toLocaleString()}
+              </strong>
+            </>
+          ) : (
+            <>Showing {startNum}–{endNum}</>
+          )
+        ) : hasTotal ? (
+          <>0 of {total.toLocaleString()}</>
         ) : (
           <>—</>
         )}
@@ -975,7 +1031,13 @@ function Pagination({ page, pageSize, currentBatchSize, onPageChange }) {
             color: 'var(--text-secondary)',
           }}
         >
-          Page {page}
+          {hasTotal && pageSize > 0 ? (
+            <>
+              Page {page} of {Math.max(1, Math.ceil(total / pageSize))}
+            </>
+          ) : (
+            <>Page {page}</>
+          )}
         </div>
         <button
           onClick={() => onPageChange(page + 1)}
