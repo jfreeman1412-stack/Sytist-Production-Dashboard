@@ -1,5 +1,5 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { useParams, useNavigate, Link } from 'react-router-dom';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { useParams, useNavigate, useSearchParams, Link } from 'react-router-dom';
 import api from '../services/api';
 
 /**
@@ -21,20 +21,47 @@ import api from '../services/api';
 export default function OrderDetailPage() {
   const { orderId } = useParams();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
 
   const [order, setOrder] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [notFound, setNotFound] = useState(false);
 
+  // Phase 14b: navigation context — prev/next IDs within the filter
+  // set the user came from. Loaded asynchronously from /neighbors;
+  // null while loading. When position=0, the current order isn't in
+  // the filtered set (operator clicked through from elsewhere); UI
+  // shows that as "not in your filtered list" with a hint to clear.
+  const [neighbors, setNeighbors] = useState(null);
+
   // Phase 13c: bump this counter to trigger ShippingBlock to refetch
   // its status. Wired into ProcessOrderBlock so a successful Process
   // (which now also creates a SS order) immediately reflects the new
   // linked state on the Shipping card without needing a page reload.
   const [shippingRefreshTrigger, setShippingRefreshTrigger] = useState(0);
-  const refreshShipping = React.useCallback(() => {
+  const refreshShipping = useCallback(() => {
     setShippingRefreshTrigger((n) => n + 1);
   }, []);
+
+  // Filter context from URL (Phase 14b). The orders list page
+  // forwards its current filter state when navigating into the
+  // detail page so prev/next can scope to the same set.
+  //
+  // The detail page itself doesn't apply any filters to fetching the
+  // order — it always loads the specific orderId. Filters only affect
+  // navigation context.
+  const filterParams = {
+    workflow: searchParams.get('workflow') || 'all',
+    productionStatus: searchParams.get('productionStatus') || 'all',
+    galleryId: searchParams.get('galleryId') || '',
+    subGalleryId: searchParams.get('subGalleryId') || '',
+    shippingOption: searchParams.get('shippingOption') || '',
+    sort: searchParams.get('sort') || 'date_asc',
+  };
+  // Stable string version for useEffect deps (object identity changes
+  // every render even when contents don't).
+  const filterParamsKey = searchParams.toString();
 
   useEffect(() => {
     let cancelled = false;
@@ -66,11 +93,82 @@ export default function OrderDetailPage() {
     };
   }, [orderId]);
 
+  // Phase 14b: fetch neighbors whenever the order or the filter context
+  // changes. Fast endpoint (a few small SQL queries), so we don't need
+  // to debounce. Errors are swallowed — neighbors are a navigation
+  // convenience, not core to the page; if it fails we just hide the
+  // Prev/Next buttons rather than spam the operator.
+  useEffect(() => {
+    let cancelled = false;
+    setNeighbors(null); // clear stale data while loading
+
+    const qs = new URLSearchParams();
+    if (filterParams.workflow !== 'all') qs.set('workflow', filterParams.workflow);
+    if (filterParams.productionStatus !== 'all')
+      qs.set('productionStatus', filterParams.productionStatus);
+    if (filterParams.galleryId) qs.set('galleryId', filterParams.galleryId);
+    if (filterParams.subGalleryId) qs.set('subGalleryId', filterParams.subGalleryId);
+    if (filterParams.shippingOption) qs.set('shippingOption', filterParams.shippingOption);
+    if (filterParams.sort !== 'date_asc') qs.set('sort', filterParams.sort);
+    const query = qs.toString();
+
+    api
+      .get(`/api/sytist/orders/${orderId}/neighbors${query ? '?' + query : ''}`)
+      .then((d) => {
+        if (cancelled) return;
+        setNeighbors(d);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        // Soft-fail: log + leave neighbors=null so the buttons hide.
+        console.warn('Could not load neighbors:', err.message);
+        setNeighbors({ error: err.message });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orderId, filterParamsKey]);
+
+  // Phase 14b: keyboard shortcuts ← / → for prev/next.
+  // Skip when the user is typing in an input/textarea so we don't
+  // hijack arrow keys during text editing.
+  const handleNavigate = useCallback(
+    (targetOrderId) => {
+      if (!targetOrderId) return;
+      // Preserve current filter context when navigating to neighbor.
+      navigate(`/orders/${targetOrderId}${filterParamsKey ? '?' + filterParamsKey : ''}`);
+    },
+    [navigate, filterParamsKey]
+  );
+
+  useEffect(() => {
+    function handleKey(e) {
+      // Ignore key events from form controls
+      const tag = e.target?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (e.target?.isContentEditable) return;
+      // Ignore when modifier keys are held (browser shortcuts etc.)
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+      if (e.key === 'ArrowLeft' && neighbors?.previousOrderId) {
+        e.preventDefault();
+        handleNavigate(neighbors.previousOrderId);
+      } else if (e.key === 'ArrowRight' && neighbors?.nextOrderId) {
+        e.preventDefault();
+        handleNavigate(neighbors.nextOrderId);
+      }
+    }
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [neighbors, handleNavigate]);
+
   // ─── Loading ──────────────────────────────────────────
   if (loading) {
     return (
       <div style={pageStyle}>
-        <BackLink />
+        <BackLink filterParamsKey={filterParamsKey} />
         <div style={{ marginTop: 32, color: 'var(--text-muted)', fontSize: 13 }}>
           Loading order {orderId}…
         </div>
@@ -80,14 +178,20 @@ export default function OrderDetailPage() {
 
   // ─── Not found ────────────────────────────────────────
   if (notFound) {
-    return <NotFoundView orderId={orderId} navigate={navigate} />;
+    return (
+      <NotFoundView
+        orderId={orderId}
+        navigate={navigate}
+        filterParamsKey={filterParamsKey}
+      />
+    );
   }
 
   // ─── Error ────────────────────────────────────────────
   if (error) {
     return (
       <div style={pageStyle}>
-        <BackLink />
+        <BackLink filterParamsKey={filterParamsKey} />
         <div style={errorBoxStyle}>
           <strong>Could not load order {orderId}</strong>
           <div style={{ marginTop: 6, fontSize: 12 }}>{error}</div>
@@ -108,7 +212,11 @@ export default function OrderDetailPage() {
 
   return (
     <div style={pageStyle}>
-      <BackLink />
+      <NavStrip
+        neighbors={neighbors}
+        onNavigate={handleNavigate}
+        filterParamsKey={filterParamsKey}
+      />
 
       <HeaderStrip order={order} teamCount={teamCount} />
 
@@ -184,11 +292,26 @@ export default function OrderDetailPage() {
 // Page-level pieces
 // ──────────────────────────────────────────────────────────
 
-function BackLink() {
+function BackLink({ filterParamsKey }) {
   const navigate = useNavigate();
   return (
     <button
-      onClick={() => navigate(-1)}
+      onClick={() => {
+        // Phase 14b hotfix #3: go directly to the orders list with
+        // the filter context, rather than navigate(-1) which walks
+        // browser history one step at a time. After Prev/Next a few
+        // times, history is cluttered with neighbor orders and the
+        // operator has to click Back many times to escape. Jumping
+        // straight to /orders fixes that.
+        //
+        // If we have filter params (came from the list), preserve
+        // them so the list reopens in the same filtered view. If
+        // not (direct URL access), just go to the bare /orders.
+        const target = filterParamsKey
+          ? `/orders?${filterParamsKey}`
+          : '/orders';
+        navigate(target);
+      }}
       style={{
         background: 'transparent',
         border: 'none',
@@ -203,6 +326,145 @@ function BackLink() {
     </button>
   );
 }
+
+// ──────────────────────────────────────────────────────────
+// NavStrip (Phase 14b)
+// ──────────────────────────────────────────────────────────
+//
+// Top strip combining "Back to Orders" with Prev/Next navigation
+// scoped to the filter context the user came from. Reads neighbors
+// async; while loading it just shows the Back link.
+//
+// If the current order isn't in the filtered set (position=0 but
+// total>0), shows a small "not in this filter" hint with an option
+// to clear filters (which reloads the same order with no params and
+// thus navigates through all orders).
+//
+// Keyboard shortcuts ← and → also wired (in the parent component's
+// keydown listener); buttons are the click affordance, keys are the
+// power-user fast path.
+
+function NavStrip({ neighbors, onNavigate, filterParamsKey }) {
+  const navigate = useNavigate();
+
+  const hasNeighbors = neighbors && !neighbors.error;
+  const prevId = hasNeighbors ? neighbors.previousOrderId : null;
+  const nextId = hasNeighbors ? neighbors.nextOrderId : null;
+  const position = hasNeighbors ? neighbors.position : 0;
+  const total = hasNeighbors ? neighbors.total : 0;
+  const outOfSet = hasNeighbors && position === 0 && total > 0;
+
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        flexWrap: 'wrap',
+        gap: 12,
+        marginBottom: 16,
+      }}
+    >
+      <BackLink filterParamsKey={filterParamsKey} />
+
+      {hasNeighbors && !outOfSet && total > 0 && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 12,
+          }}
+        >
+          <button
+            onClick={() => onNavigate(prevId)}
+            disabled={!prevId}
+            title={
+              prevId
+                ? 'Previous order (←)'
+                : 'No previous order in this filter'
+            }
+            style={navButtonStyle(!prevId)}
+          >
+            ← Previous
+          </button>
+          <div
+            style={{
+              fontSize: 12,
+              color: 'var(--text-muted)',
+              fontVariantNumeric: 'tabular-nums',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            <strong style={{ color: 'var(--text-secondary)' }}>
+              {position.toLocaleString()}
+            </strong>{' '}
+            of {total.toLocaleString()}
+          </div>
+          <button
+            onClick={() => onNavigate(nextId)}
+            disabled={!nextId}
+            title={nextId ? 'Next order (→)' : 'No next order in this filter'}
+            style={navButtonStyle(!nextId)}
+          >
+            Next →
+          </button>
+        </div>
+      )}
+
+      {outOfSet && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            fontSize: 12,
+            color: 'var(--text-muted)',
+          }}
+        >
+          <span title="This order doesn't match the filter you came from. Clear filters to navigate through all orders.">
+            Not in current filter ({total.toLocaleString()} other
+            {total === 1 ? '' : 's'})
+          </span>
+          <button
+            onClick={() => {
+              // Reload with no filter params — navigates through all orders.
+              const path = window.location.pathname;
+              navigate(path);
+            }}
+            style={{
+              background: 'transparent',
+              border: 'none',
+              padding: 0,
+              fontSize: 12,
+              color: 'var(--accent)',
+              cursor: 'pointer',
+              fontFamily: 'inherit',
+              textDecoration: 'underline',
+            }}
+          >
+            Clear filter
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function navButtonStyle(disabled) {
+  return {
+    padding: '6px 14px',
+    background: disabled ? 'transparent' : 'var(--bg-card)',
+    border: '1px solid var(--border-color)',
+    color: disabled ? 'var(--text-muted)' : 'var(--text-secondary)',
+    borderRadius: 4,
+    fontSize: 12,
+    cursor: disabled ? 'not-allowed' : 'pointer',
+    fontFamily: 'inherit',
+    opacity: disabled ? 0.5 : 1,
+    fontWeight: 500,
+  };
+}
+
 
 function HeaderStrip({ order, teamCount }) {
   return (
@@ -3455,7 +3717,7 @@ function WorkflowBadge({ workflow, uncategorized, shippingOption }) {
 // Not-found view (option B: with order lookup search)
 // ──────────────────────────────────────────────────────────
 
-function NotFoundView({ orderId, navigate }) {
+function NotFoundView({ orderId, navigate, filterParamsKey }) {
   const [lookup, setLookup] = useState('');
 
   function handleLookup(e) {
@@ -3467,7 +3729,7 @@ function NotFoundView({ orderId, navigate }) {
 
   return (
     <div style={pageStyle}>
-      <BackLink />
+      <BackLink filterParamsKey={filterParamsKey} />
       <div
         style={{
           marginTop: 32,

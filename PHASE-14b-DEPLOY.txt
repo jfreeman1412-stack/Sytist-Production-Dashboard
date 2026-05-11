@@ -1,0 +1,153 @@
+Phase 14b — Prev/Next navigation on order detail page
+
+═══════════════════════════════════════════════════════
+SCOPE
+═══════════════════════════════════════════════════════
+
+Adds Previous/Next buttons + arrow key shortcuts to the order
+detail page. Navigation scopes to whatever filter the user came
+from — clicking into an order from a "ship_to_home" filtered list
+gives you Prev/Next that walks only ship_to_home orders.
+
+The detail page URL now carries filter context as query params
+(e.g. /orders/110633?workflow=ship_to_home&sort=date_asc) so
+context survives page reloads and direct links.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/services/sytistDbService.js
+    + New getOrderNeighbors(orderId, opts) method. Takes the same
+      filter options as getOrdersByWorkflow (workflow,
+      productionStatus, gallery, sub-gallery, shippingOption, sort).
+      Returns { previousOrderId, nextOrderId, position, total }.
+
+      Runs four small SQL queries against ms_orders:
+        1. anchor lookup (date + id of current order)
+        2. COUNT(*) of filtered set → total
+        3. in-set check → did the anchor match the filters at all?
+        4. COUNT(*) before anchor → position (1-based)
+        5. Next neighbor (LIMIT 1 with > anchor predicate)
+        6. Prev neighbor (LIMIT 1 with < anchor predicate)
+
+      Tiebreaker for same-date orders: order_id ASC (stable
+      regardless of date direction). Direction-aware predicates
+      so sort=date_desc works correctly.
+
+  server/routes/sytist.js
+    + New GET /api/sytist/orders/:orderId/neighbors endpoint.
+      Accepts the same filter query params as GET /orders.
+      Returns the neighbors object from sytistDbService.
+
+  client/src/pages/OrdersListPage.js
+    + Order row click handler now forwards the current filter
+      state to the detail page as URL query params. Default
+      values (workflow=all, productionStatus=0, sort=date_asc)
+      are omitted for clean URLs.
+
+  client/src/pages/OrderDetailPage.js
+    + useSearchParams imported, filter params parsed on mount.
+    + New useEffect that fetches /neighbors whenever orderId or
+      filter params change. Failures soft-fail (buttons hide).
+    + New NavStrip component combining the existing Back link
+      with Prev/Next buttons and a position counter ("5 of 141").
+    + Buttons disable when prev/next is null (at ends of set).
+    + Out-of-set state ("operator clicked into a non-matching
+      order") shows a clear filters link instead of buttons.
+    + Keyboard shortcuts: ← / → navigate prev/next. Skipped when
+      typing in inputs/textareas/contenteditable, or when modifier
+      keys are held.
+    + Navigation between orders preserves the filter context, so
+      Prev/Next keeps you in the same filtered set throughout.
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+Server unit-tested getOrderNeighbors against 6 synthetic-DB scenarios:
+  ✓ Sort ASC across 6 orders (with same-date tiebreak)
+    → position 1..6, neighbors point to ±1 in sequence
+  ✓ Sort DESC reverses sequence correctly
+    → date DESC, id ASC tiebreaker keeps stable order
+  ✓ workflow=ship_to_home filters out Manager orders
+    → 102 returns position=0/5 (out-of-set), neighbors null
+  ✓ workflow + productionStatus combine correctly
+    → 105 with open_status=12 excluded from open-status=0 set
+  ✓ Out-of-set order returns position=0 with null neighbors
+    but reports total of filtered set so UI can show context
+  ✓ Nonexistent order returns position=0, total=0, all null
+
+Client SSR-tested NavStrip against 8 states:
+  ✓ Loading (neighbors=null) — back link only, no nav controls
+  ✓ Middle of set — prev/next both active, "5 of 141" counter
+  ✓ First in set — prev disabled, next active
+  ✓ Last in set — prev active, next disabled
+  ✓ Only one in set — both disabled
+  ✓ Out of set — "Not in current filter (N others)" + clear link
+  ✓ Empty set — no nav (no orders to navigate)
+  ✓ Error — back link only (soft-fail)
+
+All 4 modified files parse cleanly.
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-14b.tar.gz --strip-components=1
+
+Nodemon picks it up. No new dependencies. No config file changes.
+
+Ctrl+Shift+R in the browser.
+
+═══════════════════════════════════════════════════════
+HOW TO VERIFY
+═══════════════════════════════════════════════════════
+
+  1. From home, click Ship to Home. Orders list shows N matches.
+  2. Click any order row. URL becomes
+       /orders/<id>?workflow=ship_to_home
+  3. Top of detail page shows the back link + a "Previous" /
+     "Next" pair with "5 of 141" between them (or similar).
+  4. Click Next → navigates to the next ship_to_home order. The
+     URL keeps the workflow=ship_to_home param.
+  5. Press ← / → arrow keys → same behavior.
+  6. Click into a list filtered to "Ship to League." Then in the
+     URL bar, manually change the order ID to one that's actually
+     ship_to_home. Page now shows "Not in current filter (N
+     others)" with a "Clear filter" link. Click it → reloads
+     without filters; navigation now spans ALL orders.
+  7. Type a URL like /orders/110633 directly (no params). Detail
+     page loads; Prev/Next navigate across ALL orders (no filter
+     applied; this is the "Show them, navigate through ALL orders"
+     behavior we chose for direct URL access).
+
+═══════════════════════════════════════════════════════
+DESIGN NOTES
+═══════════════════════════════════════════════════════
+
+• Two SQL approaches were considered: fetching the full filtered
+  ID list to the client and finding adjacents in JS, vs. computing
+  prev/next on the server with index lookups. Went with the latter
+  — at any data scale, two LIMIT 1 queries beat shipping N IDs to
+  the client.
+
+• The neighbors endpoint defaults productionStatus to 'all' (not
+  to 0 like the list page does). Reason: when an operator types
+  a URL or clicks an email link directly, they expect navigation
+  to work without surprises. If they came from the list page,
+  productionStatus is in the URL anyway. Net effect: direct-URL
+  access feels right, list-link access respects what they were
+  filtering by.
+
+• Keyboard shortcuts use plain ← / →. Considered j/k like Vim or
+  n/p like email clients, but for a mostly mouse-driven UI the
+  arrow keys are the least surprising choice. The listener checks
+  the active element first to avoid hijacking text-input arrow
+  keys.
+
+• Out-of-set state shows a "Clear filter" link rather than
+  silently hiding the navigation. The operator might have just
+  forgotten what filter they had set; this surfaces it.

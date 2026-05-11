@@ -373,6 +373,57 @@ router.get('/orders/:orderId', async (req, res) => {
 });
 
 /**
+ * Phase 14b: GET /api/sytist/orders/:orderId/neighbors
+ *
+ * Returns the prev/next order IDs for navigating within a filtered
+ * list. Accepts the same filter query params as GET /orders:
+ *   workflow         — 'all' | 'ship_to_home' | 'ship_to_managers' | 'ship_to_league'
+ *   productionStatus — number | 'all' (default: 'all' on detail page,
+ *                      so direct-link / typed-URL access navigates
+ *                      across all statuses unless caller specifies)
+ *   galleryId        — number
+ *   subGalleryId     — number
+ *   shippingOption   — string
+ *   sort             — 'date_asc' | 'date_desc'
+ *
+ * Response:
+ *   {
+ *     previousOrderId: '110632' | null,
+ *     nextOrderId:     '110634' | null,
+ *     position:        N      (1-based; 0 if anchor isn't in filtered set),
+ *     total:           M      (total in filtered set),
+ *   }
+ *
+ * Used by the order detail page's Prev/Next buttons.
+ */
+router.get('/orders/:orderId/neighbors', async (req, res) => {
+  try {
+    const opts = {};
+    if (req.query.workflow) opts.workflow = req.query.workflow;
+    if (req.query.productionStatus !== undefined) {
+      opts.productionStatus =
+        req.query.productionStatus === 'all'
+          ? 'all'
+          : parseInt(req.query.productionStatus, 10);
+    }
+    if (req.query.galleryId) opts.galleryId = parseInt(req.query.galleryId, 10);
+    if (req.query.subGalleryId)
+      opts.subGalleryId = parseInt(req.query.subGalleryId, 10);
+    if (req.query.shippingOption) opts.shippingOption = req.query.shippingOption;
+    if (req.query.sort) opts.sort = req.query.sort;
+
+    const neighbors = await sytistDb.getOrderNeighbors(
+      req.params.orderId,
+      opts
+    );
+    res.json(neighbors);
+  } catch (err) {
+    console.error('[sytist/orders/:orderId/neighbors]', err);
+    res.status(500).json({ error: err.message, code: err.code });
+  }
+});
+
+/**
  * PUT /api/sytist/orders/:orderId/status
  * Body: { statusId: number }
  *

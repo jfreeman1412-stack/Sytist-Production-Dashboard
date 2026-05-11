@@ -609,7 +609,31 @@ export default function OrdersListPage() {
             allOnPageSelected={allOnPageSelected}
             onTogglePageSelection={togglePageSelection}
             onRowClick={(orderId) => {
-              navigate(`/orders/${orderId}`);
+              // Phase 14b: forward the current filter context to the
+              // detail page so its Prev/Next buttons navigate within
+              // the same filtered set. We include ALL active filter
+              // values — even defaults — so the detail page receives
+              // a complete picture of "what list view is this?"
+              //
+              // Hotfix #2: productionStatus defaults to '0' on this
+              // page but the detail page defaults to 'all'. If we
+              // dropped '0' here because it equals the list's default,
+              // the detail page would assume 'all' and walk every
+              // status. Always send it.
+              const ctx = new URLSearchParams();
+              if (workflow !== 'all') ctx.set('workflow', workflow);
+              // productionStatus: always send (covers both '0' default
+              // and explicit selections like '40' or 'all').
+              ctx.set('productionStatus', productionStatus);
+              if (galleryId) ctx.set('galleryId', galleryId);
+              if (subGalleryId) ctx.set('subGalleryId', subGalleryId);
+              if (shippingOption) ctx.set('shippingOption', shippingOption);
+              // sort: always send too, since detail-page default
+              // ('date_asc') matches list-page default but explicit
+              // values matter for prev/next direction.
+              ctx.set('sort', sort);
+              const qs = ctx.toString();
+              navigate(`/orders/${orderId}${qs ? '?' + qs : ''}`);
             }}
           />
 

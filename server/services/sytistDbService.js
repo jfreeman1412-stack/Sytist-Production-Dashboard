@@ -818,6 +818,209 @@ class SytistDbService {
   }
 
   /**
+   * Phase 14b: find the previous + next order IDs for a given order
+   * within a filtered/sorted set. Powers the Prev/Next navigation on
+   * the order detail page.
+   *
+   * Takes the same filter options as getOrdersByWorkflow (workflow,
+   * productionStatus, galleryId, subGalleryId, shippingOption, sort)
+   * PLUS the current orderId. Returns:
+   *   {
+   *     previousOrderId: string|null,  // null at first row
+   *     nextOrderId: string|null,      // null at last row
+   *     position: number,              // 1-based index in filtered set
+   *     total: number,                 // total in filtered set
+   *   }
+   *
+   * If the current order is OUTSIDE the filter (e.g. operator filters
+   * to ship_to_home but the detail page is a ship_to_managers order),
+   * position = 0 and both prev/next return null. The UI should handle
+   * that as "not in this list" — the operator may want to clear
+   * filters.
+   *
+   * Implementation: rather than fetching all IDs and finding adjacents
+   * in JS, we run three small SQL queries:
+   *   1. Look up the anchor's (date, order_id) tuple to know "where
+   *      we are in the sort order"
+   *   2. SELECT * WHERE filters AND (date,id) > anchor LIMIT 1 → next
+   *   3. SELECT * WHERE filters AND (date,id) < anchor LIMIT 1 → prev
+   *   4. COUNT(*) + COUNT(* WHERE before anchor) → position + total
+   *
+   * Stable tiebreaker: orders with the same order_date are tied. We
+   * break ties with order_id so the navigation is deterministic.
+   * Direction of tiebreaker flips with sort (asc vs desc).
+   */
+  async getOrderNeighbors(orderId, opts = {}) {
+    const {
+      workflow = 'all',
+      productionStatus = 'all',  // detail-page default: all statuses
+      galleryId = null,
+      subGalleryId = null,
+      shippingOption = null,
+      sort = 'date_asc',
+    } = opts;
+
+    const id = parseInt(orderId, 10);
+    if (Number.isNaN(id) || id <= 0) {
+      throw new Error('Invalid order ID');
+    }
+
+    const pool = this.getPool();
+    const isDesc = sort === 'date_desc';
+
+    // Build the same WHERE clause as getOrdersByWorkflow. We need the
+    // base filters (paid/non-erased/order_status=0) regardless — they
+    // define what "the list" even is. Same shape, just refactored from
+    // the inlined version above. This duplication is intentional: any
+    // future filter added to getOrdersByWorkflow must be added here
+    // too, and the SQL stays straightforward.
+    const baseWhere = [
+      "o.order_payment_status = 'Completed'",
+      'o.order_status = 0',
+      'o.order_erased = 0',
+    ];
+    const baseParams = [];
+
+    if (productionStatus !== 'all') {
+      baseWhere.push('o.order_open_status = ?');
+      baseParams.push(productionStatus);
+    }
+    if (shippingOption) {
+      baseWhere.push('o.order_shipping_option = ?');
+      baseParams.push(shippingOption);
+    }
+    if (workflow !== 'all') {
+      const wfPred = _buildWorkflowSqlPredicate(workflow);
+      if (wfPred) {
+        baseWhere.push(wfPred.sql);
+        baseParams.push(...wfPred.params);
+      }
+    }
+    if (galleryId) {
+      baseWhere.push(
+        '(EXISTS (SELECT 1 FROM ms_cart c WHERE c.cart_order = o.order_id AND c.cart_pic_date_id = ?)' +
+          ' OR EXISTS (SELECT 1 FROM ms_cart_archive ca WHERE ca.cart_order = o.order_id AND ca.cart_pic_date_id = ?))'
+      );
+      baseParams.push(galleryId, galleryId);
+    }
+    if (subGalleryId) {
+      baseWhere.push(
+        '(EXISTS (SELECT 1 FROM ms_cart c WHERE c.cart_order = o.order_id AND c.cart_sub_gal_id = ?)' +
+          ' OR EXISTS (SELECT 1 FROM ms_cart_archive ca WHERE ca.cart_order = o.order_id AND ca.cart_sub_gal_id = ?))'
+      );
+      baseParams.push(subGalleryId, subGalleryId);
+    }
+
+    const baseWhereSql = baseWhere.join(' AND ');
+
+    // ─── 1. Anchor lookup ──────────────────────────────────
+    //
+    // We need (order_date, order_id) of the current order so we can
+    // compare against it in the prev/next queries. We DON'T require
+    // the anchor to be in the filtered set — operators can click into
+    // a ship_to_managers order from elsewhere even if their list was
+    // filtered to ship_to_home. In that case position=0 and both
+    // neighbors come back null.
+    const [anchorRows] = await pool.query(
+      `SELECT order_id, order_date FROM ms_orders WHERE order_id = ? AND order_erased = 0 LIMIT 1`,
+      [id]
+    );
+    if (anchorRows.length === 0) {
+      return {
+        previousOrderId: null,
+        nextOrderId: null,
+        position: 0,
+        total: 0,
+      };
+    }
+    const anchorDate = anchorRows[0].order_date;
+    const anchorId = anchorRows[0].order_id;
+
+    // ─── 2. Total in filtered set ─────────────────────────
+    const [totalRows] = await pool.query(
+      `SELECT COUNT(*) AS total FROM ms_orders o WHERE ${baseWhereSql}`,
+      baseParams
+    );
+    const total = Number(totalRows[0]?.total || 0);
+
+    // ─── 3. Is the anchor IN the filtered set? ────────────
+    //
+    // If not, return null neighbors with position=0. The UI shows
+    // a "this order isn't in your filtered list" note in that case.
+    const [inSetRows] = await pool.query(
+      `SELECT 1 FROM ms_orders o WHERE ${baseWhereSql} AND o.order_id = ? LIMIT 1`,
+      [...baseParams, id]
+    );
+    if (inSetRows.length === 0) {
+      return {
+        previousOrderId: null,
+        nextOrderId: null,
+        position: 0,
+        total,
+      };
+    }
+
+    // ─── 4. Position (1-based index of anchor in the set) ─
+    //
+    // Count how many rows come BEFORE the anchor in the chosen sort
+    // order. Position is that count + 1.
+    //   asc: rows with (date < anchorDate) OR (date == anchorDate AND id < anchorId)
+    //   desc: rows with (date > anchorDate) OR (date == anchorDate AND id < anchorId)
+    // The id-tiebreaker direction stays consistent (ASC) regardless
+    // of date direction — pick one and stick with it.
+    const beforePredicate = isDesc
+      ? '(o.order_date > ? OR (o.order_date = ? AND o.order_id < ?))'
+      : '(o.order_date < ? OR (o.order_date = ? AND o.order_id < ?))';
+    // 'before' is a reserved word in MySQL — must alias with backticks
+    // or pick a non-reserved name. Going with the latter.
+    const [beforeRows] = await pool.query(
+      `SELECT COUNT(*) AS before_count FROM ms_orders o WHERE ${baseWhereSql} AND ${beforePredicate}`,
+      [...baseParams, anchorDate, anchorDate, anchorId]
+    );
+    const position = Number(beforeRows[0]?.before_count || 0) + 1;
+
+    // ─── 5. Next neighbor ──────────────────────────────────
+    //
+    // First row strictly after the anchor in sort order.
+    //   asc: date > anchorDate OR (date == anchorDate AND id > anchorId)
+    //   desc: date < anchorDate OR (date == anchorDate AND id > anchorId)
+    const nextPredicate = isDesc
+      ? '(o.order_date < ? OR (o.order_date = ? AND o.order_id > ?))'
+      : '(o.order_date > ? OR (o.order_date = ? AND o.order_id > ?))';
+    const nextOrderBy = isDesc
+      ? 'o.order_date DESC, o.order_id ASC'
+      : 'o.order_date ASC, o.order_id ASC';
+    const [nextRows] = await pool.query(
+      `SELECT o.order_id FROM ms_orders o WHERE ${baseWhereSql} AND ${nextPredicate} ORDER BY ${nextOrderBy} LIMIT 1`,
+      [...baseParams, anchorDate, anchorDate, anchorId]
+    );
+    const nextOrderId = nextRows[0] ? String(nextRows[0].order_id) : null;
+
+    // ─── 6. Previous neighbor ─────────────────────────────
+    //
+    // First row strictly before the anchor. Sort order flips so the
+    // closest predecessor comes first.
+    const prevPredicate = isDesc
+      ? '(o.order_date > ? OR (o.order_date = ? AND o.order_id < ?))'
+      : '(o.order_date < ? OR (o.order_date = ? AND o.order_id < ?))';
+    const prevOrderBy = isDesc
+      ? 'o.order_date ASC, o.order_id DESC'
+      : 'o.order_date DESC, o.order_id DESC';
+    const [prevRows] = await pool.query(
+      `SELECT o.order_id FROM ms_orders o WHERE ${baseWhereSql} AND ${prevPredicate} ORDER BY ${prevOrderBy} LIMIT 1`,
+      [...baseParams, anchorDate, anchorDate, anchorId]
+    );
+    const previousOrderId = prevRows[0] ? String(prevRows[0].order_id) : null;
+
+    return {
+      previousOrderId,
+      nextOrderId,
+      position,
+      total,
+    };
+  }
+
+  /**
    * Returns a single canonical-shaped order, or null if not found.
    *
    * Uses the same stitching logic as getOrdersByWorkflow but filters down to
