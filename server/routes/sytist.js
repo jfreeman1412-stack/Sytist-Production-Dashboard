@@ -3062,4 +3062,485 @@ router.delete(
   }
 );
 
+// ──────────────────────────────────────────────────────────
+// PHASE 15a: PACKAGE CONTENTS
+// ──────────────────────────────────────────────────────────
+//
+// CRUD for the per-package-SKU contents config that drives the
+// explosion of package line items in sytistDbService. Read access
+// for any logged-in user; write access for admin/operator only.
+
+// GET /api/sytist/package-contents — full config
+router.get('/package-contents', async (req, res) => {
+  try {
+    const packageContentsService = require('../services/packageContentsService');
+    const config = await packageContentsService.getConfig();
+    res.json({ packages: config });
+  } catch (err) {
+    console.error('[sytist/package-contents]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/sytist/package-contents — replace the entire config
+// Body: { packages: { "1": { name, items: [{sku, qty}, ...] }, ... } }
+router.put(
+  '/package-contents',
+  requireRole('admin', 'operator'),
+  async (req, res) => {
+    try {
+      const packageContentsService = require('../services/packageContentsService');
+      const incoming = (req.body && req.body.packages) || req.body || {};
+      const saved = await packageContentsService.updateConfig(incoming, {
+        username: req.user?.username,
+      });
+      res.json({ packages: saved });
+    } catch (err) {
+      console.error('[sytist/package-contents PUT]', err);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// PUT /api/sytist/package-contents/:sku — update a single package
+// Body: { name, items: [{sku, qty}, ...] }
+router.put(
+  '/package-contents/:sku',
+  requireRole('admin', 'operator'),
+  async (req, res) => {
+    try {
+      const packageContentsService = require('../services/packageContentsService');
+      const saved = await packageContentsService.updatePackage(
+        req.params.sku,
+        req.body || {},
+        { username: req.user?.username }
+      );
+      res.json({ packages: saved });
+    } catch (err) {
+      console.error('[sytist/package-contents/:sku PUT]', err);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// DELETE /api/sytist/package-contents/:sku
+router.delete(
+  '/package-contents/:sku',
+  requireRole('admin', 'operator'),
+  async (req, res) => {
+    try {
+      const packageContentsService = require('../services/packageContentsService');
+      const saved = await packageContentsService.deletePackage(
+        req.params.sku,
+        { username: req.user?.username }
+      );
+      res.json({ packages: saved });
+    } catch (err) {
+      console.error('[sytist/package-contents/:sku DELETE]', err);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// GET /api/sytist/package-contents/lint — sanity check the config
+// against current packaging-config + composite/imposition mappings.
+// Returns warnings the Settings UI surfaces inline:
+//   - Items missing from packaging-config's productWeights
+//   - Items with no composite mapping AND no imposition mapping
+//     (those will produce a full-size print instead of the intended
+//     product, e.g. trading cards without an imposition rule)
+//
+// Phase 15a hotfix-1: composite and imposition mappings store their
+// SKU under `externalId` (not `sku`). The first cut keyed by `m.sku`
+// which silently returned undefined for every SKU, causing every
+// item to warn as if it had no mapping. Now we key by externalId.
+router.get('/package-contents/lint', async (req, res) => {
+  try {
+    const packageContentsService = require('../services/packageContentsService');
+    const packagingService = require('../services/packagingService');
+    const compositeService = require('../services/compositeService');
+    const impositionService = require('../services/impositionService');
+
+    const config = await packageContentsService.getConfig();
+    const packagingCfg = await packagingService.getConfig();
+    const productWeights = packagingCfg.productWeights || {};
+
+    // Composite mappings: listMappings() returns an array of
+    // { externalId, layoutId, chainToImposition }. Key by externalId.
+    let compositeMappings = {};
+    try {
+      const list = await compositeService.listMappings();
+      const arr = Array.isArray(list) ? list : [];
+      for (const m of arr) {
+        if (m && m.externalId != null) {
+          compositeMappings[String(m.externalId)] = m;
+        }
+      }
+    } catch (err) {
+      console.warn('[lint] composite mappings load failed:', err.message);
+    }
+
+    // Imposition mappings: getMappings() returns an array of
+    // { externalId, layoutId, orientation?, layoutName }. Key by
+    // externalId. Note: a SKU can appear multiple times (different
+    // orientations) — any one entry counts as "has a mapping" for
+    // this check.
+    let impositionMappings = {};
+    try {
+      const list = await impositionService.getMappings();
+      const arr = Array.isArray(list) ? list : [];
+      for (const m of arr) {
+        if (m && m.externalId != null) {
+          impositionMappings[String(m.externalId)] = m;
+        }
+      }
+    } catch (err) {
+      console.warn('[lint] imposition mappings load failed:', err.message);
+    }
+
+    const warnings = [];
+    for (const [pkgSku, pkg] of Object.entries(config)) {
+      for (const item of pkg.items || []) {
+        const itemSku = String(item.sku);
+        const w = productWeights[itemSku];
+        const hasComposite = !!compositeMappings[itemSku];
+        const hasImposition = !!impositionMappings[itemSku];
+        const isDigital = w && w.category === 'digital';
+
+        if (!w) {
+          warnings.push({
+            severity: 'error',
+            packageSku: pkgSku,
+            packageName: pkg.name,
+            itemSku,
+            message: `SKU ${itemSku} is not in Settings → Packaging → Product weights. Add it so the engine knows its weight.`,
+          });
+        }
+        if (!isDigital && !hasComposite && !hasImposition) {
+          warnings.push({
+            severity: 'warning',
+            packageSku: pkgSku,
+            packageName: pkg.name,
+            itemSku,
+            itemName: w?.name || `SKU ${itemSku}`,
+            message: `SKU ${itemSku} has no composite or imposition mapping — will print as one full-size copy of the photo instead of the intended product.`,
+          });
+        }
+      }
+    }
+
+    res.json({ warnings });
+  } catch (err) {
+    console.error('[sytist/package-contents/lint]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ──────────────────────────────────────────────────────────
+// PHASE 15b: ADDON MAPPINGS
+// ──────────────────────────────────────────────────────────
+//
+// CRUD for the co_opt_id → SKU mappings used by the order pipeline
+// to expand ms_cart_options rows into synthetic line items.
+// Plus an auto-discovery endpoint that scans recent orders for
+// unmapped option IDs.
+
+// GET /api/sytist/addon-mappings — full config
+router.get('/addon-mappings', async (req, res) => {
+  try {
+    const addonMappingsService = require('../services/addonMappingsService');
+    const mappings = await addonMappingsService.getConfig();
+    res.json({ mappings });
+  } catch (err) {
+    console.error('[sytist/addon-mappings]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/sytist/addon-mappings — replace the entire config
+// Body: { mappings: { "2007": { name, sku }, ... } }
+router.put(
+  '/addon-mappings',
+  requireRole('admin', 'operator'),
+  async (req, res) => {
+    try {
+      const addonMappingsService = require('../services/addonMappingsService');
+      const incoming = (req.body && req.body.mappings) || req.body || {};
+      const saved = await addonMappingsService.updateConfig(incoming, {
+        username: req.user?.username,
+      });
+      res.json({ mappings: saved });
+    } catch (err) {
+      console.error('[sytist/addon-mappings PUT]', err);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// PUT /api/sytist/addon-mappings/:optId — update a single mapping
+// Body: { name, sku }
+router.put(
+  '/addon-mappings/:optId',
+  requireRole('admin', 'operator'),
+  async (req, res) => {
+    try {
+      const addonMappingsService = require('../services/addonMappingsService');
+      const saved = await addonMappingsService.updateMapping(
+        req.params.optId,
+        req.body || {},
+        { username: req.user?.username }
+      );
+      res.json({ mappings: saved });
+    } catch (err) {
+      console.error('[sytist/addon-mappings/:optId PUT]', err);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// DELETE /api/sytist/addon-mappings/:optId
+router.delete(
+  '/addon-mappings/:optId',
+  requireRole('admin', 'operator'),
+  async (req, res) => {
+    try {
+      const addonMappingsService = require('../services/addonMappingsService');
+      const saved = await addonMappingsService.deleteMapping(
+        req.params.optId,
+        { username: req.user?.username }
+      );
+      res.json({ mappings: saved });
+    } catch (err) {
+      console.error('[sytist/addon-mappings/:optId DELETE]', err);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// GET /api/sytist/addon-mappings/discovery
+// Scans recent (completed) orders for ms_cart_options.co_opt_id
+// values and returns those not yet in the mapping config, ranked by
+// occurrence count. Useful for "what add-ons have customers actually
+// ordered that I haven't configured yet."
+//
+// Query params:
+//   limit — number of recent orders to scan (default 200, max 1000)
+//
+// Response:
+//   { unmappedOptions: [{ optId, optName, occurrences, samplePrice }, ...] }
+router.get('/addon-mappings/discovery', async (req, res) => {
+  const t0 = Date.now();
+  console.log('[discovery] start');
+  try {
+    const addonMappingsService = require('../services/addonMappingsService');
+    const sytistDb = require('../services/sytistDbService');
+    const pool = sytistDb.getPool();
+
+    const limit = Math.min(
+      5000,
+      Math.max(50, parseInt(req.query.limit, 10) || 500)
+    );
+
+    // Phase 15b hotfix-1: split into two queries because old MySQL
+    // rejects LIMIT inside IN subqueries.
+    console.log('[discovery] querying recent orders, limit=' + limit);
+    const [recentOrderRows] = await pool.query(
+      `SELECT order_id FROM ms_orders
+       WHERE order_payment_status = 'Completed'
+         AND order_erased = 0
+       ORDER BY order_date DESC
+       LIMIT ?`,
+      [limit]
+    );
+    const recentOrderIds = recentOrderRows.map((r) => r.order_id);
+    console.log('[discovery] got ' + recentOrderIds.length + ' order ids in ' + (Date.now() - t0) + 'ms');
+    if (recentOrderIds.length === 0) {
+      return res.json({ unmappedOptions: [], scannedOrders: limit });
+    }
+
+    const sql = `
+      SELECT co.co_opt_id, co.co_opt_name,
+             COUNT(*) AS occurrences,
+             AVG(co.co_price) AS avg_price
+      FROM ms_cart_options co
+      JOIN ms_cart c ON c.cart_id = co.co_cart_id
+      WHERE c.cart_order IN (?)
+      GROUP BY co.co_opt_id, co.co_opt_name
+      ORDER BY occurrences DESC
+    `;
+    console.log('[discovery] querying options for ' + recentOrderIds.length + ' orders');
+    const [rows] = await pool.query(sql, [recentOrderIds]);
+    console.log('[discovery] got ' + rows.length + ' option rows in ' + (Date.now() - t0) + 'ms total');
+
+    const config = await addonMappingsService.getConfig();
+    const unmappedOptions = [];
+    for (const row of rows) {
+      const optId = row.co_opt_id != null ? String(row.co_opt_id) : null;
+      if (!optId) continue;
+      // Phase 15c hotfix-2: completeness depends on type.
+      //   product type:  needs sku
+      //   modifier type: needs suffix
+      // Phase 15b checked only sku, which meant modifier mappings
+      // (suffix-only, no sku) still appeared as "unmapped" in
+      // discovery even after being saved.
+      const m = config[optId];
+      if (m) {
+        const isModifier = m.type === 'modifier';
+        const complete = isModifier ? !!m.suffix : !!m.sku;
+        if (complete) continue;
+      }
+      unmappedOptions.push({
+        optId,
+        optName: row.co_opt_name || '',
+        occurrences: Number(row.occurrences || 0),
+        samplePrice: Number(row.avg_price || 0),
+      });
+    }
+    console.log('[discovery] done, ' + unmappedOptions.length + ' unmapped in ' + (Date.now() - t0) + 'ms');
+    res.json({ unmappedOptions, scannedOrders: limit });
+  } catch (err) {
+    console.error('[discovery] ERROR after ' + (Date.now() - t0) + 'ms:', err.message);
+    console.error('[discovery] stack:', err.stack);
+    console.error('[discovery] code:', err.code, 'errno:', err.errno);
+    res.status(500).json({ error: err.message, code: err.code });
+  }
+});
+
+// ──────────────────────────────────────────────────────────
+// PHASE 16: CONFIG HISTORY + EXPORT/IMPORT
+// ──────────────────────────────────────────────────────────
+
+// GET /api/sytist/config-history?type=&id=&limit=
+//
+// Audit trail for a single config entity. Both query params required.
+//   type — 'addon_mapping' | 'package' | 'order_override'
+//   id   — entity identifier (opt_id, package_sku, or "<orderId>:<cartId>")
+//   limit — optional, 1-500, defaults to 50
+router.get('/config-history', async (req, res) => {
+  try {
+    const configHistory = require('../services/configHistoryService');
+    const { type, id, limit } = req.query;
+    if (!type || !id) {
+      return res.status(400).json({
+        error: "Both 'type' and 'id' query params are required",
+      });
+    }
+    const history = configHistory.list({
+      configType: String(type),
+      entityId: String(id),
+      limit,
+    });
+    res.json({ history });
+  } catch (err) {
+    console.error('[sytist/config-history]', err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// GET /api/sytist/config-history/recent?type=&limit=
+//
+// Recent changes across all entities of a config type. Useful for
+// a "what's changed lately" overview.
+router.get('/config-history/recent', async (req, res) => {
+  try {
+    const configHistory = require('../services/configHistoryService');
+    const { type, limit } = req.query;
+    if (!type) {
+      return res.status(400).json({ error: "'type' query param is required" });
+    }
+    const history = configHistory.recent({
+      configType: String(type),
+      limit,
+    });
+    res.json({ history });
+  } catch (err) {
+    console.error('[sytist/config-history/recent]', err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ─── Export / import: addon mappings ─────────────────────
+
+// GET /api/sytist/addon-mappings/export
+//   Downloads the full config as a JSON file.
+router.get('/addon-mappings/export', async (req, res) => {
+  try {
+    const addonMappingsService = require('../services/addonMappingsService');
+    const cfg = await addonMappingsService.getConfig();
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="addon-mappings-${new Date()
+        .toISOString()
+        .slice(0, 10)}.json"`
+    );
+    res.send(JSON.stringify(cfg, null, 2));
+  } catch (err) {
+    console.error('[sytist/addon-mappings/export]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/sytist/addon-mappings/import
+//   Body: full JSON config in the same shape as export.
+//   Replaces the entire config.
+router.put(
+  '/addon-mappings/import',
+  requireRole('admin', 'operator'),
+  async (req, res) => {
+    try {
+      const addonMappingsService = require('../services/addonMappingsService');
+      const incoming = req.body || {};
+      // Tolerate either { mappings: {...} } or the flat shape itself
+      const cfg = incoming.mappings || incoming;
+      const saved = await addonMappingsService.updateConfig(cfg, {
+        username: req.user?.username,
+      });
+      res.json({ mappings: saved });
+    } catch (err) {
+      console.error('[sytist/addon-mappings/import]', err);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// ─── Export / import: package contents ───────────────────
+
+router.get('/package-contents/export', async (req, res) => {
+  try {
+    const packageContentsService = require('../services/packageContentsService');
+    const cfg = await packageContentsService.getConfig();
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="package-contents-${new Date()
+        .toISOString()
+        .slice(0, 10)}.json"`
+    );
+    res.send(JSON.stringify(cfg, null, 2));
+  } catch (err) {
+    console.error('[sytist/package-contents/export]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.put(
+  '/package-contents/import',
+  requireRole('admin', 'operator'),
+  async (req, res) => {
+    try {
+      const packageContentsService = require('../services/packageContentsService');
+      const incoming = req.body || {};
+      const cfg = incoming.packages || incoming;
+      const saved = await packageContentsService.updateConfig(cfg, {
+        username: req.user?.username,
+      });
+      res.json({ packages: saved });
+    } catch (err) {
+      console.error('[sytist/package-contents/import]', err);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
 module.exports = router;

@@ -1,0 +1,275 @@
+Phase 15a — Package explosion (Gold/Silver/Bronze constituent items)
+
+═══════════════════════════════════════════════════════
+PROBLEM
+═══════════════════════════════════════════════════════
+
+When a customer orders a "Gold Package" in Sytist, the database stores
+it as ONE ms_cart row with cart_package=1 and one photo. Today the
+production pipeline sees that single row and produces a single print
+of the photo. The customer is expecting a Memory Mate, 8x10, 5x7s,
+wallets, trading cards, magnets, button, and a digital — none of
+which gets made.
+
+═══════════════════════════════════════════════════════
+WHAT THIS PHASE DOES
+═══════════════════════════════════════════════════════
+
+Introduces a "package contents" config (per package SKU → list of
+constituent items) and explodes package rows into synthetic line
+items at the order-fetch boundary. Downstream — composite engine,
+imposition, darkroom .txt, packing slip, ShipStation packaging engine
+— sees the full set of items and processes them normally.
+
+The package row is preserved (not replaced) as a header. It carries a
+new flag (isPackageHeader=true) so the pipeline can skip it from
+production while still letting the operator see "this came from a
+Gold Package" in the order detail.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+NEW FILES:
+  server/services/packageContentsService.js
+    Singleton with getConfig / updateConfig / updatePackage /
+    deletePackage / getContentsForPackage. Storage:
+    server/config/package-contents.json (created on first read with
+    Gold/Silver/Bronze defaults from our earlier conversations).
+
+  client/src/pages/settings/PackagesPage.js
+    Settings UI for editing package contents. One card per package
+    SKU. Editable name + items list (SKU + qty per row). Add-item
+    dropdown populated from Settings → Packaging's product weights
+    (operators pick from real SKUs, not free-text). Per-item
+    warnings inline when an item has no imposition or composite
+    mapping. Total weight calculator that compares against the
+    bundle weight set in Settings → Packaging.
+
+MODIFIED FILES:
+  server/services/sytistDbService.js
+    + New _expandPackageLineItems free function that takes the
+      assembled lineItems array and a package contents map, and
+      returns a longer array with synthetic constituents emitted
+      after each package row.
+    + New _loadPackageMap method that loads the contents config +
+      builds a SKU→name lookup + SKU→category lookup once per
+      query (so explosion can resolve names and infer the digital
+      flag).
+    + Both getOrdersByWorkflow AND getOrderById call the expansion
+      right after lineItems is built but before sibling detection.
+    + Synthetic constituents:
+        - cartId = "<parentCartId>-pkg-<sku>" (string, no collision
+          with real numeric cart IDs)
+        - flags.isPackageItem = true
+        - flags.packageParentCartId = <parent>
+        - flags.packageParentSku = <parent SKU>
+        - flags.download = true if the SKU's category is 'digital'
+          (so SKU 25 in a Gold Package is correctly skipped from
+          production)
+        - photo / gallery / sub-gallery inherited from the package
+        - qty = item.qty × packageRow.qty (handles rare qty>1 case)
+    + Package row gets flags.isPackageHeader = true (still keeps
+      flags.package = true so other code paths can detect a package
+      either way).
+
+  server/services/processingService.js
+    + isPackageHeader added to SKIP_FLAGS so the package header row
+      never produces a print. Constituents (with their own SKUs and
+      flags.isPackageItem = true) go through the normal pipeline.
+
+  server/services/packagingService.js
+    + Weight calculation loop skips items with flags.isPackageHeader.
+      Constituents now contribute their real weights from
+      productWeights; the bundle weight in packageBundles is no
+      longer added. forcePackage routing logic unchanged (still
+      fires when a package SKU appears in skuSet).
+    + weightBreakdown records the header with source =
+      'packageHeaderSkipped' and 0 weight, so the audit trail is
+      complete.
+
+  server/services/packingSlipService.js
+    + isPackageHeader added to SKIP_FLAGS. The slip shows constituent
+      items as individual rows; the parent header doesn't appear as
+      its own row (would be duplicate noise alongside its expanded
+      contents).
+
+  server/routes/sytist.js
+    + GET    /api/sytist/package-contents          → full config
+    + PUT    /api/sytist/package-contents          → replace config
+    + PUT    /api/sytist/package-contents/:sku     → update one package
+    + DELETE /api/sytist/package-contents/:sku     → delete one package
+    + GET    /api/sytist/package-contents/lint     → config warnings
+      (cross-references productWeights + composite/imposition
+      mappings, flags items that'd print wrong)
+
+  client/src/components/AppLayout.js
+    + Imports PackagesPage and adds <Route path="packages" /> under
+      /settings.
+
+  client/src/pages/settings/SettingsLayout.js
+    + Adds <SidebarLink to="packages" label="Packages" /> in the
+      Integrations sidebar group.
+
+═══════════════════════════════════════════════════════
+DEFAULTS LOADED ON FIRST USE
+═══════════════════════════════════════════════════════
+
+The config file is created on first read if missing, populated with:
+
+  Gold (SKU 1):
+    SKU  6  Memory Mate            ×1
+    SKU  8  8x10 Individual        ×1
+    SKU 10  5x7 Individual         ×1
+    SKU 11  5x7 Team               ×1
+    SKU 12  8 Wallets (sheet)      ×1
+    SKU 35  8 Trading Cards (sheet)×1
+    SKU 15  2 3.5x5 Magnets        ×1
+    SKU 16  Photo Button           ×1
+    SKU 25  Digital Download       ×1
+
+  Silver (SKU 2):
+    SKU  6  Memory Mate            ×1
+    SKU  8  8x10 Individual        ×1
+    SKU 10  5x7 Individual         ×1
+    SKU 11  5x7 Team               ×1
+    SKU 12  8 Wallets              ×1
+    SKU 15  2 3.5x5 Magnets        ×1
+    SKU 25  Digital Download       ×1
+
+  Bronze (SKU 3):
+    SKU 27  4-3.5x5 Prints         ×1
+    SKU 12  8 Wallets              ×1
+
+Edit any of these in Settings → Packages after deploy.
+
+═══════════════════════════════════════════════════════
+KNOWN ISSUE — TRADING CARDS IMPOSITION
+═══════════════════════════════════════════════════════
+
+You mentioned SKU 35 (8 Trading Cards) doesn't yet have an imposition
+mapping. With this phase deployed, Gold Package orders will explode to
+include SKU 35, and without an imposition mapping the pipeline will
+produce ONE full-size print of the photo instead of a sheet of 8
+trading cards.
+
+The Settings → Packages page will show this as a yellow warning under
+the Gold Package card. To fix: go to Settings → Imposition, add a
+mapping for SKU 35.
+
+Same gap will surface for any package item that lacks both a composite
+and imposition mapping (and isn't digital). The lint warning makes the
+gap visible so it can be addressed proactively.
+
+═══════════════════════════════════════════════════════
+BEHAVIOR CHANGES TO EXPECT
+═══════════════════════════════════════════════════════
+
+1. Order detail page for a Gold Package order will now show ~10
+   line items instead of 1. The package row is still there as a
+   header, but the constituents appear below it. No UI grouping
+   yet (deferred to Phase 15b polish).
+
+2. Processing a Gold Package will now produce the full set of
+   constituent items — composite for memory mate, imposition for
+   wallets, full-size prints for items without mappings (incl.
+   trading cards until you set up imposition for them).
+
+3. Packing slip for a Gold Package will show 8-9 rows (constituents)
+   instead of 1 (the package header). The header is skipped from
+   the slip via SKIP_FLAGS.
+
+4. ShipStation weight will now come from constituent weights rather
+   than the bundle weight in Settings → Packaging. The total should
+   be close — the existing bundle weights were our best estimate;
+   constituent sum is the truth. Check the Packages settings page
+   for any weight mismatch warnings (it compares totalOz against
+   bundleWeight and shows when they differ by > 0.5 oz).
+
+5. In-flight orders that haven't been processed yet WILL explode
+   the next time they're loaded. This is correct (they should make
+   the full bundle) but it's a behavior change for any "in progress"
+   orders sitting in the queue. Operators should be aware.
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-15a.tar.gz --strip-components=1
+
+Nodemon restarts. Hard refresh in browser (Ctrl+Shift+R).
+
+Notes about deploy:
+  - server/config/package-contents.json is NOT in the tarball. The
+    service creates it with defaults the first time it's read.
+  - This tarball overwrites SettingsLayout.js. If you've edited it
+    locally since Phase 13b, your changes will be lost. Check with
+    `git diff HEAD client/src/pages/settings/SettingsLayout.js`
+    AFTER extracting but BEFORE committing — if you see unexpected
+    deletions, save my version and re-apply on top of HEAD.
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+1. Open Settings → Packages. You should see three cards:
+   Gold (SKU 1), Silver (SKU 2), Bronze (SKU 3) with their items.
+
+2. At the top of the page, you'll see a yellow warning panel:
+   "Trading Cards has no composite or imposition mapping — will
+   print as one full-size copy..." (this is the expected gap).
+
+3. Open any order that has a package. Confirm you see:
+     - The Gold Package row at the top
+     - Below it, the constituent items (Memory Mate, 8x10, 5x7, etc.)
+
+4. Try processing a non-package order — make sure nothing changed
+   for normal orders. (The explosion is a no-op when there are no
+   package lines.)
+
+5. Try processing a package order — confirm:
+     - Constituent items go through composite/imposition normally
+     - Darkroom .txt includes constituent SKUs (NOT the Gold Package
+       SKU, which is the header)
+     - Packing slip shows constituent items as separate rows
+     - ShipStation gets the right weight (sum of constituents)
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+packageContentsService:
+  ✓ Initial read creates defaults with 9/7/2 items
+  ✓ getContentsForPackage('1') returns Gold's 9 items
+  ✓ getContentsForPackage('999') returns null gracefully
+  ✓ updatePackage adds/removes items, cache invalidates
+  ✓ isPackageSku detects configured packages
+  ✓ Normalize handles bad input (null SKUs filtered, invalid qty → 1)
+
+_expandPackageLineItems (sytistDbService):
+  ✓ Original 3 items → expanded to 6 (Gold + 3 constituents + others passthrough)
+  ✓ Package qty=2 multiplies constituent qty correctly
+  ✓ No map → no explosion (graceful)
+  ✓ Unknown package SKU → passthrough, header NOT marked
+  ✓ Synthetic items inherit photo, gallery, subGallery
+  ✓ packageParentCartId set correctly
+  ✓ Header keeps `package: true` AND adds `isPackageHeader: true`
+
+All 9 files parse cleanly.
+
+═══════════════════════════════════════════════════════
+FUTURE WORK (NOT IN THIS PHASE)
+═══════════════════════════════════════════════════════
+
+  • Phase 15b polish: visual grouping of package constituents on
+    the slip + indentation on the order detail page so the operator
+    sees "Gold Package" as a parent with indented children. The
+    current approach (skip header on slip, flat list on detail
+    page) gets the job done; this is a polish pass.
+
+  • A "package contents change history" view if it turns out
+    operators tune the contents often and need a diff log.
+
+  • Per-team package overrides (rare but possible — different
+    teams might have different package variants).

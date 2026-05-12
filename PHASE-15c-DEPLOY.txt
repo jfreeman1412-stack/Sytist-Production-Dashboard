@@ -1,0 +1,130 @@
+Phase 15c — Add-on qty + modifier suffix
+
+═══════════════════════════════════════════════════════
+WHAT'S NEW
+═══════════════════════════════════════════════════════
+
+Two improvements to the add-on system from Phase 15b:
+
+1. Add-ons now support quantity. "Add 2 5x7s" can be mapped to
+   SKU 10 with qty=2, and the synthesized line item will have
+   qty 2 — flowing correctly through imposition, slip counts,
+   and Darkroom .txt.
+
+2. Add-ons now support a "modifier" type. Instead of synthesizing
+   a new production line, a modifier appends a suffix to the
+   parent line's product name (e.g. " (Framed)") so the suffix
+   prints on:
+     - the Darkroom .txt's item description (visible on the print)
+     - the packing slip (with a yellow highlight)
+   The customer-paid fee tracks against the parent's options list
+   (visible) but doesn't drive any production routing.
+
+═══════════════════════════════════════════════════════
+CONFIG SCHEMA (addon-mappings.json)
+═══════════════════════════════════════════════════════
+
+Old (Phase 15b):
+  "2007": { "name": "...", "sku": "..." }
+
+New (Phase 15c):
+  Product type:
+    "2007": { "type": "product", "name": "...", "sku": "...", "qty": 2 }
+
+  Modifier type:
+    "2050": { "type": "modifier", "name": "Frame", "suffix": " (Framed)" }
+
+Legacy entries without an explicit type field continue to be
+treated as product (backward-compatible). The Settings UI shows
+type-aware editors.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/services/addonMappingsService.js
+    Normalize handles type + qty + suffix. getMappingForOpt
+    checks completeness per type (product: sku, modifier: suffix).
+
+  server/services/sytistDbService.js
+    _expandAddonLineItems rewritten to handle both types:
+      - product → synthetic line item with qty from mapping
+      - modifier → appends suffix to parent productName, adds
+        modifiers[] array on parent for slip rendering
+    Object identity preserved for unchanged lines.
+    _loadAddonMap now passes type-aware entries through.
+
+  server/services/packingSlipService.js
+    Renders modifiers as a yellow highlighted line below the
+    product name on the slip. Layout adjusted to make room.
+
+  client/src/pages/settings/AddonsPage.js
+    - Type chip selector (Product / Modifier)
+    - Product form: SKU dropdown + qty input
+    - Modifier form: suffix input with live preview
+    - Each row in the configured-mappings table also has a type
+      selector + dynamic fields
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-15c.tar.gz --strip-components=1
+
+Nodemon picks up server changes. Hard refresh browser.
+
+If your existing addon-mappings.json has entries that were created
+under Phase 15b (no explicit type field), they keep working as
+product-type mappings. You can edit them in the UI to change type
+or set qty.
+
+═══════════════════════════════════════════════════════
+VERIFY
+═══════════════════════════════════════════════════════
+
+For the qty improvement:
+  1. Settings → Add-ons → find the "Add 2 5x7s" mapping (or add it)
+  2. Set qty=2, SKU=10, Save
+  3. Open an order with that add-on. The synthetic line item now
+     reads "2 5x7s ... qty 2".
+
+For the modifier improvement:
+  1. Settings → Add-ons → add (or map) the Frame option
+  2. Type: Modifier, Name: Frame, Suffix: " (Framed)" (with leading space)
+  3. Open an order that has Frame attached to an 8x10. The order
+     detail's line item should now read "8x10 Individual (Framed)".
+  4. Process the order. Confirm:
+     - Darkroom .txt's item description includes "(Framed)"
+     - Packing slip shows the item with a yellow "+ Frame" highlight
+       line below the product name
+
+═══════════════════════════════════════════════════════
+UNIT TEST RESULTS
+═══════════════════════════════════════════════════════
+
+_expandAddonLineItems (Phase 15c rewrite):
+  ✓ Modifier + product mix: parent gets both suffixes appended,
+    parent modifiers[] has 2 entries, synthetic 2 5x7s has qty=2
+  ✓ Only modifier (no product addons): just 1 line out (parent
+    with suffix), no synthetic items
+  ✓ Legacy mapping (no type field): defaults to product
+  ✓ Half-configured modifier (no suffix): ignored
+  ✓ Original passthrough preserves object identity
+
+All 4 modified files parse cleanly.
+AddonsPage SSRs cleanly.
+
+═══════════════════════════════════════════════════════
+KNOWN LIMITATION
+═══════════════════════════════════════════════════════
+
+If a single line item has MANY modifiers, the slip's yellow
+highlight line can overflow horizontally. Layout calc estimates
+character width and clips to the available space. If you hit a
+case where it's truncated, let me know and I'll adjust to wrap
+or use smaller text.
+
+The .txt suffix path is the same as the productName so no width
+concerns there.

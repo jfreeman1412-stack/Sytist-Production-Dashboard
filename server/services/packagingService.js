@@ -412,6 +412,25 @@ class PackagingService {
     for (const item of physicalItems) {
       const sku = String(item.sku || '');
       const qty = item.qty || 1;
+
+      // Phase 15a: package header rows contribute no weight — their
+      // constituent items (already in physicalItems thanks to the
+      // explosion in sytistDbService) carry the real weights. Without
+      // this skip, we'd double-count: bundle.weight on the header
+      // PLUS each constituent's weight. The header still drives
+      // routing (forcePackage check below) but not weight.
+      if (item.flags?.isPackageHeader) {
+        weightBreakdown.items.push({
+          sku,
+          name: (config.packageBundles[sku] || {}).name || `Package ${sku}`,
+          qty,
+          unitWeightOz: 0,
+          lineWeightOz: 0,
+          source: 'packageHeaderSkipped',
+        });
+        continue;
+      }
+
       const bundle = config.packageBundles[sku];
       let unitWeight;
       let source;

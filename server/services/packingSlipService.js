@@ -97,7 +97,13 @@ const DEFAULT_SLIP_CONFIG = {
 
 // Same skip set as darkroomService — items with these flags aren't print
 // jobs and shouldn't appear on the slip.
-const SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell'];
+// Phase 15a: isPackageHeader is the synthetic flag attached to the
+// original package row when sytistDbService explodes a package into
+// its constituent items. The header itself isn't a printable product
+// — the constituents are — so we skip it from the slip the same way
+// we skip digital downloads. The constituents (with flags.isPackageItem
+// = true and their own SKUs) DO show on the slip as individual rows.
+const SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell', 'isPackageHeader'];
 
 class PackingSlipService {
   constructor() {
@@ -692,16 +698,43 @@ class PackingSlipService {
         ? esc(li.subGalleryName)
         : '';
 
+      // Phase 15c: render modifier add-ons (e.g. "Frame") as a
+      // highlighted line below the product name. The suffix is
+      // already appended to li.productName so the Darkroom .txt
+      // shows it too; this slip-only display makes it visually
+      // obvious to the packer.
+      const modifiers = Array.isArray(li.modifiers) ? li.modifiers : [];
+      const modifierText = modifiers
+        .map((m) => m.name || '')
+        .filter(Boolean)
+        .join(' · ');
+      // Layout: when modifiers exist, push sku/team rows down to
+      // make room. Reserve a row at y * 2.5 for the highlight.
+      const hasMods = modifierText.length > 0;
+      const modY = Math.round(itemNameSize * 2.5);
+      const skuY = hasMods ? Math.round(itemNameSize * 3.7) : Math.round(itemNameSize * 2.5);
+      const teamY = hasMods ? Math.round(itemNameSize * 4.8) : Math.round(itemNameSize * 3.6);
+      const modifierBlock = hasMods
+        ? // Highlighted background + bold label
+          `<rect x="-2" y="${modY - Math.round(itemDetailSize * 1.0)}" ` +
+            `width="${Math.min(textWidth, Math.round(modifierText.length * itemDetailSize * 0.62) + 14)}" ` +
+            `height="${Math.round(itemDetailSize * 1.4)}" rx="3" fill="#FFE066"/>` +
+          `<text x="6" y="${modY}" font-family="Arial, sans-serif" ` +
+            `font-size="${itemDetailSize}" font-weight="bold" fill="#444400">` +
+            `+ ${esc(modifierText)}</text>`
+        : '';
+
       const itemSvg = Buffer.from(
         `<svg width="${textWidth + 10}" height="${thumbSize + 10}" xmlns="http://www.w3.org/2000/svg">` +
           `<text x="0" y="${Math.round(itemNameSize * 1.2)}" font-family="Arial, sans-serif" font-size="${itemNameSize}" ` +
           `font-weight="bold" fill="#222222">${esc(li.productName || 'Unknown Product')}</text>` +
+          modifierBlock +
           (skuLine
-            ? `<text x="0" y="${Math.round(itemNameSize * 2.5)}" font-family="Arial, sans-serif" ` +
+            ? `<text x="0" y="${skuY}" font-family="Arial, sans-serif" ` +
               `font-size="${itemDetailSize}" fill="#666666">${skuLine}</text>`
             : '') +
           (teamLine
-            ? `<text x="0" y="${Math.round(itemNameSize * 3.6)}" font-family="Arial, sans-serif" ` +
+            ? `<text x="0" y="${teamY}" font-family="Arial, sans-serif" ` +
               `font-size="${itemDetailSize}" fill="#888888">${teamLine}</text>`
             : '') +
           `<text x="${textWidth}" y="${Math.round(itemQtySize * 1.1)}" font-family="Arial, sans-serif" ` +

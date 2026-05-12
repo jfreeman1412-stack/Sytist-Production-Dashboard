@@ -113,6 +113,10 @@ function Sidebar() {
         </div>
         <SidebarLink to="api-keys" label="API Keys" />
         <SidebarLink to="packaging" label="Packaging" />
+        {/* Phase 15a: package contents */}
+        <SidebarLink to="packages" label="Packages" />
+        {/* Phase 15b: addon mappings */}
+        <SidebarLink to="addons" label="Add-ons" />
 
         <div
           style={{

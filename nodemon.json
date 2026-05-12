@@ -1,0 +1,12 @@
+{
+  "watch": ["server/**/*.js", "server/**/*.mjs", "server/**/*.cjs"],
+  "ignore": [
+    "server/config/",
+    "server/config/**",
+    "**/*.json",
+    "node_modules/",
+    "node_modules/**"
+  ],
+  "delay": 300,
+  "verbose": true
+}

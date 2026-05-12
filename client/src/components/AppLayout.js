@@ -22,6 +22,10 @@ import OverrideEditorPage from '../pages/settings/OverrideEditorPage';
 import ApiKeysPage from '../pages/settings/ApiKeysPage';
 // Phase 13b: packaging rules engine settings
 import PackagingPage from '../pages/settings/PackagingPage';
+// Phase 15a: package contents (SKU → items expansion)
+import PackagesPage from '../pages/settings/PackagesPage';
+// Phase 15b: addon mappings (co_opt_id → SKU expansion)
+import AddonsPage from '../pages/settings/AddonsPage';
 // Phase 13f: dedicated ShipStation page (pending/shipped/failed)
 import ShipStationPage from '../pages/ShipStationPage';
 
@@ -120,6 +124,10 @@ export default function AppLayout({ user, onLogout }) {
             <Route path="api-keys" element={<ApiKeysPage />} />
             {/* Phase 13b: packaging rules engine */}
             <Route path="packaging" element={<PackagingPage />} />
+            {/* Phase 15a: package contents (Gold/Silver/Bronze items) */}
+            <Route path="packages" element={<PackagesPage />} />
+            {/* Phase 15b: addon mappings */}
+            <Route path="addons" element={<AddonsPage />} />
           </Route>
 
           {/* Unknown paths fall back to home. Could be a 404 page later. */}

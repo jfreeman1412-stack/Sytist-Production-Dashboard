@@ -1,0 +1,230 @@
+Phase 16 — SQLite migration for addon/package configs + audit history
+
+═══════════════════════════════════════════════════════
+SUMMARY
+═══════════════════════════════════════════════════════
+
+Three config systems get a storage backend upgrade:
+
+  1. addon-mappings.json    → SQLite addon_mappings table
+  2. package-contents.json  → SQLite packages + package_items tables
+  3. order_overrides table  → audit history hooks added
+     (already SQLite since Phase 11 — no data migration)
+
+Plus shared infrastructure:
+  - config_history table — unified audit log across all three configs
+  - configHistoryService.js — common record/list helpers
+  - HistoryModal.js — reusable timeline viewer (📜 button per row/card)
+  - 4 new endpoints: /config-history, /config-history/recent,
+    /api/sytist/addon-mappings/export and /import,
+    /api/sytist/package-contents/export and /import
+
+═══════════════════════════════════════════════════════
+WHY
+═══════════════════════════════════════════════════════
+
+  - Fixes the nodemon-restart-on-file-write problem at its root.
+    Writing to SQLite doesn't touch the filesystem in a way nodemon
+    notices, so settings saves no longer kill in-flight requests.
+
+  - Concurrent edits are safe. Today's "read whole JSON, mutate,
+    write whole JSON" pattern would lose-race if two operators
+    edited Settings simultaneously. SQLite handles concurrent
+    writes correctly via locking.
+
+  - Audit trail. Every settings change is now recorded with what
+    changed, when, and (when an auth session is present) by whom.
+    Operators can review history per row.
+
+  - Export/import. A "↓ Export" button downloads the current
+    config as JSON. An "↑ Import" button accepts a JSON file
+    (same shape as export) and replaces the config wholesale.
+    Useful for backups, sharing config between environments, or
+    bulk edits in an external editor.
+
+═══════════════════════════════════════════════════════
+BEFORE YOU DEPLOY — BACKUP
+═══════════════════════════════════════════════════════
+
+  Strongly recommended: back up the SQLite database AND the config
+  directory before this deploy. The migration is transactional and
+  idempotent, but better safe.
+
+    cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+    copy server\config\sytist-dashboard.db server\config\sytist-dashboard.db.bak
+    xcopy server\config server\config-backup-pre-phase16 /E /I
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-16.tar.gz --strip-components=1
+
+Nodemon picks up server changes. Hard refresh browser.
+
+On first boot post-deploy, expect these log lines:
+
+  [Database] Migrated 8 addon mappings from JSON
+  [Database] Archived addon-mappings.json to addon-mappings.json.migrated
+  [Database] Migrated 4 packages (16 items) from JSON
+  [Database] Archived package-contents.json to package-contents.json.migrated
+  [Database] Initialized at C:\...\server\config\sytist-dashboard.db
+
+If you DON'T see migration lines, that means one of:
+  - The JSON files were already migrated (lines won't repeat)
+  - The JSON files don't exist (nothing to migrate)
+  - The SQLite tables already have data (skipped to be safe)
+
+All three cases are normal — the migration is one-shot and
+idempotent.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/services/database.js
+    + 4 new tables (addon_mappings, packages, package_items, config_history)
+      plus defensive CREATE for order_overrides
+    + 4 new indexes
+    + _migrateJsonConfigs() called from init() after schema creation
+
+  server/services/addonMappingsService.js
+    Rewritten. Same public API, SQLite-backed implementation. All
+    writes wrap in a transaction + record one history row per
+    changed entity. Diffs vs previous state so untouched rows
+    don't generate noisy history entries.
+
+  server/services/packageContentsService.js
+    Rewritten. Same public API. Items wholesale-replaced on update
+    (simpler than per-item diff). Foreign-key cascade from
+    package_items to packages handles deletes cleanly.
+
+  server/services/orderOverrideService.js
+    Public API unchanged + new optional `username` param to
+    upsert/remove/setReprintFilename. Each write records a history
+    row in config_history with config_type='order_override'.
+
+  server/routes/sytist.js
+    + Thread req.user?.username through PUT/DELETE handlers for
+      addon-mappings and package-contents
+    + New endpoints (8): config-history, config-history/recent,
+      addon-mappings/export, addon-mappings/import,
+      package-contents/export, package-contents/import
+
+  client/src/pages/settings/AddonsPage.js
+    + Export / Import buttons in page header
+    + 📜 history button per row → opens HistoryModal
+    + Confirmation prompt before bulk import
+
+  client/src/pages/settings/PackagesPage.js
+    + Export / Import buttons in page header
+    + 📜 History button per package card → opens HistoryModal
+
+NEW:
+  server/services/configHistoryService.js
+    Singleton with record({...}) / list({...}) / recent({...})
+    methods. Polymorphic on config_type — three values supported:
+    'addon_mapping', 'package', 'order_override'.
+
+  client/src/components/HistoryModal.js
+    Reusable timeline viewer. Renders insert/update/delete actions
+    with side-by-side prev/new JSON snapshots, timestamps, and
+    "by <username>" attribution. ESC key + outside click dismiss.
+
+═══════════════════════════════════════════════════════
+DATA MODEL
+═══════════════════════════════════════════════════════
+
+  addon_mappings
+    opt_id (PK)
+    type ('product' | 'modifier')
+    name, sku, qty       — product fields
+    suffix               — modifier field
+    updated_at, updated_by
+
+  packages
+    package_sku (PK)
+    name
+    updated_at, updated_by
+
+  package_items
+    id (PK auto)
+    package_sku (FK CASCADE) + item_sku — unique together
+    qty, sort_order
+
+  config_history
+    history_id (PK auto)
+    config_type — 'addon_mapping' | 'package' | 'order_override'
+    entity_id   — opt_id, package_sku, or "<orderId>:<cartId>"
+    action      — 'insert' | 'update' | 'delete'
+    prev_value, new_value — JSON snapshots
+    changed_at, changed_by
+    Indexes: (config_type, entity_id, changed_at DESC), (changed_at DESC)
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+  1. Server starts. Check the log for migration lines.
+
+  2. Open Settings → Add-ons. All your mappings still visible.
+     Make a small edit (rename one entry) and save. Should:
+       - Save cleanly (no proxy ECONNRESET — proves nodemon
+         isn't restarting on the DB write either)
+       - Click 📜 on that row → modal shows the edit you just
+         made + the original migration entry
+
+  3. Open Settings → Packages. All packages still visible.
+     Click 📜 on Gold Package — should show the migration entry
+     attributed to "migration" (the username we set for the
+     initial JSON import).
+
+  4. Try Export → save the .json. The file shape matches the
+     old config files exactly, so you can use it as a backup.
+
+  5. Optional test: Edit something via the file, then Import it
+     back. Confirm in the history modal that this shows up as an
+     "update" with prev/new diff.
+
+═══════════════════════════════════════════════════════
+ROLLBACK PATH (if something's wrong)
+═══════════════════════════════════════════════════════
+
+  1. Stop the dev server.
+  2. Replace server/services/database.js with the previous version
+     from git history.
+  3. Restore the .db backup OR delete the new tables (DB still
+     has sessions data you need to keep).
+  4. Rename server/config/addon-mappings.json.migrated back to
+     .json — same for package-contents.
+  5. Restart.
+
+This is the worst-case path. The expected case is that migration
+just works — it's been smoke-tested with mock data and all the
+paths exercise cleanly.
+
+═══════════════════════════════════════════════════════
+KNOWN CONSIDERATIONS
+═══════════════════════════════════════════════════════
+
+  - config_history grows over time. At a typical edit rate
+    (1-10 saves/day across all configs) it'll be hundreds of
+    rows/month — trivially small. If you ever want to prune
+    older history, that's a SQL DELETE statement away.
+
+  - The migration attributes initial entries to changed_by =
+    'migration'. Subsequent edits will show the actual logged-in
+    username (or null if requireAuth isn't enforced on that
+    route).
+
+  - Order-override history records metadata (layoutId, variant,
+    filenames) but NOT the layout_snapshot itself. The snapshot
+    can be hundreds of KB per row and isn't useful for an audit
+    view. The override TABLE still stores it; we just don't
+    duplicate it into history.
+
+  - The .json.migrated files stay in server/config/. They're a
+    safety net for rollback. Once you're confident the SQLite
+    backend is working, you can delete them — but no rush.

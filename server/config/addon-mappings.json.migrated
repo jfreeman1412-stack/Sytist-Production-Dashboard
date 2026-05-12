@@ -1,0 +1,84 @@
+{
+  "62": {
+    "type": "product",
+    "name": "Add on High Resolution Download",
+    "sku": "25",
+    "qty": 1
+  },
+  "66": {
+    "type": "product",
+    "name": "Add on High Resolution Download",
+    "sku": "25",
+    "qty": 1
+  },
+  "69": {
+    "type": "product",
+    "name": "Add on Photo Button",
+    "sku": "16",
+    "qty": 1
+  },
+  "70": {
+    "type": "product",
+    "name": "Add on two 3.5x5 Magnets",
+    "sku": "15",
+    "qty": 1
+  },
+  "457": {
+    "type": "modifier",
+    "name": "Photo Frame",
+    "suffix": "-PHOTO FRAME"
+  },
+  "458": {
+    "type": "modifier",
+    "name": "Photo Frame",
+    "suffix": "-PHOTO FRAME"
+  },
+  "2925": {
+    "type": "product",
+    "name": "Add on 1- 8x10",
+    "sku": "8",
+    "qty": 1
+  },
+  "2926": {
+    "type": "product",
+    "name": "Add on 2 -5x7's",
+    "sku": "10",
+    "qty": 2
+  },
+  "2927": {
+    "type": "product",
+    "name": "Add on 8 - Wallets",
+    "sku": "12",
+    "qty": 1
+  },
+  "2928": {
+    "type": "product",
+    "name": "Add on Memory Mate",
+    "sku": "6",
+    "qty": 1
+  },
+  "2929": {
+    "type": "product",
+    "name": "Add on Photo Button",
+    "sku": "16",
+    "qty": 1
+  },
+  "2930": {
+    "type": "product",
+    "name": "Add on Key Chain",
+    "sku": "7",
+    "qty": 1
+  },
+  "2931": {
+    "type": "product",
+    "name": "Add on two 3.5x5 Magnets",
+    "sku": "15",
+    "qty": 1
+  },
+  "2932": {
+    "type": "product",
+    "name": "Add on Coffee Mug",
+    "sku": "20",
+    "qty": 1
+  }
+}

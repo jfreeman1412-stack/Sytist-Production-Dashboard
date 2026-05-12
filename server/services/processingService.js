@@ -89,7 +89,16 @@ const DEFAULT_SETTINGS = {
 
 // Skip flags shared with darkroom + slip — items with any of these aren't
 // print jobs and are dropped from processing entirely.
-const SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell'];
+// Skip flags shared with darkroom + slip — items with any of these aren't
+// print jobs and are dropped from processing entirely.
+//
+// Phase 15a: isPackageHeader is the synthetic flag we attach to the
+// original package row after explosion. The constituents (with
+// flags.isPackageItem = true) ARE printable; the header is just a
+// label for the operator/slip. Skipping it here keeps darkroom .txt
+// and the print pipeline from rendering "Gold Package" as if it were
+// a single product.
+const SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell', 'isPackageHeader'];
 
 // In-memory job registry for batch processing progress polling. Cleared
 // 1 hour after job completion to avoid unbounded growth.

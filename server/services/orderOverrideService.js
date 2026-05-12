@@ -193,6 +193,7 @@ class OrderOverrideService {
     originalCompositeFilename = null,
     reprintCompositeFilename = null,
     createdBy = null,
+    username = null,
   }) {
     this.init();
     const now = new Date().toISOString();
@@ -214,6 +215,37 @@ class OrderOverrideService {
       created_by: existing ? existing.created_by : createdBy,
       updated_at: now,
     });
+
+    // Phase 16: audit-history hook. Record after the write so the
+    // snapshot reflects the new state. The layout snapshot itself
+    // is excluded from the history JSON (large, rarely useful) —
+    // we just record the metadata diff.
+    this._recordHistory({
+      orderId,
+      cartId,
+      action: existing ? 'update' : 'insert',
+      prev: existing
+        ? {
+            layoutId: existing.layout_id,
+            variant: existing.variant,
+            originalCompositeFilename: existing.original_composite_filename,
+            reprintCompositeFilename: existing.reprint_composite_filename,
+            updatedAt: existing.updated_at,
+          }
+        : null,
+      next: {
+        layoutId: String(layoutId),
+        variant: String(variant),
+        originalCompositeFilename:
+          existing && existing.original_composite_filename
+            ? existing.original_composite_filename
+            : originalCompositeFilename,
+        reprintCompositeFilename,
+        updatedAt: now,
+      },
+      username,
+    });
+
     return this.get(orderId, cartId);
   }
 
@@ -221,15 +253,34 @@ class OrderOverrideService {
    * Mark a reprint filename on an existing override (after a
    * successful reprint render).
    */
-  setReprintFilename(orderId, cartId, filename) {
+  setReprintFilename(orderId, cartId, filename, { username = null } = {}) {
     this.init();
     const now = new Date().toISOString();
+    const existing = this._stmts.get.get(Number(orderId), Number(cartId));
     this._stmts.setReprintFilename.run(
       filename,
       now,
       Number(orderId),
       Number(cartId)
     );
+    if (existing) {
+      this._recordHistory({
+        orderId,
+        cartId,
+        action: 'update',
+        prev: {
+          layoutId: existing.layout_id,
+          variant: existing.variant,
+          reprintCompositeFilename: existing.reprint_composite_filename,
+        },
+        next: {
+          layoutId: existing.layout_id,
+          variant: existing.variant,
+          reprintCompositeFilename: filename,
+        },
+        username,
+      });
+    }
   }
 
   /**
@@ -238,13 +289,52 @@ class OrderOverrideService {
    * responsibility (typically: re-render with the original layout
    * to overwrite the bad output).
    */
-  remove(orderId, cartId) {
+  remove(orderId, cartId, { username = null } = {}) {
     this.init();
+    const existing = this._stmts.get.get(Number(orderId), Number(cartId));
     const result = this._stmts.delete.run(
       Number(orderId),
       Number(cartId)
     );
+    if (result.changes > 0 && existing) {
+      this._recordHistory({
+        orderId,
+        cartId,
+        action: 'delete',
+        prev: {
+          layoutId: existing.layout_id,
+          variant: existing.variant,
+          originalCompositeFilename: existing.original_composite_filename,
+          reprintCompositeFilename: existing.reprint_composite_filename,
+        },
+        next: null,
+        username,
+      });
+    }
     return result.changes > 0;
+  }
+
+  // Phase 16: write one row to config_history. Lazy-loaded to avoid
+  // a require cycle at module load (database.js depends on this file
+  // not existing yet on first migration boot).
+  _recordHistory({ orderId, cartId, action, prev, next, username }) {
+    try {
+      const configHistory = require('./configHistoryService');
+      configHistory.record({
+        configType: 'order_override',
+        entityId: `${orderId}:${cartId}`,
+        action,
+        prevValue: prev,
+        newValue: next,
+        username,
+      });
+    } catch (err) {
+      // Don't let history failures break the primary write. Log and
+      // move on — the data change committed in its own transaction.
+      console.warn(
+        `[orderOverrideService] history record failed: ${err.message}`
+      );
+    }
   }
 }
 

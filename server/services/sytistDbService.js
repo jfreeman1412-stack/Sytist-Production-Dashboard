@@ -164,6 +164,254 @@ function normalizeSubjectFields(orderRow) {
   return fields;
 }
 
+// ─── Phase 15a: package explosion ─────────────────────────
+//
+// Sytist stores a customer's package order as a single ms_cart row
+// with cart_package > 0 (e.g. "Gold Package" with one photo). The
+// rest of the production pipeline (composite, imposition, darkroom,
+// slip) operates on individual products, so we expand the package
+// row into synthetic line items right after the cart→lineItems
+// stitching in both getOrdersByWorkflow and getOrderById.
+//
+// Behavior:
+//   - For each line item where flags.package === true, look up the
+//     package's contents from packageContentsService.
+//   - If contents are configured: emit the original package row as
+//     a "header" (flags.isPackageHeader = true, used by the
+//     processing pipeline to skip producing prints for the package
+//     row itself), then emit synthetic line items for each constituent.
+//   - If contents are NOT configured: pass the package row through
+//     unchanged, the existing behavior (one print of the photo).
+//     The Settings UI surfaces this as a config gap so operators
+//     notice.
+//   - Synthetic constituents inherit photo, gallery, sub-gallery
+//     from the parent package row. They get a synthetic cartId
+//     ("<parentCartId>-pkg-<sku>") and flags.isPackageItem = true
+//     plus flags.packageParentCartId for traceability.
+//   - If the package row's qty > 1 (rare), the constituent qty is
+//     multiplied. Same photo though — Sytist doesn't track separate
+//     photos per qty.
+//
+// We do this in a free function rather than a method on the service
+// to keep it pure and easy to test. The caller supplies the resolved
+// content map (so async config-loading happens once per query, not
+// per line item).
+
+function _expandPackageLineItems(lineItems, packageContentsMap) {
+  if (!packageContentsMap) return lineItems;
+  const out = [];
+  for (const li of lineItems) {
+    if (!li.flags?.package) {
+      out.push(li);
+      continue;
+    }
+    const contents = packageContentsMap[String(li.sku)];
+    if (!contents || contents.length === 0) {
+      // Package SKU not configured — leave as-is. Operator sees the
+      // gap in the Settings UI.
+      out.push(li);
+      continue;
+    }
+    // Emit header: keep the original row but mark it.
+    out.push({
+      ...li,
+      flags: { ...li.flags, isPackageHeader: true },
+    });
+    // Emit synthetic constituents inheriting the parent's photo,
+    // gallery, sub-gallery. cartId is a string so it never collides
+    // with real numeric cart IDs.
+    const packageQty = Math.max(1, li.qty || 1);
+    for (const item of contents) {
+      const itemQty = (item.qty || 1) * packageQty;
+      // If the constituent is digital (per packaging-config's
+      // productWeights.category), flag it as download so the
+      // existing pipeline (processingService, packingSlipService)
+      // skips it the same way an explicitly-ordered digital line
+      // would be skipped. Without this, a Gold Package's bundled
+      // Digital Download (SKU 25) would erroneously go through
+      // imposition, composite, and darkroom .txt writes.
+      const isDigital = item.category === 'digital';
+      out.push({
+        cartId: `${li.cartId}-pkg-${item.sku}`,
+        productName: item.name || `SKU ${item.sku}`,
+        sku: String(item.sku),
+        qty: itemQty,
+        price: 0, // bundled into parent package
+        photoProductId: li.photoProductId, // inherit; pipeline doesn't
+                                            // distinguish per constituent
+        galleryId: li.galleryId,
+        galleryName: li.galleryName,
+        subGalleryId: li.subGalleryId,
+        subGalleryName: li.subGalleryName,
+        photo: li.photo,
+        backgroundPhoto: li.backgroundPhoto,
+        flags: {
+          // Inherit workflow-relevant flags from parent (giftCert,
+          // creditProduct, booking, preSell — all package-level
+          // concepts that propagate to constituents).
+          ...li.flags,
+          // Per-constituent overrides:
+          package: false, // the constituent itself isn't a package
+          isPackageHeader: false,
+          isPackageItem: true,
+          packageParentCartId: li.cartId,
+          packageParentSku: li.sku,
+          // Digital category drives the download flag; this lets
+          // the existing SKIP_FLAGS-based filtering in processing
+          // and slip work correctly for bundled digital items.
+          download: isDigital ? true : !!li.flags?.download,
+        },
+        options: [], // constituents have no per-line options
+        thumbPath: li.thumbPath,
+        notes: '',
+      });
+    }
+  }
+  return out;
+}
+
+// ─── Phase 15b: add-on explosion ──────────────────────────
+//
+// Sytist add-ons live in ms_cart_options rows attached to a parent
+// ms_cart row. Each option has a co_opt_id (Sytist's identifier for
+// the add-on type) and co_price (what the customer paid for the
+// add-on). They're typically discounted "and one of these too" items:
+// order a Memory Mate, add 2 Magnets for $8.49.
+//
+// Without explosion, the production pipeline never sees the add-on
+// — the magnets don't get printed, the slip doesn't list them, the
+// .txt file is silent. After explosion, each MAPPED add-on becomes
+// a synthetic line item the existing pipeline handles naturally.
+//
+// Differences from package explosion:
+//   - The PARENT line item is NOT skipped. It's a real product the
+//     customer paid for and must be produced.
+//   - The synthetic item gets its `price` from the add-on's co_price
+//     (whereas package constituents are price=0 since the parent
+//     carries the bundled price).
+//   - The mapping is keyed by co_opt_id (Sytist option ID), not by
+//     parent SKU.
+//   - Options WITHOUT a mapping stay as text on the parent line's
+//     options array — they still show on the slip/order detail as
+//     informational text, just don't get expanded into producible
+//     items.
+//
+// Synthetic constituent shape:
+//   - cartId = "<parentCartId>-addon-<coId>"   (string)
+//   - sku    = the mapping's sku
+//   - qty    = 1                                (always)
+//   - price  = the option's co_price
+//   - photo / gallery / sub-gallery inherited from parent
+//   - flags.isAddonItem = true
+//   - flags.addonParentCartId = parent
+//   - flags.addonOptId = co_opt_id
+//   - flags.download = true if mapped SKU is digital (same digital-
+//     skip story as package constituents)
+
+function _expandAddonLineItems(lineItems, addonMap, productCategoriesBySku) {
+  if (!addonMap || Object.keys(addonMap).length === 0) return lineItems;
+  const out = [];
+  for (const li of lineItems) {
+    // Phase 15c: two kinds of add-on mappings:
+    //
+    //   product  — expands into a synthetic line item with sku+qty.
+    //              Same as phase 15b behavior, now with qty support.
+    //
+    //   modifier — does NOT expand. Appends a suffix to the parent's
+    //              productName so it flows through to slip + Darkroom
+    //              .txt; also recorded in a parent-line modifiers[]
+    //              array so the slip can highlight it visually.
+    //
+    // We process the parent line's options to build:
+    //   1. parentModifiers — list of {name, suffix, price} that the
+    //      slip/UI uses to render highlights
+    //   2. parentSuffixes  — concatenated suffix text appended to
+    //      productName so it shows on the .txt directly
+    //   3. syntheticItems  — new line items for product-type mappings,
+    //      emitted AFTER the (modified) parent
+
+    if (!Array.isArray(li.options) || li.options.length === 0) {
+      out.push(li);
+      continue;
+    }
+
+    const parentModifiers = [];
+    const parentSuffixes = [];
+    const syntheticItems = [];
+
+    for (const opt of li.options) {
+      if (!opt.optId) continue;
+      const mapping = addonMap[String(opt.optId)];
+      if (!mapping) continue;
+
+      if (mapping.type === 'modifier') {
+        if (!mapping.suffix) continue; // half-configured; ignore
+        parentSuffixes.push(mapping.suffix);
+        parentModifiers.push({
+          optId: String(opt.optId),
+          name: mapping.name || opt.name || `Modifier ${opt.optId}`,
+          suffix: mapping.suffix,
+          price: Number(opt.price) || 0,
+        });
+        continue;
+      }
+
+      // product type (or legacy entry without explicit type)
+      if (!mapping.sku) continue;
+      const qty = Math.max(1, parseInt(mapping.qty, 10) || 1);
+      const targetSku = String(mapping.sku);
+      const category = productCategoriesBySku
+        ? productCategoriesBySku[targetSku] || null
+        : null;
+      const isDigital = category === 'digital';
+      syntheticItems.push({
+        cartId: `${li.cartId}-addon-${opt.coId || opt.optId}`,
+        productName: mapping.name || opt.name || `Add-on ${opt.optId}`,
+        sku: targetSku,
+        qty,
+        price: opt.price || 0,
+        photoProductId: li.photoProductId,
+        galleryId: li.galleryId,
+        galleryName: li.galleryName,
+        subGalleryId: li.subGalleryId,
+        subGalleryName: li.subGalleryName,
+        photo: li.photo,
+        backgroundPhoto: li.backgroundPhoto,
+        flags: {
+          ...li.flags,
+          package: false,
+          isPackageHeader: false,
+          isPackageItem: false,
+          isAddonItem: true,
+          addonParentCartId: li.cartId,
+          addonOptId: String(opt.optId),
+          download: isDigital ? true : !!li.flags?.download,
+        },
+        options: [], // synthetic items don't carry options
+        thumbPath: li.thumbPath,
+        notes: '',
+      });
+    }
+
+    // Emit the (possibly modified) parent. We don't mutate the
+    // original object — clone if there's anything to add. Otherwise
+    // pass through by reference so callers can rely on identity.
+    if (parentSuffixes.length > 0 || parentModifiers.length > 0) {
+      out.push({
+        ...li,
+        productName: li.productName + parentSuffixes.join(''),
+        modifiers: parentModifiers,
+      });
+    } else {
+      out.push(li);
+    }
+
+    // Then the synthetic product-type addons
+    for (const syn of syntheticItems) out.push(syn);
+  }
+  return out;
+}
+
 // ─── Photo URL assembly ───────────────────────────────────
 //
 // Photos live on S3. The full URL is:
@@ -516,6 +764,15 @@ class SytistDbService {
 
     const orderIds = orderRowsByWorkflow.map((r) => r.order_id);
 
+    // Phase 15a: load package contents map once for the whole query.
+    // Each order's lineItems build will consult this when expanding
+    // package rows into their constituent items.
+    // Phase 15b: also load the addon mappings here. Both maps are
+    // singleton-cached so this is cheap.
+    const { packageContentsMap, productCategoriesBySku } =
+      await this._loadPackageMap();
+    const { addonMap } = await this._loadAddonMap();
+
     // ─── Query 2: cart lines for those orders ──────────────
     //
     // UNION ALL across ms_cart and ms_cart_archive. Only orders with
@@ -628,7 +885,7 @@ class SytistDbService {
     if (cartIdsList.length > 0) {
       const [optRows] = await pool.query(
         `
-        SELECT co_cart_id, co_opt_name, co_select_name, co_price
+        SELECT co_id, co_cart_id, co_opt_id, co_opt_name, co_select_name, co_price
         FROM ms_cart_options
         WHERE co_cart_id IN (?)
         ORDER BY co_id
@@ -638,6 +895,12 @@ class SytistDbService {
       for (const o of optRows) {
         const list = optionsByCartId.get(o.co_cart_id) || [];
         list.push({
+          // Phase 15b: include co_id and co_opt_id so the addon
+          // explosion can synthesize unique cartIds and look up
+          // option mappings. Existing consumers of `options` only
+          // read name/selectedValue/price so adding fields is safe.
+          coId: o.co_id,
+          optId: o.co_opt_id != null ? String(o.co_opt_id) : null,
           name: o.co_opt_name || '',
           selectedValue: o.co_select_name || '',
           price: Number(o.co_price) || 0,
@@ -716,17 +979,39 @@ class SytistDbService {
         };
       });
 
+      // Phase 15a: expand package rows into their constituent items.
+      // No-op if packageContentsMap is null (no config) or if no line
+      // has flags.package true.
+      const packageExpanded = _expandPackageLineItems(
+        lineItems,
+        packageContentsMap
+      );
+
+      // Phase 15b: expand add-on options (ms_cart_options) into
+      // synthetic line items so the production pipeline materializes
+      // them. Runs AFTER package expansion so package constituents
+      // (which have options: []) are correctly no-op'd, and so that
+      // an add-on attached to a regular line item still expands. Add-
+      // ons attached to a package row itself currently expand too —
+      // unusual but allowed; the operator will see them as items
+      // hanging off the package header.
+      const expandedLineItems = _expandAddonLineItems(
+        packageExpanded,
+        addonMap,
+        productCategoriesBySku
+      );
+
       // Order-level gallery: take the first cart line's gallery as primary.
       // Sibling detection: distinct sub-galleries across lines.
       const distinctSubGalleries = new Set(
-        lineItems
+        expandedLineItems
           .map((li) => li.subGalleryId)
           .filter((id) => id > 0)
       );
       const isSibling = distinctSubGalleries.size > 1;
 
       const primaryGallery =
-        lineItems.find((li) => li.galleryId > 0) || null;
+        expandedLineItems.find((li) => li.galleryId > 0) || null;
 
       const shipping = categorizeShipping(
         o.order_shipping_option,
@@ -790,7 +1075,7 @@ class SytistDbService {
         subGalleryId: primaryGallery ? primaryGallery.subGalleryId : 0,
         subGalleryName: primaryGallery ? primaryGallery.subGalleryName : '',
 
-        lineItems,
+        lineItems: expandedLineItems,
         isSibling,
 
         dueDate:
@@ -1139,7 +1424,7 @@ class SytistDbService {
     if (cartIdsList.length > 0) {
       const [optRows] = await pool.query(
         `
-        SELECT co_cart_id, co_opt_name, co_select_name, co_price
+        SELECT co_id, co_cart_id, co_opt_id, co_opt_name, co_select_name, co_price
         FROM ms_cart_options
         WHERE co_cart_id IN (?)
         ORDER BY co_id
@@ -1149,6 +1434,9 @@ class SytistDbService {
       for (const op of optRows) {
         const list = optionsByCartId.get(op.co_cart_id) || [];
         list.push({
+          // Phase 15b: include co_id and co_opt_id (see getOrdersByWorkflow)
+          coId: op.co_id,
+          optId: op.co_opt_id != null ? String(op.co_opt_id) : null,
           name: op.co_opt_name || '',
           selectedValue: op.co_select_name || '',
           price: Number(op.co_price) || 0,
@@ -1205,11 +1493,28 @@ class SytistDbService {
       };
     });
 
+    // Phase 15a: expand package rows. Same logic as
+    // getOrdersByWorkflow — load the contents map, walk lineItems,
+    // emit synthetic constituents for each configured package row.
+    // Phase 15b: chain add-on explosion afterwards.
+    const { packageContentsMap, productCategoriesBySku } =
+      await this._loadPackageMap();
+    const { addonMap } = await this._loadAddonMap();
+    const packageExpanded = _expandPackageLineItems(
+      lineItems,
+      packageContentsMap
+    );
+    const expandedLineItems = _expandAddonLineItems(
+      packageExpanded,
+      addonMap,
+      productCategoriesBySku
+    );
+
     const distinctSubGalleries = new Set(
-      lineItems.map((li) => li.subGalleryId).filter((sid) => sid > 0)
+      expandedLineItems.map((li) => li.subGalleryId).filter((sid) => sid > 0)
     );
     const isSibling = distinctSubGalleries.size > 1;
-    const primaryGallery = lineItems.find((li) => li.galleryId > 0) || null;
+    const primaryGallery = expandedLineItems.find((li) => li.galleryId > 0) || null;
     const shipping = categorizeShipping(o.order_shipping_option, o.order_shipping);
 
     return {
@@ -1267,7 +1572,7 @@ class SytistDbService {
       subGalleryId: primaryGallery ? primaryGallery.subGalleryId : 0,
       subGalleryName: primaryGallery ? primaryGallery.subGalleryName : '',
 
-      lineItems,
+      lineItems: expandedLineItems,
       isSibling,
 
       dueDate:
@@ -1573,6 +1878,135 @@ class SytistDbService {
       bpId: row.bpId,
       candidateCount: rows.length, // 1 = clean match, 2 = multi-match (we returned newest)
     };
+  }
+
+  /**
+   * Phase 15a: load the package-contents map and a SKU→name lookup
+   * once per query, so _expandPackageLineItems can resolve SKUs
+   * efficiently. Both services are singletons with their own caches;
+   * calling them is cheap.
+   *
+   * Returns:
+   *   {
+   *     packageContentsMap: { [packageSku]: [{ sku, qty, name }, ...] },
+   *     // null if no package contents are configured at all — caller
+   *     // can short-circuit and skip _expandPackageLineItems entirely.
+   *   }
+   */
+  async _loadPackageMap() {
+    let packageContentsService;
+    let packagingService;
+    try {
+      packageContentsService = require('./packageContentsService');
+    } catch {
+      return { packageContentsMap: null };
+    }
+    let contentsConfig;
+    try {
+      contentsConfig = await packageContentsService.getConfig();
+    } catch (err) {
+      console.warn(
+        `[SytistDB] Could not load package contents config: ${err.message}`
+      );
+      return { packageContentsMap: null };
+    }
+    if (!contentsConfig || Object.keys(contentsConfig).length === 0) {
+      return { packageContentsMap: null };
+    }
+
+    // Build SKU→name and SKU→category lookups from packaging-config.
+    // The category lookup is used by _expandPackageLineItems to set
+    // flags.download for digital constituents — so e.g. the Gold
+    // Package's bundled Digital Download (SKU 25) gets flagged the
+    // same way an explicitly-ordered digital line item would, and
+    // the production pipeline correctly skips it.
+    let productNames = {};
+    let productCategories = {};
+    try {
+      packagingService = require('./packagingService');
+      const pkgCfg = await packagingService.getConfig();
+      for (const [sku, def] of Object.entries(pkgCfg.productWeights || {})) {
+        if (def && def.name) productNames[String(sku)] = def.name;
+        if (def && def.category) productCategories[String(sku)] = def.category;
+      }
+      // Also pull names from packageBundles in case a package SKU
+      // itself appears as a constituent (unusual but allowed).
+      for (const [sku, def] of Object.entries(pkgCfg.packageBundles || {})) {
+        if (def && def.name) productNames[String(sku)] = def.name;
+      }
+    } catch {
+      // packagingService unavailable — names will fall back to "SKU N"
+    }
+
+    // Decorate contents map with names + categories for synthetic
+    // productName and digital-flag inference.
+    const packageContentsMap = {};
+    for (const [pkgSku, pkg] of Object.entries(contentsConfig)) {
+      packageContentsMap[pkgSku] = (pkg.items || []).map((item) => ({
+        sku: String(item.sku),
+        qty: Math.max(1, parseInt(item.qty, 10) || 1),
+        name: productNames[String(item.sku)] || `SKU ${item.sku}`,
+        category: productCategories[String(item.sku)] || null,
+      }));
+    }
+    // Phase 15b: also return productCategories so the addon
+    // explosion in the same query can infer the digital flag for
+    // mapped add-on SKUs without re-loading packagingService.
+    return { packageContentsMap, productCategoriesBySku: productCategories };
+  }
+
+  /**
+   * Phase 15b: load the addon-mappings config once per query for
+   * use by _expandAddonLineItems. Returns { addonMap } where
+   * addonMap[optId] = { name, sku } for every configured mapping.
+   * Empty/null when no mappings are configured.
+   */
+  async _loadAddonMap() {
+    let addonMappingsService;
+    try {
+      addonMappingsService = require('./addonMappingsService');
+    } catch {
+      return { addonMap: null };
+    }
+    try {
+      const cfg = await addonMappingsService.getConfig();
+      if (!cfg || Object.keys(cfg).length === 0) {
+        return { addonMap: null };
+      }
+      // Phase 15c: two mapping types. Pass through only "complete"
+      // mappings:
+      //   - product mappings need a non-empty sku
+      //   - modifier mappings need a non-empty suffix
+      // Half-configured entries are dropped here so the explosion
+      // logic doesn't have to recheck completeness per option.
+      const out = {};
+      for (const [optId, mapping] of Object.entries(cfg)) {
+        if (!mapping) continue;
+        const type = mapping.type === 'modifier' ? 'modifier' : 'product';
+        if (type === 'modifier') {
+          if (!mapping.suffix) continue;
+          out[String(optId)] = {
+            type: 'modifier',
+            name: mapping.name || '',
+            suffix: mapping.suffix,
+          };
+        } else {
+          if (!mapping.sku) continue;
+          out[String(optId)] = {
+            type: 'product',
+            name: mapping.name || '',
+            sku: String(mapping.sku),
+            qty: Math.max(1, parseInt(mapping.qty, 10) || 1),
+          };
+        }
+      }
+      return { addonMap: Object.keys(out).length > 0 ? out : null };
+    } catch (err) {
+      console.warn(
+        `[SytistDB] Could not load addon mappings: ${err.message}`
+      );
+      return { addonMap: null };
+    }
   }
 
   async close() {

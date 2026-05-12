@@ -1,0 +1,175 @@
+Phase 15b — Add-on explosion (ms_cart_options → synthetic line items)
+
+═══════════════════════════════════════════════════════
+PROBLEM
+═══════════════════════════════════════════════════════
+
+Sytist stores add-ons in ms_cart_options, attached to a ms_cart row
+via co_cart_id. Each add-on has a co_opt_id (Sytist's option type),
+co_opt_name (display name), and co_price (what the customer paid).
+
+Today the production pipeline reads ms_cart but doesn't materialize
+add-ons as production items. So a Memory Mate + "2 Magnets" add-on
+becomes a Memory Mate print only — the magnets never get made.
+
+═══════════════════════════════════════════════════════
+WHAT THIS PHASE DOES
+═══════════════════════════════════════════════════════
+
+Same pattern as Phase 15a (package explosion), but keyed by
+co_opt_id instead of package SKU.
+
+  1. New "addon mappings" config: co_opt_id → { name, sku }
+  2. sytistDbService loads the config + emits synthetic line items
+     for every option that has a mapped SKU
+  3. Existing pipeline (composite, imposition, slip, .txt) sees
+     the synthetic items and processes them like normal cart lines
+  4. Options WITHOUT a mapping stay on the parent's `options` array
+     as informational text — visible on slip + order detail but not
+     materialized
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+NEW:
+  server/services/addonMappingsService.js
+    Singleton with CRUD on server/config/addon-mappings.json.
+    Created empty on first read; operator populates via UI.
+
+  client/src/pages/settings/AddonsPage.js
+    Settings → Add-ons page with three sections:
+      - Discovery panel — co_opt_id values seen in recent orders
+        that aren't mapped yet (sorted by occurrences)
+      - Configured mappings — editable table of existing mappings
+      - Manual add — for opt_ids you know ahead of time
+
+MODIFIED:
+  server/services/sytistDbService.js
+    + Both options queries (getOrdersByWorkflow + getOrderById) now
+      pull co_id and co_opt_id from ms_cart_options, exposed on the
+      line item's options[] array as { coId, optId, name, ... }.
+      Backward-compatible: existing consumers of options[] read
+      only name/selectedValue/price.
+    + New _expandAddonLineItems free function. Walks lineItems,
+      for each line with options it emits synthetic constituents
+      for each option that has a mapped SKU.
+    + New _loadAddonMap method that loads the addon-mappings config
+      once per query.
+    + Both methods now chain: package explosion → addon explosion
+      → sibling/primary-gallery detection → return.
+
+  server/routes/sytist.js
+    + GET    /api/sytist/addon-mappings           → full config
+    + PUT    /api/sytist/addon-mappings           → replace config
+    + PUT    /api/sytist/addon-mappings/:optId    → update one
+    + DELETE /api/sytist/addon-mappings/:optId    → delete one
+    + GET    /api/sytist/addon-mappings/discovery → unmapped optIds
+      from recent (scanned 200 most-recent paid+non-erased) orders.
+
+  client/src/components/AppLayout.js
+    + Import AddonsPage; <Route path="addons" element={...} /> in
+      /settings.
+
+  client/src/pages/settings/SettingsLayout.js
+    + <SidebarLink to="addons" label="Add-ons" />.
+
+═══════════════════════════════════════════════════════
+SYNTHETIC LINE ITEM SHAPE
+═══════════════════════════════════════════════════════
+
+For each option o on a line item li with a mapping in addon-mappings.json:
+  cartId             = `${li.cartId}-addon-${o.coId}`   (string)
+  sku                = mapping.sku
+  qty                = 1
+  price              = o.co_price (passed through from ms_cart_options)
+  productName        = mapping.name (or o.name as fallback)
+  photo              = li.photo (inherited)
+  galleryId          = li.galleryId
+  galleryName        = li.galleryName
+  subGalleryId       = li.subGalleryId
+  subGalleryName     = li.subGalleryName
+  flags.isAddonItem        = true
+  flags.addonParentCartId  = li.cartId
+  flags.addonOptId         = String(o.optId)
+  flags.download           = true if mapped SKU has category=digital
+  options                  = []  (synthetic items don't carry options)
+
+The parent line item is NOT modified or skipped — it's still produced
+as the real product the customer bought.
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-15b.tar.gz --strip-components=1
+
+Nodemon restart picks up server changes. Hard refresh browser.
+
+server/config/addon-mappings.json is NOT in the tarball — it's
+created empty on first read.
+
+═══════════════════════════════════════════════════════
+HOW TO USE AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+1. Open Settings → Add-ons.
+2. Top panel shows unmapped options seen in your last 200 orders,
+   ranked by occurrence count. Each row has the option's Sytist
+   name + average price + a "Map" button.
+3. Click "Map" on a row → manual-add form opens pre-filled with
+   the option's name. Pick the destination SKU from the dropdown
+   (sourced from Settings → Packaging → productWeights). Click Add.
+4. The mapping is saved. Refresh an order containing that add-on
+   to see the synthetic line item appear under the parent.
+
+═══════════════════════════════════════════════════════
+SMOKE TEST RESULTS
+═══════════════════════════════════════════════════════
+
+_expandAddonLineItems unit tests:
+  ✓ Memory Mate with mapped + unmapped options expands correctly
+    (2 synthetic items, 1 unmapped option passes through as text)
+  ✓ Synthetic items inherit photo/gallery/subGallery from parent
+  ✓ Synthetic cartIds unique (using co_id as discriminator)
+  ✓ Digital category sets download flag for digital add-ons
+  ✓ No map = no explosion (graceful)
+  ✓ Empty map = no explosion
+
+All 6 files parse cleanly. AddonsPage SSRs cleanly.
+
+═══════════════════════════════════════════════════════
+RISKS & EDGE CASES
+═══════════════════════════════════════════════════════
+
+  • Existing in-flight orders WILL expand the next time they load
+    if a relevant mapping is configured. Same behavior change as
+    Phase 15a. Correct from production standpoint, but worth being
+    aware of.
+
+  • The discovery panel scans only recent paid+non-erased orders
+    (default 200). Rare/older add-ons might not show up there;
+    operator can still add them via Manual Add.
+
+  • An add-on attached to a package line item will currently expand
+    too. Unusual case — packages have their own constituent list,
+    so adding an add-on to a Gold Package would produce both the
+    package's contents AND the add-on. Operator's call whether to
+    map it or not; the system is permissive.
+
+  • Half-configured mappings (name set but no SKU) are intentionally
+    allowed. They show in the configured-mappings table with a
+    "⚠️ No SKU" warning. The pipeline ignores them (no SKU = no
+    explosion).
+
+═══════════════════════════════════════════════════════
+NEXT STEPS (NOT IN THIS PHASE)
+═══════════════════════════════════════════════════════
+
+  • Visual grouping in the order detail page and slip — show
+    "Memory Mate ↳ 2 Magnets ↳ Photo Button" with indentation.
+    Same Phase 15c polish as for package explosion.
+
+  • Lint warnings for add-on SKUs missing composite/imposition
+    mappings (parallel to what we have for package contents).

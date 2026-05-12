@@ -1,0 +1,15 @@
+{
+  "watch": ["."],
+  "ext": "js,mjs,cjs",
+  "ignore": [
+    "config/",
+    "config/*",
+    "config/**/*",
+    "*.json",
+    "**/*.json",
+    "node_modules/",
+    "node_modules/**"
+  ],
+  "delay": 300,
+  "verbose": true
+}
