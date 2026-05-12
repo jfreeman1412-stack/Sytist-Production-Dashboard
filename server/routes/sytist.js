@@ -1229,12 +1229,64 @@ router.get('/imposition/preview/:orderId/:cartId', async (req, res) => {
         : null;
 
     const ctx = impositionService.buildContext(order, lineItem);
-    const result = await impositionService.composeFromUrl(
-      lineItem.photo.fullUrl,
-      lineItem.sku,
-      ctx,
-      orientation
-    );
+
+    // Phase 17: green-screen background compositing for the preview.
+    // If this line is green-screen with a chosen background, fetch
+    // the subject + background, composite them, and feed the result
+    // straight into the imposition layer (bypassing the URL-fetch
+    // path because we already have the bytes in memory).
+    //
+    // Non-green-screen lines go through composeFromUrl as before.
+    const greenscreenService = require('../services/greenscreenService');
+    let result;
+    if (greenscreenService.shouldComposite(lineItem)) {
+      try {
+        const subjectResp = await fetch(lineItem.photo.fullUrl);
+        if (!subjectResp.ok) {
+          throw new Error(`Failed to fetch subject: HTTP ${subjectResp.status}`);
+        }
+        const subjectBuffer = Buffer.from(await subjectResp.arrayBuffer());
+        const { buffer: composedBuffer, warnings: gsWarnings } =
+          await greenscreenService.composeWithBackground(
+            subjectBuffer,
+            lineItem.backgroundPhoto.fullUrl,
+            { outputFormat: 'jpeg', jpegQuality: 92 }
+          );
+        if (gsWarnings && gsWarnings.length > 0) {
+          for (const w of gsWarnings) {
+            console.warn(
+              `[imposition/preview] greenscreen ${w.type}: ${w.message}`
+            );
+          }
+        }
+        result = await impositionService.buildSheetBuffer(
+          composedBuffer,
+          lineItem.sku,
+          ctx,
+          orientation
+        );
+      } catch (gsErr) {
+        // Fall back to subject-only on green-screen errors so the
+        // preview still renders something. Log loudly so the operator
+        // notices something went wrong.
+        console.warn(
+          `[imposition/preview] greenscreen failed for ${req.params.orderId}/${req.params.cartId}: ${gsErr.message} — falling back to subject-only`
+        );
+        result = await impositionService.composeFromUrl(
+          lineItem.photo.fullUrl,
+          lineItem.sku,
+          ctx,
+          orientation
+        );
+      }
+    } else {
+      result = await impositionService.composeFromUrl(
+        lineItem.photo.fullUrl,
+        lineItem.sku,
+        ctx,
+        orientation
+      );
+    }
 
     if (!result.imposed) {
       return res.status(404).json({ error: result.reason });
@@ -1370,12 +1422,56 @@ router.post('/imposition/preview/:orderId/:cartId/save', async (req, res) => {
         : null);
 
     const ctx = impositionService.buildContext(order, lineItem);
-    const result = await impositionService.composeFromUrl(
-      lineItem.photo.fullUrl,
-      lineItem.sku,
-      ctx,
-      orientation
-    );
+
+    // Phase 17: green-screen compositing for the save path too.
+    // Same logic as the GET /preview endpoint above.
+    const greenscreenService = require('../services/greenscreenService');
+    let result;
+    if (greenscreenService.shouldComposite(lineItem)) {
+      try {
+        const subjectResp = await fetch(lineItem.photo.fullUrl);
+        if (!subjectResp.ok) {
+          throw new Error(`Failed to fetch subject: HTTP ${subjectResp.status}`);
+        }
+        const subjectBuffer = Buffer.from(await subjectResp.arrayBuffer());
+        const { buffer: composedBuffer, warnings: gsWarnings } =
+          await greenscreenService.composeWithBackground(
+            subjectBuffer,
+            lineItem.backgroundPhoto.fullUrl,
+            { outputFormat: 'jpeg', jpegQuality: 92 }
+          );
+        if (gsWarnings && gsWarnings.length > 0) {
+          for (const w of gsWarnings) {
+            console.warn(
+              `[imposition/preview/save] greenscreen ${w.type}: ${w.message}`
+            );
+          }
+        }
+        result = await impositionService.buildSheetBuffer(
+          composedBuffer,
+          lineItem.sku,
+          ctx,
+          orientation
+        );
+      } catch (gsErr) {
+        console.warn(
+          `[imposition/preview/save] greenscreen failed for ${req.params.orderId}/${req.params.cartId}: ${gsErr.message} — falling back to subject-only`
+        );
+        result = await impositionService.composeFromUrl(
+          lineItem.photo.fullUrl,
+          lineItem.sku,
+          ctx,
+          orientation
+        );
+      }
+    } else {
+      result = await impositionService.composeFromUrl(
+        lineItem.photo.fullUrl,
+        lineItem.sku,
+        ctx,
+        orientation
+      );
+    }
 
     if (!result.imposed) {
       return res.status(404).json({ error: result.reason });

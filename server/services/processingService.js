@@ -1167,6 +1167,63 @@ class ProcessingService {
       }
     }
 
+    // ─── Step 1.6 (Phase 17): green-screen background composite ──
+    //
+    // For line items that are green-screen (flags.greenScreen) AND
+    // have a chosen background (backgroundPhoto) AND are NOT being
+    // handled by the composite engine (skipImpositionCartIds), we
+    // need to flatten the transparent subject onto the background
+    // before imposition or the print shows up with the page color
+    // visible behind the figure.
+    //
+    // The composite engine already handles its own backgrounds via
+    // the playerBackground slot (Step 1.5), so we skip those lines
+    // here to avoid double-compositing.
+    //
+    // Items WITHOUT a composite mapping but WITH a green-screen
+    // background go through here. Common case: a regular 5x7 or
+    // 8x10 print with a chosen photo backdrop.
+    //
+    // We overwrite the downloaded file at downloaded.path so Step 2
+    // (imposition) and downstream readers pick up the composited
+    // image without any further changes.
+    const greenscreenService = require('./greenscreenService');
+    for (const li of sub.lineItems) {
+      const downloaded = photosByCartId[li.cartId];
+      if (!downloaded) continue;
+      if (skipImpositionCartIds.has(li.cartId)) continue;
+      if (!greenscreenService.shouldComposite(li)) continue;
+
+      try {
+        const subjectBuffer = await fsp.readFile(downloaded.path);
+        const { buffer: composedBuffer, warnings: gsWarnings } =
+          await greenscreenService.composeWithBackground(
+            subjectBuffer,
+            li.backgroundPhoto.fullUrl,
+            { outputFormat: 'jpeg', jpegQuality: 92 }
+          );
+        // Atomic .tmp + rename so partial writes never reach
+        // downstream readers.
+        const tmp = downloaded.path + '.gs.tmp';
+        await fsp.writeFile(tmp, composedBuffer);
+        await fsp.rename(tmp, downloaded.path);
+
+        for (const w of gsWarnings || []) {
+          subResult.warnings.push({
+            type: 'greenscreen_' + (w.type || 'warning'),
+            cartId: li.cartId,
+            message: w.message,
+          });
+        }
+      } catch (err) {
+        subResult.warnings.push({
+          type: 'greenscreen_compose_error',
+          cartId: li.cartId,
+          message: `Green-screen composite failed: ${err.message}`,
+        });
+      }
+    }
+
     // ─── Step 2: imposition in-place on every successfully-downloaded photo
     // composeSheetInPlace is destructive (.tmp + rename), but only fires
     // when there's a rule for the SKU. Items without a rule pass through

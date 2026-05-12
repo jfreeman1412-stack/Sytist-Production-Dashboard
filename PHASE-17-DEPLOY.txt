@@ -1,0 +1,105 @@
+Phase 17 — Green-screen background compositing
+
+═══════════════════════════════════════════════════════
+WHAT THIS PHASE DOES
+═══════════════════════════════════════════════════════
+
+For green-screen line items on SKUs that DON'T use the composite
+engine (regular 8x10, 5x7, wallets, etc.), composites the chosen
+photo background under the keyed-out subject. Without this, the
+transparent PNG goes through imposition and prints with the page
+color showing through behind the figure.
+
+Composite engine (Memory Mate, etc.) already handles its own
+backgrounds via the playerBackground slot — this phase doesn't
+touch those.
+
+Three places get the compositing:
+  1. Production pipeline (processingService Step 1.6)
+  2. Imposition preview endpoint (GET .../imposition/preview/...)
+  3. Imposition save endpoint (POST .../imposition/preview/.../save)
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+NEW:
+  server/services/greenscreenService.js
+    Singleton with composeWithBackground() and shouldComposite().
+    Uses sharp, fit:'cover' for background sizing, JPEG quality 92.
+
+MODIFIED:
+  server/services/processingService.js
+    Inserted Step 1.6 between Step 1.5 (composite) and Step 2
+    (imposition). Iterates line items, calls greenscreenService for
+    any that pass shouldComposite() and aren't already handled by
+    the composite engine.
+
+  server/routes/sytist.js
+    Both imposition endpoints (preview GET + save POST) now check
+    shouldComposite() and if true, fetch the subject, composite the
+    background, and feed the composited buffer directly into
+    impositionService.buildSheetBuffer().
+
+═══════════════════════════════════════════════════════
+COMPOSITING RULES
+═══════════════════════════════════════════════════════
+
+  - Background sized with sharp fit:'cover' — fills the entire
+    canvas of the subject, aspect ratio preserved, overflow cropped
+    on the long axis. No blank pixels.
+  - Subject layered on top at (0,0)
+  - Output JPEG at quality 92
+  - On any failure (background URL missing, fetch fails, resize
+    fails), falls back to subject-only and logs a warning. The
+    order doesn't crash.
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzf F:\Downloads\sytist-dashboard-phase-17.tar.gz --strip-components=1
+
+Nodemon picks up server changes automatically. Hard refresh the
+browser (Ctrl+Shift+R).
+
+═══════════════════════════════════════════════════════
+VERIFY
+═══════════════════════════════════════════════════════
+
+1. Open an order with a green-screen line item (something other
+   than a Memory Mate — say a 5x7 or 8x10).
+
+2. From the order detail, click Imposition Preview on that line.
+   The preview should now render with the chosen background filling
+   the canvas behind the subject.
+
+3. Optional: process the order. Inspect the .txt'd file on disk —
+   should be a composited JPG (still .png on the path is OK; the
+   bytes are JPG).
+
+4. Open a green-screen order with a Memory Mate (composite-mapped
+   SKU). The composite engine still owns this — verify it renders
+   correctly and isn't double-composited (subject placed twice).
+
+═══════════════════════════════════════════════════════
+SERVER LOGS TO LOOK FOR
+═══════════════════════════════════════════════════════
+
+Success is silent.
+
+On a green-screen line where the background fetch fails:
+  [imposition/preview] greenscreen background_fetch_failed: ...
+
+On unrecoverable error in the route, falls back to subject-only:
+  [imposition/preview] greenscreen failed for <orderId>/<cartId>: ...
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+1. git checkout HEAD server/services/processingService.js
+2. git checkout HEAD server/routes/sytist.js
+3. del server\services\greenscreenService.js
+4. Restart server

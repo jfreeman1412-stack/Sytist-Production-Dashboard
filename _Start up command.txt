@@ -1,0 +1,2 @@
+CD C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+npm run dev

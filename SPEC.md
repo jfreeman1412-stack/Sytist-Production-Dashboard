@@ -1,7 +1,9 @@
 # Sytist Production Dashboard — Spec
 
-**Status:** Draft, planning session 2026-05-08
+**Status:** Phase 16 shipped — production-capable. Original spec drafted 2026-05-08; this revision 2026-05-12.
 **Author:** Joey Freeman + Claude
+
+This spec documents both the original plan and the additions made through Phase 16. Phase headings in §13 are marked with their current status. New sections (§16–§20) cover work that happened after the original spec was drafted.
 
 ---
 
@@ -437,50 +439,75 @@ Sytist-specific additions:
 
 Each phase ends in something runnable and verifiable. **Phases 0-7 ship a working dashboard for orders that don't need composition** (the majority of daily volume). Phases 8-11 add composition incrementally on top.
 
-**Phase 0 — Bootstrap (½ day)**
+**Phase 0 — Bootstrap (½ day) — ✅ shipped**
 Project folder, package.json (server + client), `.gitignore`, `.env.example`, README. Empty Express server runs; empty React app loads at /. Init git, push to private GitHub repo.
 
-**Phase 1 — Auth (½ day)**
+**Phase 1 — Auth (½ day) — ✅ shipped**
 Copy `authService.js`, `middleware/auth.js`, login route + page from photo day. Confirm login works against a local SQLite users table.
 
-**Phase 2 — Data layer (1–2 days)**
+**Phase 2 — Data layer (1–2 days) — ✅ shipped**
 `sytistDbService.js` with the public surface in §9. Connection via `.env`, configurable in Settings later. Test queries against the live droplet DB; verify canonical shape with real data. A `/api/orders/test` endpoint that returns 5 recent orders as JSON for visual inspection.
 
-**Phase 3 — Read-only UI (1 day)**
+**Phase 3 — Read-only UI (1 day) — ✅ shipped**
 Orders list page populated by `sytistDbService`. Filters: workflow, production status, date range, gallery. Detail view (no actions yet, just display).
 
-**Phase 4 — Pipeline port (2–3 days)**
+**Phase 4 — Pipeline port (2–3 days) — ✅ shipped**
 Copy darkroom, packing slip, packaging, folder sort, specialty, **imposition**, qrcode services. Extend packing slip per §6 (barcode, subject info, breadcrumb, branded graphic). Add a "Process this order" button on order detail that runs the full pipeline locally (no ShipStation yet). Verify Darkroom txt + packing slip JPG + multi-up imposition (8 wallets, 2 magnets, etc.) produced correctly for a real Sytist order. **Composition products fail gracefully with a clear "needs composition (Phase 8)" message until Phase 8 ships.**
 
-**Phase 5 — ShipStation (1 day)**
+**Phase 5 — ShipStation (1 day) — ✅ shipped**
 Copy `shipstationService.js`, wire to "Process" action for `shipstation` workflow only. Verify with a single order end-to-end.
 
-**Phase 6 — Schedulers (1–2 days)**
+**Phase 6 — Schedulers (1–2 days) — ✅ shipped**
 Auto-fetch poll every 5 min. Scheduled batch with HH:MM definitions. UI for schedule management.
 
-**Phase 7 — Status writeback (½ day)**
+**Phase 7 — Status writeback (½ day) — ✅ shipped**
 "Mark as Printing" / "Mark as Shipped" buttons → write to `ms_orders.order_open_status`. Confirm Sytist's automation picks it up correctly.
 
 **━━━ Composition system (Phases 8–11) ━━━**
 
-**Phase 8 — Composition engine (3–4 days)**
+**Phase 8 — Composition engine (3–4 days) — ✅ shipped**
 `compositionService.js` with JSON-driven templates per §6.5. Slot types, variant selection from photo orientation, variable substitution, auto-fit text, team photo resolution per §6.5.1. Templates authored as hand-edited JSON files for now (no UI). Hook into pipeline so SKUs mapped to composition templates render via this engine instead of producing the "needs composition" failure from Phase 4.
 
-**Phase 9 — Asset upload + logo assignment (2 days)**
+**Phase 9 — Asset upload + logo assignment (2 days) — ✅ shipped**
 Upload UI per §6.7 (overlays, logos, fonts). Per-gallery logo assignment UI per §6.5.2. `$JOB_LOGO` resolution wired into composition engine.
 
-**Phase 10 — Visual template editor (5–7 days)**
+**Phase 10 — Visual template editor (5–7 days) — ✅ shipped**
 Canvas-based editor per §6.6. Drag handles, properties panel, variant switcher, asset picker, sample-order preview render. Users can author and edit composition templates without hand-editing JSON.
 
-**Phase 11 — Per-order re-render (Flow B1) (1–2 days)**
+**Phase 11 — Per-order re-render (Flow B1) (1–2 days) — ✅ shipped**
 Per §6.8. Re-render with overrides for a single order using the visual editor pre-populated with that order's data.
 
 **━━━ Polish ━━━**
 
-**Phase 12 — Polish (open-ended)**
-Bulk operations, print sheets page, stats and quick actions, multi-user concurrency, Flow A re-render (edit template + re-render affected orders), whatever else surfaces during real use.
+**Phase 12 — Polish — ✅ shipped**
+Dashboard analytics, production overview charts, gallery breakdown, quick actions, folder sort UI, specialty highlight colors, paths config with dynamic variable substitution.
 
-**Total estimate to Phase 11:** roughly 3–5 weeks of dedicated focus. Phases 0–7 alone (working basic dashboard): ~1.5–2 weeks.
+**━━━ Post-spec phases ━━━**
+
+Phases 13 through 16 happened after the original spec was drafted. See §16–§20 below for details. Quick summary:
+
+**Phase 13 — Packaging engine — ✅ shipped**
+ProductWeights + packageBundles config (Settings → Packaging). Drives shipping weight calculation per order.
+
+**Phase 14a — Orders list count fix — ✅ shipped**
+Workflow filter applied in SQL rather than JS post-LIMIT.
+
+**Phase 14b — Prev/Next navigation — ✅ shipped**
+Order detail page has Prev/Next buttons + arrow-key shortcuts. Filter context preserved across navigation.
+
+**Phase 15a — Package explosion — ✅ shipped**
+Configurable map from package SKU → constituent items. Pipeline emits synthetic line items for each constituent so composite/imposition/slip see them.
+
+**Phase 15b — Add-on explosion — ✅ shipped**
+Configurable map from `ms_cart_options.co_opt_id` → SKU. Pipeline emits synthetic line items for mapped options.
+
+**Phase 15c — Add-on qty + modifier suffixes — ✅ shipped**
+Add-ons can have a qty > 1 (e.g. "Add 2 5×7s" → qty 2). New modifier type appends a suffix to the parent's product name instead of synthesizing a new line.
+
+**Phase 16 — SQLite migration + audit history — ✅ shipped**
+addon-mappings.json and package-contents.json moved to SQLite tables. Unified config_history table records every settings change. Export/import endpoints. HistoryModal UI per row.
+
+Total estimate to Phase 11 from the original draft: roughly 3–5 weeks. Actual: similar range, with phases 12–16 layered on top over the following weeks.
 
 ## 14. Open questions / deferred decisions
 
@@ -508,3 +535,222 @@ Discussed and deferred:
 - Rotating Twilio/Plivo credentials (security followup)
 - Reviewing `dbscreenpop/.htaccess` (security followup)
 - Full charset migration to utf8mb4 (latent risk)
+
+---
+
+## 16. Packaging engine (Phase 13)
+
+Drives shipping weight calculation per order, used by both the slip and the ShipStation submission.
+
+**Config:** `server/config/packaging-config.json`
+
+```js
+{
+  productWeights: {
+    "<sku>": {
+      name: "...",
+      weight: 1.7,           // ounces, per individual item
+      category: "flat" | "bulky" | "digital",
+      externalId: "..."      // links to composite/imposition mappings
+    }
+  },
+  packageBundles: {
+    "<package_sku>": {
+      name: "Gold Package",
+      weight: 0              // bundle base weight; constituents now carry weight (Phase 15a)
+    }
+  }
+}
+```
+
+**Categories:**
+- `flat` — counted in standard envelope weight calculation
+- `bulky` — triggers larger packaging
+- `digital` — excluded from production AND shipping calculations
+
+**Slip + ShipStation behavior:**
+- Slip totals up `Σ qty × weight` across all materialized line items
+- ShipStation `weight.value` set to the same total
+- Bundle weight is 0 because Phase 15a's package explosion now emits constituent items, each carrying their own weight from `productWeights`
+
+UI: Settings → Packaging. Per-SKU editor with name + weight + category + externalId. Searchable. Add/delete rows.
+
+## 17. Order navigation (Phase 14)
+
+### 17a. Workflow count fix
+
+The original orders-list endpoint applied workflow filtering in JS *after* a SQL `LIMIT 50`, which meant the "N orders match" count was wrong whenever a page included rows that didn't pass the workflow filter.
+
+Fixed by translating the workflow filter into a SQL predicate using `SHIPPING_OPTION_MAP` (configured in Settings → Shipping) plus a numeric `order_shipping` fallback for the three workflow buckets defined in §8.
+
+### 17b. Prev/Next navigation
+
+Order detail page got Prev/Next buttons + arrow-key shortcuts (left/right). The filter context (workflow, productionStatus, sort) is preserved across navigation via:
+
+- A `getOrderNeighbors(orderId, opts)` method in `sytistDbService` that runs 6 small SQL queries against the filtered set: anchor lookup, total count, in-set check, before-count, next, prev. Stable order_id ASC tiebreaker so consecutive Prev/Next stays in sync with the list page.
+- A `GET /api/sytist/orders/:orderId/neighbors` endpoint
+- An `OrdersListPage` that forwards filter context (workflow, productionStatus, sort) to the detail page
+- A `BackLink` component on the detail page that routes back to `/orders?<filters>` rather than `navigate(-1)`
+
+This was where we hit MySQL on the droplet rejecting `before` as a column alias (it's a reserved word in this MySQL version) — fixed by renaming to `before_count`.
+
+## 18. Package and add-on explosion (Phase 15)
+
+The Sytist data model represents packages and add-ons as **single ms_cart rows** — the customer buys a "Gold Package" or a "Memory Mate + Frame", and that's one cart line. But the production pipeline needs to see each constituent item separately to composite, impose, print, and slip. Phase 15 introduces the **explosion** layer that bridges this gap.
+
+### 18a. Package explosion
+
+**Config:** moved to SQLite in Phase 16. Storage: `packages` + `package_items` tables.
+
+Shape:
+```
+packages         (package_sku PK, name, ...)
+package_items    (id, package_sku FK, item_sku, qty, sort_order)
+```
+
+Settings UI: Settings → Packages. Per-package card with:
+- Editable name
+- Items list (SKU + qty per row, picked from productWeights)
+- Add-item dropdown
+- Per-item warnings (missing composite/imposition mappings)
+- Per-card Save + Delete buttons
+- Lint panel showing config-wide warnings
+
+**Pipeline integration:**
+- `sytistDbService._loadPackageMap()` loads the config once per query
+- `_expandPackageLineItems(lineItems, packageMap)` walks line items, for each row with `flags.package === true` it:
+  1. Emits the parent line item unchanged (with `flags.isPackageHeader = true`) so the slip and detail page still show "1× Gold Package"
+  2. Emits one synthetic line item per constituent
+- Synthetic items have:
+  - `cartId = "<parent>-pkg-<sku>"` (string, unique within the order)
+  - `sku` from the mapping
+  - `qty = constituent.qty × parent.qty`
+  - `price = 0` (parent carries the bundled price)
+  - `photo` / `gallery` / `subGallery` inherited from parent
+  - `flags.isPackageItem = true`, `flags.packageParentCartId`, `flags.packageParentSku`
+  - `flags.download = true` if mapped SKU has `category = "digital"`
+
+SKIP_FLAGS were extended to include `isPackageHeader` so the parent doesn't trigger production work (just slip display) and the constituents do all the production.
+
+### 18b. Add-on explosion
+
+Sytist add-ons live in **ms_cart_options**, not ms_cart. Each has `co_opt_id` (option type), `co_opt_name` (display), `co_price` (customer paid).
+
+**Config:** in SQLite as of Phase 16. Storage: `addon_mappings` table.
+
+```
+addon_mappings   (opt_id PK, type, name, sku, qty, suffix, ...)
+```
+
+Two mapping types (Phase 15c):
+
+**Product type** — synthesizes a production line item.
+```json
+{ "type": "product", "name": "2 Magnets", "sku": "15", "qty": 1 }
+```
+
+**Modifier type** — appends a suffix to the parent line's product name.
+```json
+{ "type": "modifier", "name": "Frame", "suffix": " (Framed)" }
+```
+
+The suffix flows naturally to:
+- Darkroom .txt's item description (whatever's in `productName`)
+- Packing slip's product name area, with a yellow `+ Frame` highlight rendered below
+
+Settings UI: Settings → Add-ons. Three sections:
+1. **Discovery panel** — co_opt_id values seen in recent orders that aren't mapped yet, sorted by occurrence. "Scan more orders" button ladders 500 → 1000 → 2000 → 5000.
+2. **Configured mappings** — table with type dropdown, name, dynamic fields (SKU+qty for product, suffix for modifier), save/delete per row.
+3. **Manual add** — type chip selector, fields per type, add button.
+
+**Pipeline integration:** runs AFTER package explosion. Walks each line item, for each option:
+- **No mapping** → option stays as a `text` entry on `lineItem.options[]` (visible on slip + detail page, not materialized)
+- **Mapping = product** → emit synthetic line item:
+  - `cartId = "<parent>-addon-<coId>"`
+  - `sku`, `qty` from mapping
+  - `price = co_price` (the actual add-on price)
+  - inherited photo / gallery / subGallery
+  - `flags.isAddonItem = true`, `flags.addonParentCartId`, `flags.addonOptId`
+  - `flags.download = true` if mapped SKU is digital
+- **Mapping = modifier** → don't emit a new line; instead, on the parent line:
+  - Append `mapping.suffix` to `productName`
+  - Push `{name, suffix, price}` into a new `modifiers[]` array (used by the slip for the yellow highlight)
+
+**Discovery query** scans recent paid+non-erased orders for `co_opt_id` values not in the addon_mappings table. Default scan: 500 orders. Cap: 5000.
+
+**MySQL version quirk:** the discovery query originally used `LIMIT` inside an `IN (subquery)`, which the droplet's MySQL rejects (error 1235 `ER_NOT_SUPPORTED_YET`). Split into two queries (fetch recent order IDs first, then options joined to that ID list).
+
+## 19. SQLite migration + audit history (Phase 16)
+
+Three configs moved from JSON files to SQLite:
+
+1. **addon-mappings.json** → `addon_mappings` table
+2. **package-contents.json** → `packages` + `package_items` tables
+3. **order_overrides** (already in SQLite since Phase 11) — audit history hooks added
+
+Plus shared infrastructure:
+- `config_history` table — polymorphic on `config_type` ('addon_mapping' | 'package' | 'order_override') and `entity_id`. Records prev_value + new_value JSON snapshots per action.
+- `configHistoryService.js` — `record({...})`, `list({...})`, `recent({...})` helpers
+- `HistoryModal.js` (client) — reusable timeline viewer with side-by-side prev/new diff
+- Export/import endpoints per config: `/api/sytist/<config>/export` (GET download), `/api/sytist/<config>/import` (PUT replace)
+
+### Why move these specifically
+
+Three classes of problems:
+
+1. **Nodemon restart loop.** Writing to a `.json` file in `server/config/` was triggering nodemon to restart the dev server mid-request, killing in-flight queries with proxy ECONNRESET. SQLite writes don't have this problem. (Belt-and-suspenders: `server/nodemon.json` also explicitly ignores `config/` and all `.json` files.)
+
+2. **Race conditions on concurrent edits.** "Read whole JSON, mutate in memory, write whole JSON" is a classic lost-update pattern. SQLite handles concurrent writes via locking.
+
+3. **No audit history.** Operators want to know who changed what.
+
+### Migration mechanics
+
+On every server boot, `databaseService.init()` calls `_createSchema()` then `_migrateJsonConfigs()`:
+
+1. For each migrated config, check if its SQLite table is empty
+2. If yes AND the JSON file exists, read it, INSERT each row in a transaction
+3. Rename the JSON file to `<name>.json.migrated` so it won't get re-imported
+4. Log the migration
+
+Idempotent. Safe to boot repeatedly. The `.migrated` files are kept as rollback artifacts.
+
+### Audit history shape
+
+Every write to one of the three migrated configs records a row:
+```
+history_id   PK auto
+config_type  'addon_mapping' | 'package' | 'order_override'
+entity_id    opt_id, package_sku, or "<orderId>:<cartId>"
+action       'insert' | 'update' | 'delete'
+prev_value   JSON snapshot before (null for insert)
+new_value    JSON snapshot after (null for delete)
+changed_at   ISO timestamp
+changed_by   username from req.user (null if no auth context)
+```
+
+Diffs are computed in the service layer — only entities whose shape actually changed get history rows. Bulk save of an unchanged config doesn't generate noise.
+
+UI: a 📜 button per row (Add-ons) or per package card (Packages) opens HistoryModal, which calls `GET /api/sytist/config-history?type=...&id=...` and renders the timeline.
+
+### Export/import
+
+Per-config endpoints:
+- `GET /api/sytist/addon-mappings/export` — returns the current config as a JSON download
+- `PUT /api/sytist/addon-mappings/import` — accepts a JSON body, replaces the config wholesale (recorded in audit history)
+- `GET /api/sytist/package-contents/export` / `PUT .../import` — same pattern
+
+UI: ↓ Export and ↑ Import buttons in the page header. Import shows a confirmation prompt with the entity count.
+
+**Known issue:** the export button uses `<a>.click()` for the download, which doesn't carry the session header. The endpoint then 401s and redirects, which the browser interprets as "go to homepage." Workaround: fix later by fetching the JSON via the authenticated `api.get()` and constructing a blob URL.
+
+## 20. Open items / next phases
+
+Pulled from the working notes:
+
+- **Real production end-to-end test** of all the explosion changes for a Gold Package order. Verify composite, imposition, slip, and Darkroom .txt all produce correct output with synthetic line items mixed with regular ones.
+- **Visual grouping on order detail + slip** — indent constituent items under their parent so the structure is obvious at a glance. Currently they're a flat list with the same gallery/sub-gallery as the parent.
+- **Export endpoint auth fix** — see §19 known issue.
+- **Migration of remaining JSON configs to SQLite** — following the same pattern as Phase 16. Candidates: `packaging-config.json`, `size-mappings.json`, `composite-mappings.json`, `imposition-config.json`, `shipping-option-mappings.json`, `path-overrides.json`, `processing-settings.json`, `darkroom-settings.json`. Not urgent — these are written rarely, so the original motivations (nodemon, concurrency, audit) don't bite as hard. But the pattern is established.
+- **Discovery panel cleanup** — the diagnostic `[discovery] start / querying / got / done` logs from Phase 15b hotfix-3 are still in. Remove once the feature feels solid.
+- **Trading Cards SKU mapping (35)** — needs an imposition mapping; lint warned about this. Resolution pending operator config.
