@@ -1,0 +1,147 @@
+Phase 20 — Global order search
+
+═══════════════════════════════════════════════════════
+WHAT IT DOES
+═══════════════════════════════════════════════════════
+
+Adds a search bar at the top of the Orders list page.
+
+Matches against:
+  - Order number (exact + partial)
+  - Customer name (first + last, concatenated)
+  - Email address
+  - Phone number (raw and stripped to digits, so "(763) 639-9351"
+    and "7636399351" both match)
+
+Behavior:
+  - Type ≥ 2 characters → debounced search-as-you-type (250ms)
+  - Enter → immediate search; if there's a single exact match
+    (especially on numeric order number), jumps directly to the
+    order detail page
+  - Multiple matches → dropdown list, click or arrow-keys-then-Enter
+    to pick
+  - Esc → close dropdown
+  - × button or empty input → clear
+  - Skips current workflow / status filters entirely — search
+    results always show, regardless of what the list view is
+    filtered to
+  - Current filter context is preserved in the URL so the order
+    detail page's Back to Orders link returns to the same view
+
+Limited to 10 results. Refine the query for more.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/services/sytistDbService.js
+    Added searchOrders(query) method that runs a single SQL
+    query against ms_orders with the standard "paid + non-erased"
+    predicate plus the OR'd match clauses. Returns at most 10
+    results with stable shape:
+      { orderId, orderNumber, orderDate, customerName, email,
+        phone, total, productionStatusId, productionStatusName }
+
+  server/routes/sytist.js
+    Added GET /api/sytist/orders/search?q=<query> route.
+    Registered BEFORE the existing /orders/:orderId route so
+    Express doesn't treat "search" as an order ID.
+
+  client/src/pages/OrdersListPage.js
+    Added search input above the workflow tabs row.
+    React hooks for search state, debouncing, race-condition
+    protection. Dropdown UI with keyboard nav, click handlers,
+    and per-result rendering (order #, date, customer, email,
+    status badge).
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-20.tar.gz --strip-components=1
+
+You should see exactly 3 file lines:
+  x server/services/sytistDbService.js
+  x server/routes/sytist.js
+  x client/src/pages/OrdersListPage.js
+
+(plus the directory listings)
+
+Nodemon picks up server changes. Webpack picks up the client
+change. Hard refresh the Orders page (Ctrl+Shift+R).
+
+═══════════════════════════════════════════════════════
+BEFORE COMMITTING — SAFETY CHECK
+═══════════════════════════════════════════════════════
+
+  git diff HEAD server/services/sytistDbService.js
+  git diff HEAD server/routes/sytist.js
+  git diff HEAD client/src/pages/OrdersListPage.js
+
+Expected diffs are ALL additions:
+  - sytistDbService.js: new searchOrders method inserted before close()
+  - sytist.js: new router.get('/orders/search', ...) handler inserted
+    before the existing /orders/:orderId handler
+  - OrdersListPage.js: useRef added to imports; ~7 new state vars;
+    new runSearch/handleSearchSubmit/handleSearchKeyDown/clearSearch
+    functions; new search bar JSX block right after the h1
+
+If any diff shows large unrelated deletions, stop and tell me.
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+1. Open the Orders page. Above the workflow tabs should be a new
+   search input "Search orders by # / name / email / phone — Enter
+   to jump".
+
+2. Search by order number — type 110487, press Enter. Should jump
+   directly to that order's detail page.
+
+3. Search by partial order number — type 1104, press Enter.
+   Should show a dropdown of orders starting with 1104.
+
+4. Search by customer name — type "Jess", should show Jessica
+   Foss orders.
+
+5. Search by email — type something from a customer's email.
+
+6. Search by phone — type "7636399351" or "(763) 639-9351", both
+   should match.
+
+7. Try with current filters set to Queue only — search should
+   STILL find shipped orders and let you jump to them.
+
+8. After jumping to an order, click "Back to Orders" — should
+   return to the same filtered view you came from.
+
+9. Keyboard navigation: type a search, then press ↓ ↓ then Enter
+   to pick the third result.
+
+10. Esc closes the dropdown.
+
+═══════════════════════════════════════════════════════
+EDGE CASES HANDLED
+═══════════════════════════════════════════════════════
+
+  - Empty query: no-op
+  - Query of 1 character: no-op (avoids spamming the DB)
+  - Stale responses from rapid typing: dropped via current-query
+    tracking
+  - Click outside the search box: dropdown closes
+  - Erased / unpaid orders: excluded (same scope as the list view)
+  - Phone with non-digit separators: matches against stripped
+    digits too
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD server/services/sytistDbService.js
+  git checkout HEAD server/routes/sytist.js
+  git checkout HEAD client/src/pages/OrdersListPage.js
+
+Restart server, hard refresh.

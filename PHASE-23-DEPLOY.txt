@@ -1,0 +1,105 @@
+Phase 23 — Bleed area in designer + Enter to load order
+
+═══════════════════════════════════════════════════════
+WHAT THIS DOES
+═══════════════════════════════════════════════════════
+
+1. BLEED AREA — the designer canvas now has visible buffer space
+   on every side. Slots extending past the canvas (Phase 21) used
+   to overlap surrounding UI (line-item picker below, inspector to
+   the right). Now they have a clearly-marked "bleed area" to
+   render into.
+
+   Implementation: SVG viewBox is now padded by 30% of the smaller
+   canvas dimension on every side. The canvas (white rect) sits in
+   the center of the viewBox with the dark wrapper background
+   visible around it as the bleed area. The dashed orange trim
+   line (Phase 21) still marks what will actually print.
+
+   Mouse events keep working everywhere because slots render
+   INSIDE the SVG element (not via CSS overflow). Drag math
+   automatically scales since getInchesPerPixel uses the full
+   viewBox size.
+
+   The visible canvas is now ~60-70% of the wrapper. Use the
+   surrounding dark space to position bleed slots.
+
+2. ENTER LOADS ORDER — typing an order ID in the designer's
+   preview panel and pressing Enter now triggers the Load button.
+   Useful for:
+     - Barcode scanners that auto-append a CR after the order #
+     - Keyboard-only workflow (no mouse needed)
+     - Faster iteration when previewing multiple orders
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/components/LayoutCanvas.js
+    - SVG viewBox extended with bleed padding
+    - getInchesPerPixel updated to use full viewBox size
+    - Bleed padding scales with canvas size (30% of smaller side)
+
+  client/src/pages/settings/LayoutDesignerPage.js
+    - Order ID input swapped for raw input with onKeyDown
+    - Enter triggers onLoadOrder() (with same disabled guards
+      as the Load button)
+    - Hint text updated: "click Load (or press Enter)"
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-23.tar.gz --strip-components=1
+
+You should see 2 file lines:
+  x client/src/components/LayoutCanvas.js
+  x client/src/pages/settings/LayoutDesignerPage.js
+
+Webpack picks up the changes. Hard refresh the designer.
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+Bleed area:
+  1. Open Settings → Composite Layouts → into a layout
+  2. The canvas should now appear in the center of a darker
+     surrounding frame. The dashed orange line marks the trim.
+  3. Select a slot. Drag it past the canvas edge — it renders
+     into the bleed area, not overlapping the line-item picker
+     or inspector.
+  4. Try wheel-scrolling to grow a slot beyond the canvas — it
+     expands into the bleed area cleanly.
+
+Enter-to-load:
+  1. In the preview panel (below the canvas), type an order
+     number into the Order ID field
+  2. Press Enter — the order should load (same as clicking Load)
+  3. Test with a barcode scanner if you have one — should work
+     identically
+
+═══════════════════════════════════════════════════════
+EDGE CASES
+═══════════════════════════════════════════════════════
+
+  - Very large slots (>30% beyond canvas in any direction):
+    visible portion clips at the bleed-area edge. Slot still
+    saves correctly. Adjust the slot's size or use the inspector
+    panel's X/Y/W/H inputs for fine control.
+  - Drag math is delta-based, so the larger viewBox doesn't
+    affect positioning accuracy.
+  - Existing layouts: render identically, no migration needed.
+  - Enter in an empty Order ID field: no-op (same guard as Load
+    button — disabled while empty).
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD client/src/components/LayoutCanvas.js
+  git checkout HEAD client/src/pages/settings/LayoutDesignerPage.js
+
+Hard refresh.

@@ -22,9 +22,15 @@
 // Token replacement happens on the raw template string in path-overrides.json
 // before segments are appended. Supported tokens:
 //
-//   {date}        — order date in YYYY-MM-DD form (from order.orderDate). Used
-//                   primarily in the base template — the date partition keeps
-//                   each day's orders together at the top of the tree.
+//   {date}        — today's date in YYYY-MM-DD form (processing date).
+//                   Used primarily in the base template — orders processed
+//                   today land in today's folder regardless of when they
+//                   were placed. Phase 18 changed this from order date to
+//                   processing date so the production person sees the day's
+//                   work in one place.
+//   {order_date}   — the order's placed date in YYYY-MM-DD form (from
+//                   order.orderDate). Use when you specifically want the
+//                   customer's order date, not today's date.
 //   {orderId}     — order.orderId
 //   {gallery}     — order.galleryName (sanitized)
 //   {subGallery}  — order.subGalleryName (sanitized; "" for non-sibling orders)
@@ -150,7 +156,16 @@ class PathsService {
     if (!template) return '';
 
     const tokens = {
-      '{date}': this._extractDate(order),
+      // Phase 18: {date} now means processing date (today). Use
+      // {order_date} when you specifically want the date the
+      // customer placed the order.
+      //
+      // Before Phase 18 {date} meant order date, which caused
+      // orders processed today but placed days ago to land in
+      // historical folders. The lab wants today's work in today's
+      // folder so the production person knows what's current.
+      '{date}': this._extractTodayDate(),
+      '{order_date}': this._extractOrderDate(order),
       '{orderId}': order.orderId || '',
       '{gallery}': sanitize(order.galleryName || ''),
       '{subGallery}': sanitize(order.subGalleryName || ''),
@@ -164,7 +179,22 @@ class PathsService {
     return out;
   }
 
-  _extractDate(order) {
+  /**
+   * Today's date in YYYY-MM-DD form. Used for {date} as of Phase 18.
+   */
+  _extractTodayDate() {
+    return new Date().toISOString().split('T')[0];
+  }
+
+  /**
+   * The order's placed date in YYYY-MM-DD form. Used for {order_date}
+   * tokens. Falls back to today if order.orderDate is missing or
+   * malformed.
+   *
+   * Phase 18: this used to be _extractDate and was wired to {date}.
+   * Renamed to make the distinction explicit.
+   */
+  _extractOrderDate(order) {
     // order.orderDate from MySQL (dateStrings: true) is "YYYY-MM-DD HH:MM:SS".
     // Pull the date half. Fallback to today if something's odd.
     if (order.orderDate && typeof order.orderDate === 'string') {
@@ -270,7 +300,7 @@ class PathsService {
       configPath: OVERRIDES_PATH,
       templates: { ...modeConfig },
       outputTypes: [...OUTPUT_TYPES],
-      knownTokens: ['{date}', '{orderId}', '{gallery}', '{subGallery}', '{workflow}'],
+      knownTokens: ['{date}', '{order_date}', '{orderId}', '{gallery}', '{subGallery}', '{workflow}'],
     };
   }
 
@@ -293,7 +323,7 @@ class PathsService {
       configPath: OVERRIDES_PATH,
       modes,
       outputTypes: [...OUTPUT_TYPES],
-      knownTokens: ['{date}', '{orderId}', '{gallery}', '{subGallery}', '{workflow}'],
+      knownTokens: ['{date}', '{order_date}', '{orderId}', '{gallery}', '{subGallery}', '{workflow}'],
     };
   }
 

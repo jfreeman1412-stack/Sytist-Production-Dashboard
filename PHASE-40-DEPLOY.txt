@@ -1,0 +1,180 @@
+Phase 40 — Process/Reprint respects saved overrides + Save (no render)
+
+═══════════════════════════════════════════════════════
+WHAT THIS DELIVERS
+═══════════════════════════════════════════════════════
+
+The override editor previously had two action buttons:
+  - Apply (Overwrite original) — save + immediate render
+  - Apply (Reprint single item) — save + immediate _REPRINT render
+
+Both work, but neither was useful for the batch use case:
+
+  > Preview an order with 4 composites. Two need fixing.
+  > Tweak both in the editor. Then click Process or Reprint
+  > on the order. All 4 composites print correctly:
+  >   - Items 1, 3: original template (no override saved)
+  >   - Items 2, 4: override layouts (saved by operator)
+
+Two changes make this work:
+
+  1. NEW "Save (no render)" button in the override editor.
+     Stores the override row WITHOUT writing a composite
+     file. Use when staging multiple fixes before printing.
+
+  2. processOrder() now checks for saved overrides on each
+     line item BEFORE the composite render. If one exists,
+     the override's layout snapshot is used; otherwise the
+     SKU's mapped layout is used. Works for both fresh
+     Process AND Reprint.
+
+═══════════════════════════════════════════════════════
+WORKFLOW (the batch case)
+═══════════════════════════════════════════════════════
+
+  1. Open order detail. See 4 Memory Mate composites that
+     need verification.
+  2. Notice items 2 and 4 have placement issues.
+  3. Click "Re-render with edits" on item 2 — opens editor.
+     Tweak slots. Click "Save (no render)". Editor confirms
+     "Override saved. Composite will be re-rendered with
+     these changes the next time you Process or Reprint
+     this order." Close editor / go back.
+  4. Same for item 4: tweak → Save → close.
+  5. On the order detail page, click "Process this order"
+     (or "Reprint this order" if status is 39 or 40).
+  6. Pipeline runs:
+     - Items 1 and 3: composite rendered from original
+       template
+     - Items 2 and 4: composite rendered from override
+       layout snapshot (server log: "applying saved
+       override")
+  7. .txt and printed sheets reflect all 4 corrections.
+
+═══════════════════════════════════════════════════════
+WORKFLOW (the legacy single-item case still works)
+═══════════════════════════════════════════════════════
+
+  1. Tweak one item in the editor.
+  2. Click "Apply (Overwrite original)" — composite gets
+     rendered immediately. Override is also saved.
+  3. If you later click Process/Reprint the whole order:
+     the saved override is used for that one item (same as
+     Phase 40 batch case). For other items, original
+     template.
+
+So Save (no render) and Apply (Overwrite) both end up
+producing the same result on Process/Reprint. The
+difference is just whether the composite gets rendered now
+or later.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED (2 files):
+
+  server/services/processingService.js
+    + Added orderOverrideService require
+    + In the composite render loop, BEFORE compositeService.
+      getLayout, check orderOverrideService.get(orderId, cartId).
+      If present, use override.layoutSnapshot as the layout.
+      Mapping is still resolved for chainToImposition.
+    + subResult.composites[i].layoutSource records 'override'
+      or 'mapping' for forensics
+    + Log line: "applying saved override (layout=X)"
+
+  client/src/pages/settings/OverrideEditorPage.js
+    + New saveOverrideOnly() function — POST to overrides
+      endpoint, no render call
+    + New "Save (no render)" button at top of the action
+      stack
+    + Success banner: "Override saved. Composite will be
+      re-rendered with these changes the next time you
+      Process or Reprint this order."
+    + actionLoading state extended to track 'save' mode
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-40.tar.gz \
+            --strip-components=1
+
+Two files. nodemon picks up the server. Hard-refresh the
+browser.
+
+═══════════════════════════════════════════════════════
+VERIFY
+═══════════════════════════════════════════════════════
+
+  1. Open the override editor for any composite line item.
+     You should see THREE action buttons in this order:
+       - Save (no render)               ← NEW, primary blue
+       - Apply (Overwrite original)
+       - Apply (Reprint single item)
+     Plus the existing "Remove override" button when an
+     override is already saved.
+
+  2. Tweak a slot. Click "Save (no render)".
+     - The screen shows a green success banner:
+       "Override saved. Composite will be re-rendered with
+       these changes the next time you Process or Reprint
+       this order."
+     - NO composite file is written
+     - The Override row in SQLite has the new
+       layout_snapshot
+
+  3. Go back to the order detail page.
+  4. Click Process (or Reprint, depending on status).
+  5. Server log should show:
+       [Processing] Order N cart C: applying saved override
+         (layout=X, variant=Y)
+     for each cart_id with a saved override.
+
+  6. Inspect the produced composite file. It should reflect
+     the saved override's layout, NOT the original template.
+
+═══════════════════════════════════════════════════════
+EDGE CASES
+═══════════════════════════════════════════════════════
+
+  - If an override exists for a cart_id but the line item
+    doesn't have a composite mapping anymore (SKU was
+    unmapped after the override was saved), the override
+    is ignored — the composite render loop skips items
+    with no mapping. This is consistent with the existing
+    behavior.
+
+  - If the override's layout_snapshot is corrupt/invalid
+    JSON, the get() call throws, we catch it, surface as
+    'override_lookup_failed' warning, and fall through to
+    the mapped layout.
+
+  - If multiple operators edit the same (orderId, cartId)
+    in parallel, last-write-wins on the override row. The
+    upsert is atomic per SQLite, but there's no
+    optimistic-lock check.
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD server/services/processingService.js
+  git checkout HEAD client/src/pages/settings/OverrideEditorPage.js
+
+Existing overrides in SQLite are untouched. The legacy
+behavior (Process/Reprint uses original template
+regardless of saved overrides) is restored.
+
+═══════════════════════════════════════════════════════
+NOT INCLUDED (potential follow-ups)
+═══════════════════════════════════════════════════════
+
+  - Indicator on the order detail page line items showing
+    "Has saved override" so operators can see at a glance
+    which items will use overrides on the next Process /
+    Reprint
+  - Bulk "Discard all overrides for this order" button
+  - Override expiration (older-than-N-days cleanup)

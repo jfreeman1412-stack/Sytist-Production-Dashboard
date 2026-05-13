@@ -178,10 +178,11 @@ export default function ApiKeysPage() {
     grouped[sec] = grouped[sec] || [];
     grouped[sec].push(f);
   }
-  const sectionOrder = ['shipstation', 'shipping_defaults', 'other'];
+  const sectionOrder = ['shipstation', 'shipping_defaults', 'aws_s3', 'other'];
   const sectionTitles = {
     shipstation: 'ShipStation',
     shipping_defaults: 'Shipping defaults',
+    aws_s3: 'AWS S3 (composed green-screen thumbnails)',
     other: 'Other',
   };
 

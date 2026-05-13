@@ -1,0 +1,55 @@
+Phase 19-v2 — Fix: use flags.package, not flags.isPackageHeader
+
+═══════════════════════════════════════════════════════
+WHAT WAS WRONG WITH PHASE 19 v1
+═══════════════════════════════════════════════════════
+
+Phase 19 v1 filtered package parent items using
+flags.isPackageHeader, but that flag is never actually set on
+line items. sytistDbService sets flags.package (when
+cart_package > 0) — the canonical marker.
+
+isPackageHeader appears in processingService's SKIP_FLAGS list
+as a forward-looking name, but no code ever assigns it. So my
+v1 filter was checking a flag that's always undefined → it
+filtered nothing → bug unchanged.
+
+═══════════════════════════════════════════════════════
+WHAT V2 CHANGES
+═══════════════════════════════════════════════════════
+
+packagingService.js — physicalItems filter at line 379 now
+checks flags.package (the real marker). Same logic, correct
+flag name.
+
+The weight-side filter at line 436 (which was already in place
+from Phase 15a) was also using the wrong flag — fixed to match.
+This block is now mostly defensive since the upstream filter
+catches package items, but consistency matters.
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-19-v2.tar.gz --strip-components=1
+
+One file:
+  x server/services/packagingService.js
+
+Nodemon picks it up. Then hard-refresh order 110487 in the
+browser (Ctrl+Shift+R).
+
+═══════════════════════════════════════════════════════
+VERIFY
+═══════════════════════════════════════════════════════
+
+Open order 110487. The Shipping block should now show:
+  - Eligible: 1 shippable item, 4 skipped (was 2 + 3)
+  - Engine suggests: Pano Tube · 12 × 2 × 2
+  - Notes: "Pano alone → Pano Tube"
+
+If still wrong: send me the output of
+  findstr /n "flags?.package" server\services\packagingService.js
+
+There should be TWO matches (lines around 382 and 436).

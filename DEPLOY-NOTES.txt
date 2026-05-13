@@ -1,0 +1,90 @@
+Docs update through Phase 44
+═══════════════════════════════════════════════════════
+
+Brings all five documentation files current with phases
+38 through 44 (and their hotfixes).
+
+WHAT'S IN THIS TARBALL
+─────────────────────────────────────────────
+
+MODIFIED (5 files):
+
+  docs/CHANGELOG.md
+    + Phase 38-44 entries (with their hotfixes folded
+      into each phase's bullet list)
+    + Extended "Major architecture decisions" section
+      with package expansion, thumbnail pipeline, and
+      cleanup-deferral entries
+    + Extended "Known follow-ups" with the ShipStation
+      auto-ship mystery, on-demand preview, and S3
+      sweep follow-ups
+
+  docs/README.md
+    + Status bumped from "Phase 37" to "Phase 44"
+    + ShipStation integration section extended with
+      Phase 41-43 thumbnail and 404-retry behavior
+    + New "Composed thumbnail pipeline" architecture
+      section
+    + New "Dashboard-driven package expansion" section
+    + Roadmap table extended with phases 38-44
+
+  docs/SPEC.md
+    + Sections 38-44 added (in the same per-phase
+      style as 17-37)
+    + "Open follow-ups" section renamed to "45+ Open
+      follow-ups" and extended
+
+  docs/AdminManual.md
+    + Sections 38-44 added covering package filter,
+      package expansion, override editor wiring, and
+      the composed/composite thumbnail pipeline
+    + Phase 42 includes full AWS S3 bucket+IAM setup
+      walkthrough
+    + Phase 44 includes verification queries (cache
+      row counts, recent rows, per-order rows, manual
+      cleanup)
+    + Troubleshooting section extended with five new
+      entries:
+        - AWS SDK not available
+        - Composite thumbnails not showing in UI
+        - Slip preview shows raw photos
+        - ShipStation 404 retry popup
+        - SS auto-ship mystery
+    + Phase-numbered reference at the bottom updated
+      to "21-44"
+
+  docs/OperatorManual.md
+    + New "Retry on 404 from ShipStation" subsection
+      under Push Packaging
+    + New section 14a "Composite thumbnails in
+      ShipStation, on packing slips, and on the order
+      detail page" explaining what operators will see
+    + Two new common situations entries:
+        - Composite thumbnail in SS but not in dashboard
+        - SS says shipped but I never marked it
+
+DEPLOY
+─────────────────────────────────────────────
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-docs-phase44.tar.gz --strip-components=1
+
+This only touches the docs/ folder — no server or client
+changes. No restart needed.
+
+VERIFY
+─────────────────────────────────────────────
+
+  1. Spot-check that CHANGELOG.md has Phase 44 at the
+     bottom of the phase list:
+       Select-String -Path "docs\CHANGELOG.md" -Pattern "^## Phase 44" -SimpleMatch
+
+  2. SPEC.md should have ## 44. section near the bottom:
+       Select-String -Path "docs\SPEC.md" -Pattern "^## 44\." -SimpleMatch
+
+  3. README.md status line should say Phase 44:
+       Select-String -Path "docs\README.md" -Pattern "Status:\*\* Phase 44" -SimpleMatch
+
+  4. AdminManual.md should have section 41-44 covering
+     S3 setup. Search for "AWS S3":
+       Select-String -Path "docs\AdminManual.md" -Pattern "AWS S3" -SimpleMatch

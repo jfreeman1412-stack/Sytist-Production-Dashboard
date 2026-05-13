@@ -1,0 +1,130 @@
+Phase 19 — Package headers excluded from packaging-engine routing
+
+═══════════════════════════════════════════════════════
+PROBLEM
+═══════════════════════════════════════════════════════
+
+Order 110487 contains:
+  - 1× Small 8x24 Team Pano Print (SKU 32)
+  - 1× Digital Package - 3 High Resolution Digital Images (SKU 3D, package header)
+  - 3× Individual Photo Download (SKU 25, digital, exploded from package)
+
+The packaging engine should pick "Pano alone → Pano Tube" (12x2x2).
+Instead it picked "Pano + other items → Medium Box" (12x10x2).
+
+Why: the package-header line item (SKU 3D) was being counted as a
+physical item because:
+  - SKU 3D isn't in productWeights (no entry for that SKU)
+  - The digital filter uses `pw?.category !== 'digital'` which
+    returns TRUE when pw is undefined → kept in physicalItems
+  - The pano rule then saw "Pano + other physical items" and picked
+    Medium Box
+
+The engine was correctly skipping the 3 digital SKU 25 lines but
+NOT the package header itself. Phase 15a already adds
+flags.isPackageHeader to the parent line — the packaging engine
+just wasn't checking it.
+
+The "2 shippable items / 3 skipped" display in the UI is the same
+bug: it was counting the Pano + the package header as shippable,
+skipping the 3 digitals.
+
+═══════════════════════════════════════════════════════
+WHAT THIS PHASE CHANGES
+═══════════════════════════════════════════════════════
+
+packagingService.js — extend the physicalItems filter at line 367
+to ALSO exclude line items where flags.isPackageHeader is true.
+
+After the fix:
+  - Order 110487's physicalItems = [Pano(32)]
+  - The pano rule sees no other physical items → "Pano alone"
+  - Engine picks pano_tube (12x2x2)
+  - The "shippable count" display also goes from 2 to 1
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/services/packagingService.js
+
+  Single change at line 367. Before:
+
+    const physicalItems = items.filter((item) => {
+      const pw = config.productWeights[String(item.sku)];
+      return !pw || pw.category !== 'digital';
+    });
+
+  After:
+
+    const physicalItems = items.filter((item) => {
+      if (item.flags?.isPackageHeader) return false;
+      const pw = config.productWeights[String(item.sku)];
+      return !pw || pw.category !== 'digital';
+    });
+
+  Existing weight-handling code at line 422 (which skips package
+  headers from weight calculation) is unchanged. This phase only
+  adds the routing-side fix.
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-19.tar.gz --strip-components=1
+
+You should see one file line:
+  x server/services/packagingService.js
+
+Nodemon picks up the change. No client changes.
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+1. Open order 110487. Look at the Shipping block:
+   - Should now say "1 shippable item, 4 skipped"
+   - Engine suggests: Pano Tube · stamps_com/usps_first_class_mail
+   - Dimensions: 12 × 2 × 2
+   - Notes should say "Pano alone → Pano Tube" instead of
+     "Pano + other items → Medium Box"
+
+2. Open a Gold Package order (where the package header has
+   constituents that ARE physical). Verify the package routing
+   logic still works:
+   - physicalItems should now be the constituents only (not the
+     header)
+   - But the constituents include physical items (8x10, 5x7, etc.)
+     so the engine still routes to the right box for the
+     constituents
+
+3. Open a non-package order. Should be unchanged.
+
+═══════════════════════════════════════════════════════
+EDGE CASES
+═══════════════════════════════════════════════════════
+
+  - Package with only digital constituents (like order 110487's
+    Digital Package): physicalItems excludes the header AND all
+    digital constituents. If there's no other physical item in
+    the order, physicalItems.length === 0 and the engine routes
+    to the default 9x11 flat. But that won't happen for an
+    all-digital order because shipping is $0 → not in ship_to_home
+    workflow. Not a concern in practice.
+
+  - Mixed package (some digital, some physical constituents): the
+    physical constituents drive routing as normal. Header skipped.
+    Works correctly.
+
+  - Multiple package headers in one order: all skipped. Their
+    constituents drive routing. Works correctly.
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD server/services/packagingService.js
+
+That returns you to pre-Phase-19 behavior.

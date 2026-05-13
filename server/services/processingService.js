@@ -66,7 +66,11 @@ const compositeService = require('./compositeService');
 const teamPhotoService = require('./teamPhotoService');
 const galleryAssetsService = require('./galleryAssetsService');
 const compositeGraphicsService = require('./compositeGraphicsService');
+const greenscreenService = require('./greenscreenService');
 const sytistDb = require('./sytistDbService');
+const composedThumbnailService = require('./composedThumbnailService');
+const composedThumbnailCacheService = require('./composedThumbnailCacheService');
+const sharp = require('sharp');
 
 const SETTINGS_PATH = path.join(
   __dirname,
@@ -196,24 +200,78 @@ class ProcessingService {
     }
     const generateDivider = !!options.generateDivider;
 
+    // Phase 35: reprint mode. When true, processOrder:
+    //   - Computes the next available "_REPRINT[_N]" suffix by
+    //     scanning the output dir for existing _REPRINT files for
+    //     this order. Threads the suffix through to every filename
+    //     (photos, composites, slip, .txt) so reprint outputs sit
+    //     alongside originals without overwriting them.
+    //   - SKIPS Sytist order_open_status update (the order's status
+    //     should not change just because we reprinted).
+    //   - SKIPS ShipStation auto-create (existing local link or not
+    //     — reprint never touches SS).
+    //   - Audits the action with source='reprint' for traceability.
+    //
+    // Optional `lineItemFilter` is an array of cartIds. When provided,
+    // only those line items are processed. Used by the per-item
+    // reprint endpoint to print just one card's worth.
+    const reprint = !!options.reprint;
+    const lineItemFilter =
+      Array.isArray(options.lineItemFilter) && options.lineItemFilter.length > 0
+        ? options.lineItemFilter.map(String)
+        : null;
+
+    let reprintSuffix = '';
+    let reprintNumber = 0;
+    if (reprint) {
+      reprintNumber = await this._nextReprintNumber(order);
+      reprintSuffix =
+        reprintNumber === 1 ? '_REPRINT' : `_REPRINT_${reprintNumber}`;
+      console.log(
+        `[Processing] Order ${order.orderId}: REPRINT mode (suffix=${reprintSuffix})` +
+          (lineItemFilter ? ` filter=cartIds:${lineItemFilter.join(',')}` : '')
+      );
+    }
+
+    // Apply line item filter if present. Operate on a shallow-cloned
+    // order so we don't mutate the caller's object.
+    let workOrder = order;
+    if (lineItemFilter) {
+      const filteredItems = (order.lineItems || []).filter((li) =>
+        lineItemFilter.includes(String(li.cartId))
+      );
+      if (filteredItems.length === 0) {
+        throw new Error(
+          `lineItemFilter [${lineItemFilter.join(',')}] matched no items in order ${order.orderId}`
+        );
+      }
+      workOrder = { ...order, lineItems: filteredItems };
+    }
+
     const result = {
-      orderId: order.orderId,
-      orderNumber: order.orderNumber || order.orderId,
+      orderId: workOrder.orderId,
+      orderNumber: workOrder.orderNumber || workOrder.orderId,
       mode: pathsService.getMode(),
       subOrders: [],
       statusUpdated: false,
       newStatusId: null,
+      reprint,
+      reprintNumber: reprint ? reprintNumber : null,
+      reprintSuffix: reprint ? reprintSuffix : null,
     };
 
-    const subOrders = this._splitIntoSubOrders(order);
+    const subOrders = this._splitIntoSubOrders(workOrder);
     console.log(
-      `[Processing] Order ${order.orderId}: ${subOrders.length} sub-order(s) ` +
-        `(workflow=${order.shipping?.workflow}, items=${(order.lineItems || []).length})`
+      `[Processing] Order ${workOrder.orderId}: ${subOrders.length} sub-order(s) ` +
+        `(workflow=${workOrder.shipping?.workflow}, items=${(workOrder.lineItems || []).length})${reprint ? ' [REPRINT]' : ''}`
     );
 
     for (const sub of subOrders) {
-      const subResult = await this._processSubOrder(order, sub, {
+      const subResult = await this._processSubOrder(workOrder, sub, {
         generateDivider,
+        reprint,
+        reprintSuffix,
+        lineItemFilter,
       });
       result.subOrders.push(subResult);
     }
@@ -238,15 +296,18 @@ class ProcessingService {
     // shipstation_links, skip create and reuse the existing link.
     // Operators who want to start over should Delete the SS order
     // from the order detail page first.
+    //
+    // Phase 35: reprint mode bypasses the entire SS step. A reprint
+    // is an extra print run; it doesn't go through ShipStation.
     let shipstationStepOk = true; // default true for non-home workflows
-    if (allOk) {
+    if (allOk && !reprint) {
       const settings = await this.getSettings();
-      const isHome = order.shipping?.workflow === 'ship_to_home';
+      const isHome = workOrder.shipping?.workflow === 'ship_to_home';
       const autoSS = settings.autoShipStation !== false; // default ON
 
       if (isHome && autoSS) {
         shipstationStepOk = false; // require explicit success below
-        result.shipstation = await this._tryCreateShipStation(order);
+        result.shipstation = await this._tryCreateShipStation(workOrder);
         shipstationStepOk = result.shipstation.ok;
       } else if (isHome && !autoSS) {
         result.shipstation = {
@@ -261,12 +322,22 @@ class ProcessingService {
           ok: true,
           skipped: true,
           reason: 'non_home_workflow',
-          message: `Workflow "${order.shipping?.workflow || 'unknown'}" — ShipStation not applicable`,
+          message: `Workflow "${workOrder.shipping?.workflow || 'unknown'}" — ShipStation not applicable`,
         };
       }
+    } else if (allOk && reprint) {
+      // Phase 35: reprint never touches SS
+      result.shipstation = {
+        ok: true,
+        skipped: true,
+        reason: 'reprint',
+        message: 'Reprint mode — ShipStation step skipped',
+      };
     }
 
-    if (allOk && shipstationStepOk) {
+    // Phase 35: reprint skips the Sytist status update entirely.
+    // The order's status should not change just because we reprinted.
+    if (allOk && shipstationStepOk && !reprint) {
       const settings = await this.getSettings();
       if (
         settings.autoStatusUpdate &&
@@ -274,15 +345,15 @@ class ProcessingService {
         settings.targetStatusId !== undefined
       ) {
         try {
-          await sytistDb.updateOrderStatus(order.orderId, settings.targetStatusId);
+          await sytistDb.updateOrderStatus(workOrder.orderId, settings.targetStatusId);
           result.statusUpdated = true;
           result.newStatusId = settings.targetStatusId;
           console.log(
-            `[Processing] Order ${order.orderId}: status → ${settings.targetStatusId}`
+            `[Processing] Order ${workOrder.orderId}: status → ${settings.targetStatusId}`
           );
         } catch (err) {
           console.warn(
-            `[Processing] Status update failed for ${order.orderId}: ${err.message}`
+            `[Processing] Status update failed for ${workOrder.orderId}: ${err.message}`
           );
           result.statusUpdateError = err.message;
         }
@@ -293,11 +364,171 @@ class ProcessingService {
       // behavior — never mark something as "done" if a downstream
       // step failed silently.
       console.warn(
-        `[Processing] Order ${order.orderId}: sub-orders OK but ShipStation step failed — NOT updating Sytist status`
+        `[Processing] Order ${workOrder.orderId}: sub-orders OK but ShipStation step failed — NOT updating Sytist status`
       );
     }
 
+    // Phase 35: audit reprints to order_status_audit so we have a
+    // record of every reprint event for forensics. Same table the
+    // ship/unship code uses. source='reprint' makes them easy to
+    // filter. We insert directly rather than going through
+    // orderStatusService since reprints don't fit that service's
+    // ship/unship model (no status change).
+    if (reprint && allOk) {
+      try {
+        // Make sure the audit table exists. orderStatusService
+        // creates it on first ship/unship, but if no shipping has
+        // happened yet on this dashboard install the table won't
+        // exist when the first reprint runs.
+        const orderStatusService = require('./orderStatusService');
+        if (typeof orderStatusService.ensureAuditTable === 'function') {
+          try { orderStatusService.ensureAuditTable(); } catch {}
+        }
+        const databaseService = require('./database');
+        const db = databaseService.getDb();
+        const note =
+          `REPRINT_${reprintNumber}` +
+          (lineItemFilter ? ` items=${lineItemFilter.join(',')}` : ' (full order)') +
+          (options.reason ? ` reason="${options.reason}"` : '');
+        db.prepare(
+          `INSERT INTO order_status_audit
+             (order_id, from_status, to_status, source, user_id, notes)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        ).run(
+          parseInt(workOrder.orderId, 10),
+          null,
+          0,
+          'reprint',
+          options.userId == null ? null : parseInt(options.userId, 10),
+          note
+        );
+      } catch (auditErr) {
+        // Audit failure must never block the reprint result.
+        console.warn(
+          `[Processing] Reprint audit log failed for ${workOrder.orderId}: ${auditErr.message}`
+        );
+      }
+    }
+
+    // ─── Phase 36: write to Sytist's ms_notes ───────────────
+    //
+    // On a successful Process / Reprint, append a row to ms_notes so
+    // the action shows up in Sytist's order detail page next to
+    // Sytist-native log entries. Non-fatal: a notes failure doesn't
+    // undo the action.
+    //
+    // Note bodies are intentionally short and consistent — Sytist's
+    // operators scan these the same way they scan Sytist's own.
+    if (allOk) {
+      try {
+        let noteText;
+        if (reprint) {
+          if (lineItemFilter && lineItemFilter.length > 0) {
+            // Identify the line item by product name for human readability.
+            const reprintedItems = (order.lineItems || []).filter((li) =>
+              lineItemFilter.includes(String(li.cartId))
+            );
+            const names = reprintedItems.map((li) => li.productName).join(', ');
+            noteText = `Sytist Dashboard: Item "${names}" reprinted as REPRINT_${reprintNumber}`;
+          } else {
+            noteText = `Sytist Dashboard: Order reprinted as REPRINT_${reprintNumber}`;
+          }
+          if (options.reason) noteText += ` — Reason: ${options.reason}`;
+        } else {
+          // Regular (non-reprint) Process. Report the count of items
+          // and any sub-orders so the operator has context.
+          const itemCount = (workOrder.lineItems || []).length;
+          noteText = `Sytist Dashboard: Order processed`;
+          if (itemCount > 0) noteText += ` (${itemCount} item${itemCount === 1 ? '' : 's'})`;
+          if (result.statusUpdated && result.newStatusId !== null) {
+            // Phase 38 follow-up: look up the friendly status name
+            // so the note reads "Printing and Production" instead of
+            // just "40". Lookup is best-effort: getStatusName never
+            // throws and returns a "Status N" fallback if the
+            // ms_order_status row isn't found.
+            let statusLabel = String(result.newStatusId);
+            try {
+              statusLabel = await sytistDb.getStatusName(result.newStatusId);
+            } catch {
+              /* keep numeric fallback */
+            }
+            noteText += ` — status → ${statusLabel}`;
+          }
+        }
+
+        await sytistDb.insertNote({
+          orderId: workOrder.orderId,
+          noteText,
+          who: options.userDisplayName || 'dashboard',
+          ip: options.userIp || '',
+          isManual: false,
+        });
+      } catch (noteErr) {
+        console.warn(
+          `[Processing] ms_notes insert failed for ${workOrder.orderId}: ${noteErr.message}`
+        );
+      }
+    }
+
     return result;
+  }
+
+  /**
+   * Phase 35: figure out what the next REPRINT_N number should be by
+   * scanning the output directory for existing _REPRINT files for
+   * this order. Returns 1 if no existing reprints, 2 if _REPRINT
+   * exists, 3 if _REPRINT_2 exists, etc.
+   *
+   * We check the regular download dir under the resolved path
+   * template. Scans for both .txt and packing_slip variants since
+   * either is sufficient evidence that a reprint already happened.
+   */
+  async _nextReprintNumber(order) {
+    try {
+      const orderNum = order.orderNumber || order.orderId;
+      const sortLevels = await folderSortService.getSortLevels();
+      const sortSegments = folderSortService.buildOrderPathSync(order, sortLevels);
+      const downloadDir = pathsService.resolveFullPath(
+        'downloadBase',
+        order,
+        sortSegments
+      );
+
+      let existing;
+      try {
+        existing = await fsp.readdir(downloadDir);
+      } catch {
+        // Dir doesn't exist yet — no prior reprints.
+        return 1;
+      }
+
+      // Match: {orderNum}_REPRINT.txt, {orderNum}_REPRINT_2.txt, etc.
+      // Or matching packing_slip variants. The pattern is permissive:
+      // anything starting with `{orderNum}_REPRINT` counts.
+      const prefix = `${orderNum}_REPRINT`;
+      let maxN = 0;
+      for (const name of existing) {
+        if (!name.startsWith(prefix)) continue;
+        // _REPRINT (no number) = treat as N=1
+        // _REPRINT_2, _REPRINT_3, etc.
+        const after = name.slice(prefix.length);
+        const m = after.match(/^_(\d+)/);
+        if (m) {
+          const n = parseInt(m[1], 10);
+          if (n > maxN) maxN = n;
+        } else {
+          // _REPRINT followed by anything other than _N (e.g. _packing_slip)
+          // counts as N=1.
+          if (maxN < 1) maxN = 1;
+        }
+      }
+      return maxN + 1;
+    } catch (err) {
+      console.warn(
+        `[Processing] _nextReprintNumber failed for ${order.orderId} — defaulting to 1: ${err.message}`
+      );
+      return 1;
+    }
   }
 
   /**
@@ -319,6 +550,11 @@ class ProcessingService {
    */
   async _tryCreateShipStation(order) {
     const orderNum = order.orderNumber || String(order.orderId);
+    // Phase 33: explicit entry log so we can always see the SS path
+    // was entered and why. Followed by per-decision-point logs that
+    // tell us exactly which branch we took.
+    console.log(`[SS] ${orderNum}: _tryCreateShipStation entered`);
+
     let shipstationService;
     let shipstationLinkService;
     try {
@@ -328,7 +564,7 @@ class ProcessingService {
       // The services aren't installed (unlikely, but defensive). Don't
       // fail the order over a missing dep — log and treat as skip.
       console.warn(
-        `[Processing] ShipStation services unavailable: ${e.message}`
+        `[SS] ${orderNum}: services unavailable: ${e.message}`
       );
       return {
         ok: true,
@@ -347,7 +583,7 @@ class ProcessingService {
     }
     if (existingLink) {
       console.log(
-        `[Processing] Order ${orderNum} already linked to SS#${existingLink.ss_order_id} — skipping create`
+        `[SS] ${orderNum}: PATH=already_linked, SS#${existingLink.ss_order_id} ss_status=${existingLink.ss_order_status || '(none)'} — skipping create. Use "Push packaging to ShipStation" button to opt-in re-push.`
       );
       return {
         ok: true,
@@ -369,7 +605,7 @@ class ProcessingService {
       payload = await shipstationService.buildOrderFromSytist(order, {});
     } catch (e) {
       console.error(
-        `[Processing] buildOrderFromSytist failed for ${orderNum}: ${e.message}`
+        `[SS] ${orderNum}: buildOrderFromSytist failed: ${e.message}`
       );
       return {
         ok: false,
@@ -382,7 +618,7 @@ class ProcessingService {
     // proceed since there's no actual ShipStation step that failed.
     if (payload && payload.__skipShipStation) {
       console.log(
-        `[Processing] ShipStation skip for ${orderNum}: ${payload.message}`
+        `[SS] ${orderNum}: PATH=engine_skip reason=${payload.reason || 'nothing_shippable'} message="${payload.message}"`
       );
       return {
         ok: true,
@@ -392,21 +628,41 @@ class ProcessingService {
       };
     }
 
+    // Phase 33: log the resolved payload before any API call.
+    // If something goes wrong downstream we have a record of exactly
+    // what the packaging engine produced.
+    console.log(
+      `[SS] ${orderNum}: payload built — weight=${payload.weight?.value}${payload.weight?.units || 'oz'}, ` +
+        `dims=${payload.dimensions?.length || '?'}x${payload.dimensions?.width || '?'}x${payload.dimensions?.height || '?'}${payload.dimensions?.units || 'in'}, ` +
+        `carrier=${payload.carrierCode}/${payload.serviceCode}, package=${payload.packageCode}`
+    );
+
     // 4. Look up SS by orderNumber in case a duplicate exists on SS's
-    // side (the operator may have created it manually). Adopt rather
-    // than create-and-conflict. Errors here are logged but non-fatal;
-    // worst case we create a duplicate that the operator deletes
-    // manually.
+    // side (the operator may have created it manually, or a prior
+    // dashboard run created it but the link row was lost). Adopt
+    // rather than create-and-conflict.
+    //
+    // Phase 33: REVERSED Phase 31's auto-push during adoption. Per
+    // operator preference, processing should NOT push packaging to
+    // an order that already exists in SS. Doing so could overwrite
+    // packaging the operator has already accepted/edited on the SS
+    // side. If an operator wants to push current packaging to an
+    // existing SS order, they use the dedicated "Push packaging to
+    // ShipStation" button on the order detail page (added in
+    // Phase 33 too).
     try {
+      console.log(`[SS] ${orderNum}: calling listOrders to check for phantom`);
       const lookup = await shipstationService.listOrders({
         orderNumber: orderNum,
       });
+      const lookupCount = lookup?.orders?.length || 0;
+      console.log(`[SS] ${orderNum}: listOrders returned ${lookupCount} match(es)`);
       const found = (lookup?.orders || []).find(
         (o) => o.orderNumber === orderNum
       );
       if (found) {
         console.log(
-          `[Processing] Order ${orderNum} already exists in SS (SS#${found.orderId}) — adopting existing`
+          `[SS] ${orderNum}: PATH=adopt_existing — SS#${found.orderId} already has this orderNumber, adopting WITHOUT pushing packaging (Phase 33 default)`
         );
         try {
           shipstationLinkService.create({
@@ -414,18 +670,25 @@ class ProcessingService {
             ssOrderId: found.orderId,
             ssOrderNumber: found.orderNumber,
             ssOrderStatus: found.orderStatus,
+            // Phase 33: persist whatever the SS order currently has
+            // for carrier/service/package as the link row's metadata.
+            // Falls back to the payload values if SS doesn't echo them.
+            carrierCode: found.carrierCode || payload.carrierCode || null,
+            serviceCode: found.serviceCode || payload.serviceCode || null,
+            packageCode: found.packageCode || payload.packageCode || null,
             payload,
           });
+          console.log(`[SS] ${orderNum}: link row created for adopted SS#${found.orderId}`);
         } catch (linkErr) {
           console.warn(
-            `[Processing] Link insert failed for ${orderNum}: ${linkErr.message}`
+            `[SS] ${orderNum}: link insert failed: ${linkErr.message}`
           );
         }
         return {
           ok: true,
           skipped: true,
           reason: 'adopted_existing',
-          message: `Adopted existing ShipStation order ${found.orderNumber}`,
+          message: `Adopted existing ShipStation order ${found.orderNumber} (skipped auto-push)`,
           orderId: found.orderId,
           orderNumber: found.orderNumber,
           orderStatus: found.orderStatus,
@@ -435,25 +698,26 @@ class ProcessingService {
       // Lookup failing doesn't block create; we'd rather create a
       // potential duplicate than refuse to ship.
       console.warn(
-        `[Processing] ShipStation lookup failed for ${orderNum} (non-fatal): ${lookupErr.message}`
+        `[SS] ${orderNum}: listOrders failed (non-fatal, will proceed to create): ${lookupErr.message}`
       );
     }
 
     // 5. Create.
+    console.log(`[SS] ${orderNum}: PATH=fresh_create — calling createOrder`);
     try {
       const ssResult = await shipstationService.createOrder(payload);
       const sentPkg = payload.packageCode;
       const storedPkg = ssResult.packageCode;
       const drift = sentPkg !== storedPkg;
-      if (drift) {
-        console.log(
-          `[Processing] Order ${orderNum} → SS#${ssResult.orderId} ⚠ packageCode drift: sent=${sentPkg}, stored=${storedPkg}`
-        );
-      } else {
-        console.log(
-          `[Processing] Order ${orderNum} → SS#${ssResult.orderId} (packageCode=${storedPkg})`
-        );
-      }
+      // Phase 33: explicit success log with all key fields so we can
+      // verify exactly what SS accepted.
+      console.log(
+        `[SS] ${orderNum}: createOrder OK → SS#${ssResult.orderId} ` +
+          `ss_status=${ssResult.orderStatus} ` +
+          `packageCode=${storedPkg}${drift ? ` (⚠ drift from sent=${sentPkg})` : ''} ` +
+          `carrier=${ssResult.carrierCode || '(echoed empty)'}/${ssResult.serviceCode || '(echoed empty)'} ` +
+          `weight=${ssResult.weight?.value || '(echoed empty)'}`
+      );
       try {
         shipstationLinkService.create({
           orderId: order.orderId,
@@ -465,9 +729,10 @@ class ProcessingService {
           packageCode: storedPkg,
           payload,
         });
+        console.log(`[SS] ${orderNum}: link row created for fresh SS#${ssResult.orderId}`);
       } catch (linkErr) {
         console.warn(
-          `[Processing] Link insert failed for ${orderNum} (SS order created OK): ${linkErr.message}`
+          `[SS] ${orderNum}: link insert failed (SS order created OK): ${linkErr.message}`
         );
       }
       return {
@@ -481,7 +746,7 @@ class ProcessingService {
       };
     } catch (createErr) {
       console.error(
-        `[Processing] ShipStation createOrder failed for ${orderNum}: ${createErr.message}`
+        `[SS] ${orderNum}: createOrder FAILED: ${createErr.message}`
       );
       return {
         ok: false,
@@ -781,10 +1046,15 @@ class ProcessingService {
   async _processSubOrder(order, sub, options) {
     const isPerTeam = sub.scope !== 'home';
     const teamScope = isPerTeam ? sub.scope : null;
+    // Phase 35: reprint suffix threaded down from processOrder. When
+    // non-empty, gets appended to every output filename so reprint
+    // outputs sit alongside the originals without overwriting.
+    const reprintSuffix = options.reprintSuffix || '';
+    const isReprint = !!options.reprint;
     const subLabel = isPerTeam
       ? `team "${teamScope.subGalleryName}"`
       : 'whole order';
-    console.log(`[Processing]   sub-order: ${subLabel} (${sub.lineItems.length} items)`);
+    console.log(`[Processing]   sub-order: ${subLabel} (${sub.lineItems.length} items)${isReprint ? ' [REPRINT' + reprintSuffix + ']' : ''}`);
 
     const subResult = {
       scope: sub.scope,
@@ -867,7 +1137,7 @@ class ProcessingService {
         /* continue — write below will fail with a clearer error */
       }
 
-      const filename = this._buildPhotoFilename(order, li);
+      const filename = this._buildPhotoFilename(order, li, reprintSuffix);
       const filePath = path.win32.join(targetDir, filename);
 
       try {
@@ -885,6 +1155,196 @@ class ProcessingService {
           sku: li.sku,
           error: err.message,
         });
+      }
+    }
+
+    // ─── Step 1.4 (Phase 34): green-screen compositing ──────
+    // For line items where the customer selected a background (Sytist
+    // cart_photo_bg > 0, surfaced as flags.greenScreen + backgroundPhoto),
+    // composite the transparent subject onto the chosen background BEFORE
+    // any other step touches the downloaded photo. This ensures:
+    //
+    //   - Imposition (Step 2) sees the composed image, so plain prints
+    //     (Mini Magnets, wallets, etc.) get the proper background instead
+    //     of a transparent PNG over white.
+    //   - The packing slip (Step 3) can read the same composed image
+    //     from disk via composedByCartId so its thumbnails match what
+    //     actually prints.
+    //   - The composite engine (Step 1.5) still receives the player image
+    //     it expects — composites have their own `playerBackground` slot
+    //     and don't pass through this code path. We only compose for
+    //     line items WITHOUT a composite mapping; composite-mapped items
+    //     keep their original subject buffer for the composite engine.
+    //
+    // The composed file is written alongside the original with a
+    // "_composed.jpg" suffix. downloaded.path is updated to point at
+    // the new file. downloaded.composedPath stores the same value so
+    // downstream code can identify composed vs raw files.
+    //
+    // Failure handling: if the compose step fails (background fetch
+    // error, etc.), we keep the original file and log a warning. The
+    // line item still processes — better a missing background than a
+    // missing item.
+    const composedByCartId = {};
+    for (const li of sub.lineItems) {
+      const downloaded = photosByCartId[li.cartId];
+      if (!downloaded) continue;
+
+      // Phase 42 diagnostics: log per-cart greenscreen state so we can
+      // diagnose why Step 1.4 fires or skips. This helps when a line
+      // item shows the green-screen badge in the UI but doesn't get
+      // composed in the pipeline (mismatch between display logic and
+      // shouldComposite()'s requirements).
+      if (li.flags?.greenScreen || li.backgroundPhoto) {
+        console.log(
+          `[Processing] Order ${order.orderId} cart ${li.cartId} sku=${li.sku}: ` +
+            `greenScreen=${!!li.flags?.greenScreen} ` +
+            `backgroundPhoto=${li.backgroundPhoto ? 'present' : 'null'} ` +
+            `bgFullUrl=${li.backgroundPhoto?.fullUrl ? 'set' : 'missing'} ` +
+            `shouldComposite=${greenscreenService.shouldComposite(li)}`
+        );
+      }
+
+      if (!greenscreenService.shouldComposite(li)) continue;
+
+      // Composite-mapped SKUs handle their own background via the
+      // playerBackground slot. Skip green-screen for them so we don't
+      // double-composite. Note: chainToImposition composites end up
+      // using the composite output as the imposition source, which
+      // already has the background baked in by the composite engine.
+      let mapping;
+      try {
+        mapping = await compositeService.findMapping(li.sku);
+      } catch {
+        mapping = null;
+      }
+      if (mapping) continue;
+
+      try {
+        const subjectBuffer = await fsp.readFile(downloaded.path);
+        const { buffer: composedBuffer, warnings: gsWarnings } =
+          await greenscreenService.composeWithBackground(
+            subjectBuffer,
+            li.backgroundPhoto.fullUrl,
+            { outputFormat: 'jpeg', jpegQuality: 92 }
+          );
+        if (gsWarnings && gsWarnings.length > 0) {
+          for (const w of gsWarnings) {
+            subResult.warnings.push({
+              type: 'greenscreen_' + w.type,
+              cartId: li.cartId,
+              message: w.message,
+            });
+            console.warn(
+              `[Processing] Order ${order.orderNumber || order.orderId} cart ${li.cartId} greenscreen ${w.type}: ${w.message}`
+            );
+          }
+        }
+
+        // Write the composed file alongside the original. We replace
+        // the original file rather than keeping a sidecar: imposition
+        // and downstream code already point at downloaded.path; the
+        // single-file approach avoids changing every consumer. The
+        // original transparent PNG is no longer useful once composed.
+        //
+        // Atomic .tmp+rename to avoid half-written files if the
+        // process is killed mid-write.
+        const composedExt = '.jpg'; // composeWithBackground default
+        const composedPath =
+          downloaded.path.replace(/\.[^.]+$/, '') + '_composed' + composedExt;
+        const tmpPath = composedPath + '.tmp';
+        await fsp.writeFile(tmpPath, composedBuffer);
+        await fsp.rename(tmpPath, composedPath);
+
+        // Update photosByCartId so imposition reads the composed file.
+        // Keep composedPath alongside so packing slip can find it.
+        downloaded.path = composedPath;
+        downloaded.composedPath = composedPath;
+        composedByCartId[li.cartId] = composedPath;
+
+        console.log(
+          `[Processing] Order ${order.orderNumber || order.orderId} cart ${li.cartId}: green-screen composed → ${composedPath}`
+        );
+
+        // Phase 42: publish a thumbnail-sized version of the composed
+        // image to the configured backend (default 'skip' = nothing
+        // happens). When the backend is 's3-sytist' with credentials
+        // set, the returned URL is mutated onto the line item as
+        // `composedImageUrl`. shipstationService.buildOrderFromSytist
+        // picks that up and sends it as the line's imageUrl. Result:
+        // ShipStation displays the actual composed product in its
+        // line-item thumbnail column, not the keyed-out subject.
+        //
+        // Failures are non-fatal: the publish wrapper catches errors
+        // and returns null, in which case we just don't set
+        // composedImageUrl. ShipStation will see no imageUrl for that
+        // line, which is the right behavior (current behavior, in fact
+        // — Phase 41 already didn't send imageUrl when there was no
+        // good URL).
+        try {
+          const thumbBuffer = await sharp(composedBuffer)
+            .resize({
+              width: 500,
+              height: 500,
+              fit: 'inside',
+              withoutEnlargement: true,
+            })
+            .jpeg({ quality: 80 })
+            .toBuffer();
+
+          const publishedUrl = await composedThumbnailService.publish(
+            order.orderId,
+            li.cartId,
+            thumbBuffer
+          );
+          if (publishedUrl) {
+            // Mutate the line item so downstream consumers
+            // (shipstationService) can read it. This is the same
+            // `li` object that's in sub.lineItems — mutation
+            // propagates.
+            li.composedImageUrl = publishedUrl;
+
+            // Phase 43: persist the URL to SQLite so Push Packaging
+            // and other downstream code paths can hydrate it later
+            // without re-running Step 1.4. Lifetime ends when the
+            // scheduler detects the order's flip to Shipped and
+            // calls cleanup.
+            try {
+              const status = composedThumbnailService.status();
+              composedThumbnailCacheService.upsert({
+                orderId: order.orderId,
+                cartId: li.cartId,
+                publicUrl: publishedUrl,
+                backend: status?.active || null,
+              });
+            } catch (cacheErr) {
+              // Non-fatal — cache miss just means Push Packaging
+              // falls back to thumbUrl. Process still succeeded.
+              console.warn(
+                `[Processing] Order ${order.orderId} cart ${li.cartId}: thumbnail cache upsert failed (non-fatal): ${cacheErr.message}`
+              );
+            }
+          }
+        } catch (thumbErr) {
+          // Non-fatal — just no thumbnail to ShipStation.
+          subResult.warnings.push({
+            type: 'composed_thumbnail_failed',
+            cartId: li.cartId,
+            message: thumbErr.message,
+          });
+          console.warn(
+            `[Processing] Order ${order.orderId} cart ${li.cartId}: composed thumbnail publish failed (non-fatal): ${thumbErr.message}`
+          );
+        }
+      } catch (err) {
+        subResult.warnings.push({
+          type: 'greenscreen_compose_error',
+          cartId: li.cartId,
+          message: err.message,
+        });
+        console.warn(
+          `[Processing] Order ${order.orderNumber || order.orderId} cart ${li.cartId}: green-screen compose failed: ${err.message} — using original subject`
+        );
       }
     }
 
@@ -1106,7 +1566,8 @@ class ProcessingService {
         const compositeFilename = this._buildCompositeFilename(
           order,
           li,
-          layout
+          layout,
+          reprintSuffix
         );
         const compositePath = path.win32.join(
           downloaded.targetDir,
@@ -1127,6 +1588,62 @@ class ProcessingService {
           teamPhotoFound: !!teamLookup?.found,
           logoFound: !!logoBuffer,
         });
+
+        // Phase 44: publish a thumbnail of the composite output to
+        // the configured backend (default 'skip' = no-op). This
+        // matches the green-screen publish flow in Step 1.4 and
+        // produces a URL that:
+        //   - shipstationService picks up via li.composedImageUrl,
+        //     so SS shows the actual composite (Memory Mate, etc.)
+        //     instead of just the keyed-out subject
+        //   - the dashboard's order detail page surfaces too, via a
+        //     new endpoint that reads the cache
+        //
+        // Same constraints as the green-screen publish: non-fatal,
+        // backend can fail silently and processing continues.
+        try {
+          const compositeThumbBuffer = await sharp(result.buffer)
+            .resize({
+              width: 500,
+              height: 500,
+              fit: 'inside',
+              withoutEnlargement: true,
+            })
+            .jpeg({ quality: 80 })
+            .toBuffer();
+
+          const publishedCompositeUrl =
+            await composedThumbnailService.publish(
+              order.orderId,
+              li.cartId,
+              compositeThumbBuffer
+            );
+          if (publishedCompositeUrl) {
+            li.composedImageUrl = publishedCompositeUrl;
+            try {
+              const status = composedThumbnailService.status();
+              composedThumbnailCacheService.upsert({
+                orderId: order.orderId,
+                cartId: li.cartId,
+                publicUrl: publishedCompositeUrl,
+                backend: status?.active || null,
+              });
+            } catch (cacheErr) {
+              console.warn(
+                `[Processing] Order ${order.orderId} cart ${li.cartId}: composite thumbnail cache upsert failed (non-fatal): ${cacheErr.message}`
+              );
+            }
+          }
+        } catch (thumbErr) {
+          subResult.warnings.push({
+            type: 'composite_thumbnail_failed',
+            cartId: li.cartId,
+            message: thumbErr.message,
+          });
+          console.warn(
+            `[Processing] Order ${order.orderId} cart ${li.cartId}: composite thumbnail publish failed (non-fatal): ${thumbErr.message}`
+          );
+        }
 
         // Surface composite-internal warnings
         for (const w of result.warnings || []) {
@@ -1163,63 +1680,6 @@ class ProcessingService {
           type: 'composite_render_error',
           cartId: li.cartId,
           message: err.message,
-        });
-      }
-    }
-
-    // ─── Step 1.6 (Phase 17): green-screen background composite ──
-    //
-    // For line items that are green-screen (flags.greenScreen) AND
-    // have a chosen background (backgroundPhoto) AND are NOT being
-    // handled by the composite engine (skipImpositionCartIds), we
-    // need to flatten the transparent subject onto the background
-    // before imposition or the print shows up with the page color
-    // visible behind the figure.
-    //
-    // The composite engine already handles its own backgrounds via
-    // the playerBackground slot (Step 1.5), so we skip those lines
-    // here to avoid double-compositing.
-    //
-    // Items WITHOUT a composite mapping but WITH a green-screen
-    // background go through here. Common case: a regular 5x7 or
-    // 8x10 print with a chosen photo backdrop.
-    //
-    // We overwrite the downloaded file at downloaded.path so Step 2
-    // (imposition) and downstream readers pick up the composited
-    // image without any further changes.
-    const greenscreenService = require('./greenscreenService');
-    for (const li of sub.lineItems) {
-      const downloaded = photosByCartId[li.cartId];
-      if (!downloaded) continue;
-      if (skipImpositionCartIds.has(li.cartId)) continue;
-      if (!greenscreenService.shouldComposite(li)) continue;
-
-      try {
-        const subjectBuffer = await fsp.readFile(downloaded.path);
-        const { buffer: composedBuffer, warnings: gsWarnings } =
-          await greenscreenService.composeWithBackground(
-            subjectBuffer,
-            li.backgroundPhoto.fullUrl,
-            { outputFormat: 'jpeg', jpegQuality: 92 }
-          );
-        // Atomic .tmp + rename so partial writes never reach
-        // downstream readers.
-        const tmp = downloaded.path + '.gs.tmp';
-        await fsp.writeFile(tmp, composedBuffer);
-        await fsp.rename(tmp, downloaded.path);
-
-        for (const w of gsWarnings || []) {
-          subResult.warnings.push({
-            type: 'greenscreen_' + (w.type || 'warning'),
-            cartId: li.cartId,
-            message: w.message,
-          });
-        }
-      } catch (err) {
-        subResult.warnings.push({
-          type: 'greenscreen_compose_error',
-          cartId: li.cartId,
-          message: `Green-screen composite failed: ${err.message}`,
         });
       }
     }
@@ -1272,11 +1732,52 @@ class ProcessingService {
     }
 
     // ─── Step 3: build & write the packing slip
+    //
+    // Phase 35: skip the slip when reprinting a SINGLE item (via the
+    // lineItemFilter / per-item reprint endpoint). A one-item slip
+    // is just visual noise — the operator already knows what they're
+    // reprinting. Full-order reprints DO get a slip (with the
+    // _REPRINT suffix in the filename).
     let slipBuildResult;
+    const skipSlip = isReprint && Array.isArray(options.lineItemFilter) && options.lineItemFilter.length > 0;
+    if (skipSlip) {
+      subResult.slipPath = null;
+      console.log(
+        `[Processing] Order ${order.orderNumber || order.orderId}: skipping slip for single-item reprint`
+      );
+    } else {
     try {
+      // Phase 44: build a per-cartId map of composite output paths.
+      // The packing slip uses these to render the actual composite
+      // (Memory Mate, etc.) as the thumbnail for each line item,
+      // matching what gets printed. Falls back to composedByCartId
+      // (green-screen composite) or photo.thumbUrl as before.
+      const compositePathsByCartId = {};
+      for (const c of subResult.composites || []) {
+        if (c.cartId !== undefined && c.cartId !== null && c.path) {
+          compositePathsByCartId[c.cartId] = c.path;
+        }
+      }
+
       slipBuildResult = await packingSlipService.buildSlipBuffer(order, {
         sortSegments,
         teamScope,
+        // Phase 34: per-cartId map of disk paths for line items whose
+        // photo was green-screen-composited in Step 1.4. The slip
+        // service prefers these over thumbUrl fetches so thumbnails
+        // match the composed images that actually print.
+        composedByCartId,
+        // Phase 44: per-cartId map of composite engine output paths.
+        // For items with a composite layout (Memory Mate, etc.),
+        // the slip shows the rendered composite as the thumbnail
+        // rather than the customer's raw subject photo. Takes
+        // priority over composedByCartId since the composite engine
+        // output INCLUDES the chosen background (via playerBackground
+        // slot) plus the rest of the layout.
+        compositePathsByCartId,
+        // Phase 35: append the reprint suffix to the slip filename
+        // so it doesn't collide with the original slip.
+        filenameSuffix: reprintSuffix,
       });
       const written = await packingSlipService.writeSlipFile(slipBuildResult);
       subResult.slipPath = written.filePath;
@@ -1288,6 +1789,7 @@ class ProcessingService {
       subResult.error = `Slip generation failed: ${err.message}`;
       return subResult; // can't continue without slip
     }
+    } // end if (!skipSlip)
 
     // ─── Step 4: optional team divider
     if (options.generateDivider && isPerTeam) {
@@ -1357,14 +1859,18 @@ class ProcessingService {
           teamScope,
         });
 
-        // Override the txt's filename so per-team chunks don't collide
+        // Override the txt's filename so per-team chunks don't collide.
+        // Phase 35: also append the reprint suffix when reprinting so
+        // the reprint .txt sits alongside the original instead of
+        // overwriting it.
         const teamSuffix = teamScope
           ? '_' + (teamScope.subGalleryName || '').replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').replace(/\s+/g, '_')
           : '';
-        if (teamSuffix) {
+        const combinedSuffix = teamSuffix + (reprintSuffix || '');
+        if (combinedSuffix) {
           const orig = txtBuild.filename;
           const dot = orig.lastIndexOf('.');
-          const newName = (dot > 0 ? orig.slice(0, dot) + teamSuffix + orig.slice(dot) : orig + teamSuffix);
+          const newName = (dot > 0 ? orig.slice(0, dot) + combinedSuffix + orig.slice(dot) : orig + combinedSuffix);
           txtBuild.filename = newName;
           txtBuild.filePath = path.win32.join(downloadDir, newName);
         }
@@ -1407,7 +1913,7 @@ class ProcessingService {
         const teamSuffix = teamScope
           ? '_' + (teamScope.subGalleryName || '').replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').replace(/\s+/g, '_')
           : '';
-        const newName = `${order.orderNumber || order.orderId}${teamSuffix}_specialty.txt`;
+        const newName = `${order.orderNumber || order.orderId}${teamSuffix}${reprintSuffix || ''}_specialty.txt`;
         txtBuild.filename = newName;
         txtBuild.filePath = path.win32.join(specialtyDir, newName);
 
@@ -1453,7 +1959,7 @@ class ProcessingService {
     return filtered;
   }
 
-  _buildPhotoFilename(order, lineItem) {
+  _buildPhotoFilename(order, lineItem, reprintSuffix = '') {
     const orderNum = order.orderNumber || order.orderId;
     const cartId = lineItem.cartId;
     const originalName =
@@ -1461,6 +1967,13 @@ class ProcessingService {
       `cart${cartId}.jpg`;
     // Sanitize
     const safe = String(originalName).replace(/[<>:"/\\|?*\x00-\x1F]/g, '_');
+    // Phase 35: reprint suffix goes between the cartId and the
+    // original filename (before the dot). For an _REPRINT_2 reprint
+    // of order 110685 / cart 481629:
+    //   110685_481629_REPRINT_2_JV_Baseball-0016.png
+    if (reprintSuffix) {
+      return `${orderNum}_${cartId}${reprintSuffix}_${safe}`;
+    }
     return `${orderNum}_${cartId}_${safe}`;
   }
 
@@ -1473,13 +1986,17 @@ class ProcessingService {
    * Example:
    *   order 110855, cartId 12345, layout "memory-mate-5x7-v1" →
    *     "110855_12345_composite_memory-mate-5x7-v1.jpg"
+   *
+   * Phase 35: when reprintSuffix is provided, the suffix is appended
+   * before the .jpg extension to keep reprint composites distinct
+   * from the originals.
    */
-  _buildCompositeFilename(order, lineItem, layout) {
+  _buildCompositeFilename(order, lineItem, layout, reprintSuffix = '') {
     const orderNum = order.orderNumber || order.orderId;
     const cartId = lineItem.cartId;
     const layoutId = (layout && layout.id) || 'composite';
     const safeLayoutId = String(layoutId).replace(/[<>:"/\\|?*\x00-\x1F\s]/g, '_');
-    return `${orderNum}_${cartId}_composite_${safeLayoutId}.jpg`;
+    return `${orderNum}_${cartId}_composite_${safeLayoutId}${reprintSuffix}.jpg`;
   }
 
   /**

@@ -48,7 +48,11 @@ function writeJsonSync(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
 }
 
-const SECRET_FIELDS = ['shipstationApiKey', 'shipstationApiSecret'];
+const SECRET_FIELDS = [
+  'shipstationApiKey',
+  'shipstationApiSecret',
+  'awsSecretAccessKey',
+];
 
 // Field definitions. Adding a new configurable value: append here,
 // then read it via getRawValue(key) wherever it's needed.
@@ -145,6 +149,84 @@ const FIELD_DEFINITIONS = [
     section: 'shipping_defaults',
     default: '0.5',
     secret: false,
+  },
+
+  // Phase 42: AWS S3 — used by composedThumbnailService to publish
+  // composed green-screen thumbnails (subject + background) so they
+  // can be sent to ShipStation as imageUrl. Optional: when any of
+  // these are empty, the service falls back to backend='skip' which
+  // simply doesn't send imageUrl for green-screen items.
+  //
+  // To enable:
+  //   1. Fill in all four (region, bucket, access key, secret) here.
+  //   2. Set 'composedThumbnailBackend' to 's3-sytist' (below).
+  //   3. Restart the server.
+  //
+  // The bucket can be Sytist's bucket if you have write access, or
+  // a separate bucket you own. The objects need to be publicly
+  // readable so ShipStation can fetch them.
+  {
+    key: 'awsAccessKeyId',
+    envKey: 'AWS_ACCESS_KEY_ID',
+    label: 'AWS Access Key ID',
+    section: 'aws_s3',
+    default: '',
+    secret: false,
+    hint: 'Public half of the AWS credential pair.',
+  },
+  {
+    key: 'awsSecretAccessKey',
+    envKey: 'AWS_SECRET_ACCESS_KEY',
+    label: 'AWS Secret Access Key',
+    section: 'aws_s3',
+    default: '',
+    secret: true,
+    hint: 'Private half. Keep secret.',
+  },
+  {
+    key: 'awsRegion',
+    envKey: 'AWS_REGION',
+    label: 'AWS Region',
+    section: 'aws_s3',
+    default: 'us-east-1',
+    secret: false,
+    hint: 'e.g. us-east-1, us-west-2',
+  },
+  {
+    key: 'awsS3Bucket',
+    envKey: 'AWS_S3_BUCKET',
+    label: 'S3 Bucket Name',
+    section: 'aws_s3',
+    default: '',
+    secret: false,
+    hint: 'Bucket to upload composed thumbnails into.',
+  },
+  {
+    key: 'awsS3KeyPrefix',
+    envKey: 'AWS_S3_KEY_PREFIX',
+    label: 'S3 Key Prefix',
+    section: 'aws_s3',
+    default: 'sytist-dashboard-composed/',
+    secret: false,
+    hint: 'Folder inside the bucket. Include trailing /',
+  },
+  {
+    key: 'awsS3PublicUrlBase',
+    envKey: 'AWS_S3_PUBLIC_URL_BASE',
+    label: 'S3 Public URL Base (optional)',
+    section: 'aws_s3',
+    default: '',
+    secret: false,
+    hint: 'Optional CDN/CloudFront URL. Leave empty to use s3.amazonaws.com.',
+  },
+  {
+    key: 'composedThumbnailBackend',
+    envKey: 'COMPOSED_THUMBNAIL_BACKEND',
+    label: 'Composed Thumbnail Backend',
+    section: 'aws_s3',
+    default: 'skip',
+    secret: false,
+    hint: 'skip = no green-screen thumbnails in SS. s3-sytist = upload to S3.',
   },
 ];
 

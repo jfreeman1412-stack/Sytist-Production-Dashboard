@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState, useRef } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import api from '../services/api';
 
@@ -39,6 +39,17 @@ export default function OrdersListPage() {
   const [galleries, setGalleries] = useState([]);
   const [shippingOptionList, setShippingOptionList] = useState([]);
 
+  // Phase 20: global order search
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchError, setSearchError] = useState(null);
+  // Track which result is highlighted for keyboard navigation
+  const [searchHighlight, setSearchHighlight] = useState(0);
+  const searchAbortRef = useRef(null);
+  const searchContainerRef = useRef(null);
+
   // Orders data
   const [orders, setOrders] = useState([]);
   const [total, setTotal] = useState(0);
@@ -59,6 +70,17 @@ export default function OrdersListPage() {
   // Active batch job (when set, a sticky banner shows progress)
   const [activeJobId, setActiveJobId] = useState(null);
   const [activeJob, setActiveJob] = useState(null);
+
+  // Phase 28 — bulk Mark Selected Shipped
+  const [shipModalOpen, setShipModalOpen] = useState(false);
+  const [shipping, setShipping] = useState(false);
+  // After a successful batch-ship: { shippedCount, skippedCount,
+  // results: [{orderId, ok, error?}] }. Shown as a dismissible banner.
+  const [shipResult, setShipResult] = useState(null);
+  // Bump this to force the orders-load useEffect to re-run (e.g.
+  // after a batch-ship changes statuses and we want the list
+  // refreshed without changing the filter URL params).
+  const [reloadCounter, setReloadCounter] = useState(0);
 
   // ─── Load filter dropdown data once ────────────────────
   useEffect(() => {
@@ -129,6 +151,7 @@ export default function OrdersListPage() {
     pageSize,
     page,
     sort,
+    reloadCounter,
   ]);
 
   // Phase 4.6 — clear selection when filters change so the operator
@@ -180,6 +203,162 @@ export default function OrdersListPage() {
     // Clearing gallery also clears sub-gallery (it's a parent-child relationship).
     if (key === 'galleryId') next.delete('subGalleryId');
     setSearchParams(next, { replace: false });
+  }
+
+  // ─── Phase 20: global order search ─────────────────────
+  // Hits /api/sytist/orders/search?q=<query>. Debounced 250ms on
+  // typing, AND fires immediately on Enter (which also auto-navigates
+  // to the order if there's exactly one result).
+  //
+  // Skips current filter context — search results jump directly to
+  // the order regardless of which workflow/status is selected.
+  //
+  // Race-condition guard: we track the "current request" by query
+  // string so stale responses from rapid typing get dropped. No
+  // AbortController used because api.get doesn't surface fetch options.
+  function runSearch(q) {
+    const query = String(q || '').trim();
+    if (!query || query.length < 2) {
+      setSearchResults([]);
+      setSearchError(null);
+      setSearchOpen(false);
+      return Promise.resolve([]);
+    }
+
+    setSearchLoading(true);
+    setSearchError(null);
+    searchAbortRef.current = query; // remember which query is current
+    return api
+      .get(`/api/sytist/orders/search?q=${encodeURIComponent(query)}`)
+      .then((d) => {
+        // Drop stale responses if a newer query has been issued.
+        if (searchAbortRef.current !== query) return [];
+        const results = d.results || [];
+        setSearchResults(results);
+        setSearchHighlight(0);
+        setSearchOpen(true);
+        return results;
+      })
+      .catch((err) => {
+        if (searchAbortRef.current !== query) return [];
+        console.warn('Search failed:', err.message);
+        setSearchError(err.message || 'Search failed');
+        setSearchResults([]);
+        return [];
+      })
+      .finally(() => {
+        if (searchAbortRef.current === query) {
+          setSearchLoading(false);
+        }
+      });
+  }
+
+  // Debounced search-as-you-type
+  useEffect(() => {
+    if (!searchQuery.trim()) {
+      setSearchResults([]);
+      setSearchOpen(false);
+      return;
+    }
+    const t = setTimeout(() => runSearch(searchQuery), 250);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchQuery]);
+
+  // Click-outside to close the dropdown
+  useEffect(() => {
+    if (!searchOpen) return undefined;
+    function onDocClick(e) {
+      if (
+        searchContainerRef.current &&
+        !searchContainerRef.current.contains(e.target)
+      ) {
+        setSearchOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, [searchOpen]);
+
+  function navigateToSearchResult(result) {
+    if (!result || !result.orderId) return;
+    setSearchOpen(false);
+    setSearchQuery('');
+    setSearchResults([]);
+    // Preserve current filter context as a return path; the order
+    // detail page's Back button reads this.
+    const qs = new URLSearchParams(searchParams);
+    const suffix = qs.toString();
+    navigate(`/orders/${result.orderId}${suffix ? `?${suffix}` : ''}`);
+  }
+
+  async function handleSearchSubmit() {
+    const query = searchQuery.trim();
+    if (!query) return;
+    // Force an immediate search, then navigate on exact match.
+    const results = await runSearch(query);
+    if (!results || results.length === 0) return;
+    // If query is a number AND first result is an exact order_number
+    // match, navigate directly.
+    if (
+      /^[0-9]{3,8}$/.test(query) &&
+      String(results[0].orderNumber) === query
+    ) {
+      navigateToSearchResult(results[0]);
+      return;
+    }
+    // If there's exactly one result, jump to it regardless.
+    if (results.length === 1) {
+      navigateToSearchResult(results[0]);
+      return;
+    }
+    // Otherwise leave the dropdown open for the user to pick.
+    setSearchOpen(true);
+  }
+
+  function handleSearchKeyDown(e) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      // If the user has highlighted a result with arrow keys, pick it.
+      if (
+        searchOpen &&
+        searchResults.length > 0 &&
+        searchHighlight >= 0 &&
+        searchHighlight < searchResults.length
+      ) {
+        navigateToSearchResult(searchResults[searchHighlight]);
+        return;
+      }
+      handleSearchSubmit();
+      return;
+    }
+    if (e.key === 'Escape') {
+      setSearchOpen(false);
+      return;
+    }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (!searchOpen) {
+        setSearchOpen(searchResults.length > 0);
+        return;
+      }
+      setSearchHighlight((h) =>
+        Math.min(searchResults.length - 1, h + 1)
+      );
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setSearchHighlight((h) => Math.max(0, h - 1));
+      return;
+    }
+  }
+
+  function clearSearch() {
+    setSearchQuery('');
+    setSearchResults([]);
+    setSearchOpen(false);
+    setSearchError(null);
   }
 
   // ─── Phase 4.6 — selection helpers ─────────────────────
@@ -288,6 +467,56 @@ export default function OrdersListPage() {
     clearSelection();
   }
 
+  // ─── Phase 28 — bulk Mark Selected Shipped ─────────────
+  //
+  // Mirrors the batch-process pattern: openShipModal previews the
+  // count, startBatchShip calls /orders/batch-ship, then a result
+  // banner shows what was shipped vs skipped. Each order is
+  // independently validated server-side (only those in Printing
+  // status are flipped to Shipped; the rest are reported as
+  // 'not_eligible' and skipped).
+  function openShipModal() {
+    if (selectedOrderIds.size === 0) return;
+    setShipResult(null);
+    setShipModalOpen(true);
+  }
+
+  async function startBatchShip() {
+    const orderIds = Array.from(selectedOrderIds);
+    if (orderIds.length === 0) return;
+    setShipping(true);
+    try {
+      const response = await api.post('/api/sytist/orders/batch-ship', {
+        orderIds,
+      });
+      setShipResult({
+        shippedCount: response.shippedCount || 0,
+        skippedCount: response.skippedCount || 0,
+        results: response.results || [],
+      });
+      setShipModalOpen(false);
+      // Refresh the orders list — shipped rows have a new status
+      // and may no longer match the active "Printing" filter.
+      setReloadCounter((c) => c + 1);
+      // Clear selection — these rows are no longer the "current set"
+      clearSelection();
+    } catch (err) {
+      setShipResult({
+        shippedCount: 0,
+        skippedCount: orderIds.length,
+        results: [],
+        error: err.message || 'Batch ship failed',
+      });
+      setShipModalOpen(false);
+    } finally {
+      setShipping(false);
+    }
+  }
+
+  function dismissShipResult() {
+    setShipResult(null);
+  }
+
   // Phase 4.7 — graceful cancel of an in-flight batch. Lets the
   // currently-processing order finish, then halts before the next one.
   async function cancelBatch() {
@@ -334,6 +563,200 @@ export default function OrdersListPage() {
       }}
     >
       <h1 style={{ fontSize: 22, margin: '0 0 16px' }}>Orders</h1>
+
+      {/* ─── Phase 20: global order search ──────────────── */}
+      <div
+        ref={searchContainerRef}
+        style={{
+          position: 'relative',
+          marginBottom: 12,
+          maxWidth: 520,
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <input
+            type="text"
+            placeholder="Search orders by # / name / email / phone — Enter to jump"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            onKeyDown={handleSearchKeyDown}
+            onFocus={() => {
+              if (searchResults.length > 0) setSearchOpen(true);
+            }}
+            style={{
+              flex: 1,
+              padding: '8px 32px 8px 12px',
+              background: 'var(--bg-card)',
+              color: 'var(--text)',
+              border: '1px solid var(--border-color)',
+              borderRadius: 6,
+              fontSize: 14,
+              fontFamily: 'inherit',
+              outline: 'none',
+            }}
+          />
+          {searchQuery && (
+            <button
+              onClick={clearSearch}
+              title="Clear search"
+              style={{
+                position: 'absolute',
+                right: 8,
+                top: '50%',
+                transform: 'translateY(-50%)',
+                background: 'transparent',
+                color: 'var(--text-muted)',
+                border: 'none',
+                cursor: 'pointer',
+                fontSize: 16,
+                padding: 4,
+                lineHeight: 1,
+                fontFamily: 'inherit',
+              }}
+            >
+              ×
+            </button>
+          )}
+        </div>
+
+        {/* Results dropdown */}
+        {searchOpen && (searchResults.length > 0 || searchLoading || searchError) && (
+          <div
+            style={{
+              position: 'absolute',
+              top: 'calc(100% + 4px)',
+              left: 0,
+              right: 0,
+              background: 'var(--bg-card)',
+              border: '1px solid var(--border-color)',
+              borderRadius: 6,
+              boxShadow: '0 4px 12px rgba(0, 0, 0, 0.25)',
+              zIndex: 50,
+              maxHeight: 480,
+              overflowY: 'auto',
+            }}
+          >
+            {searchLoading && searchResults.length === 0 && (
+              <div
+                style={{
+                  padding: '12px 14px',
+                  fontSize: 13,
+                  color: 'var(--text-muted)',
+                }}
+              >
+                Searching…
+              </div>
+            )}
+            {searchError && (
+              <div
+                style={{
+                  padding: '12px 14px',
+                  fontSize: 13,
+                  color: '#ff6b6b',
+                }}
+              >
+                Search error: {searchError}
+              </div>
+            )}
+            {!searchLoading && !searchError && searchResults.length === 0 && (
+              <div
+                style={{
+                  padding: '12px 14px',
+                  fontSize: 13,
+                  color: 'var(--text-muted)',
+                }}
+              >
+                No matching orders
+              </div>
+            )}
+            {searchResults.map((r, idx) => {
+              const isHi = idx === searchHighlight;
+              return (
+                <button
+                  key={r.orderId}
+                  onMouseEnter={() => setSearchHighlight(idx)}
+                  onClick={() => navigateToSearchResult(r)}
+                  style={{
+                    display: 'block',
+                    width: '100%',
+                    textAlign: 'left',
+                    padding: '10px 14px',
+                    background: isHi
+                      ? 'var(--accent-hover, rgba(255,255,255,0.05))'
+                      : 'transparent',
+                    color: 'var(--text)',
+                    border: 'none',
+                    borderBottom: '1px solid var(--border-color)',
+                    cursor: 'pointer',
+                    fontSize: 13,
+                    fontFamily: 'inherit',
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'baseline',
+                      gap: 8,
+                    }}
+                  >
+                    <span style={{ fontWeight: 600 }}>
+                      #{r.orderNumber || r.orderId}
+                    </span>
+                    <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                      {r.orderDate}
+                    </span>
+                  </div>
+                  <div
+                    style={{
+                      marginTop: 4,
+                      color: 'var(--text-secondary)',
+                      display: 'flex',
+                      gap: 12,
+                      alignItems: 'baseline',
+                      flexWrap: 'wrap',
+                    }}
+                  >
+                    <span>{r.customerName || '(no name)'}</span>
+                    {r.email && (
+                      <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                        {r.email}
+                      </span>
+                    )}
+                    {r.productionStatusName && (
+                      <span
+                        style={{
+                          fontSize: 11,
+                          color: 'var(--text-muted)',
+                          padding: '1px 6px',
+                          border: '1px solid var(--border-color)',
+                          borderRadius: 4,
+                          marginLeft: 'auto',
+                        }}
+                      >
+                        {r.productionStatusName}
+                      </span>
+                    )}
+                  </div>
+                </button>
+              );
+            })}
+            {searchResults.length === 10 && (
+              <div
+                style={{
+                  padding: '8px 14px',
+                  fontSize: 11,
+                  color: 'var(--text-muted)',
+                  textAlign: 'center',
+                  fontStyle: 'italic',
+                }}
+              >
+                Showing first 10 — refine search for more
+              </div>
+            )}
+          </div>
+        )}
+      </div>
 
       {/* ─── Workflow tabs row ──────────────────────────── */}
       <div
@@ -592,12 +1015,14 @@ export default function OrdersListPage() {
         </div>
       ) : (
         <>
-          {/* Phase 4.6 — selection action bar */}
+          {/* Phase 4.6 — selection action bar (Phase 28: also handles
+              bulk Mark Shipped) */}
           <SelectionActionBar
             selectedCount={selectedOrderIds.size}
             onClearSelection={clearSelection}
             onProcessSelected={openBatchModalSelected}
             onProcessAllFiltered={openBatchModalAll}
+            onShipSelected={openShipModal}
             disabled={!!activeJobId && activeJob?.status !== 'complete' && activeJob?.status !== 'failed' && activeJob?.status !== 'cancelled'}
           />
 
@@ -665,6 +1090,24 @@ export default function OrdersListPage() {
           job={activeJob}
           onDismiss={dismissJobBanner}
           onCancel={cancelBatch}
+        />
+      )}
+
+      {/* Phase 28 — bulk Mark Shipped confirmation modal */}
+      {shipModalOpen && (
+        <BatchShipModal
+          selectedCount={selectedOrderIds.size}
+          onClose={() => setShipModalOpen(false)}
+          onConfirm={startBatchShip}
+          shipping={shipping}
+        />
+      )}
+
+      {/* Phase 28 — result banner shown after a bulk ship completes */}
+      {shipResult && (
+        <BatchShipResultBanner
+          result={shipResult}
+          onDismiss={dismissShipResult}
         />
       )}
     </div>
@@ -1124,6 +1567,7 @@ function SelectionActionBar({
   onClearSelection,
   onProcessSelected,
   onProcessAllFiltered,
+  onShipSelected,
   disabled,
 }) {
   const hasSelection = selectedCount > 0;
@@ -1191,6 +1635,29 @@ function SelectionActionBar({
         >
           Process selected ({selectedCount})
         </button>
+
+        {/* Phase 28 — bulk Mark Shipped */}
+        {onShipSelected && (
+          <button
+            onClick={onShipSelected}
+            disabled={disabled || !hasSelection}
+            style={{
+              background: hasSelection ? '#4caf50' : 'var(--bg-input)',
+              border: `1px solid ${hasSelection ? '#4caf50' : 'var(--border-color)'}`,
+              color: hasSelection ? '#ffffff' : 'var(--text-muted)',
+              padding: '6px 14px',
+              borderRadius: 6,
+              fontSize: 12,
+              fontWeight: 600,
+              cursor: disabled || !hasSelection ? 'not-allowed' : 'pointer',
+              fontFamily: 'inherit',
+              opacity: disabled ? 0.6 : 1,
+            }}
+            title="Mark selected orders as Shipped (only orders currently in Printing will be updated)"
+          >
+            Mark Shipped ({selectedCount})
+          </button>
+        )}
 
         <button
           onClick={onProcessAllFiltered}
@@ -1416,6 +1883,229 @@ function BatchProcessModal({ allMode, selectedCount, onClose, onConfirm }) {
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Phase 28 — Confirmation modal for "Mark Selected Shipped".
+ *
+ * Doesn't pre-check eligibility — the server validates per-order
+ * and reports back which were shipped vs skipped. That keeps the
+ * modal fast (no extra round-trip) and the source of truth on the
+ * server. The modal explains this so the operator knows what will
+ * happen.
+ */
+function BatchShipModal({ selectedCount, onClose, onConfirm, shipping }) {
+  useEffect(() => {
+    function onKey(e) {
+      if (e.key === 'Escape' && !shipping) onClose();
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose, shipping]);
+
+  return (
+    <div
+      onClick={shipping ? undefined : onClose}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0,0,0,0.6)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        zIndex: 1000,
+        padding: 24,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: 'var(--bg-card)',
+          border: '1px solid var(--border-color)',
+          borderRadius: 8,
+          padding: 24,
+          width: '100%',
+          maxWidth: 480,
+        }}
+      >
+        <h3 style={{ margin: '0 0 12px', fontSize: 16, fontWeight: 600 }}>
+          Mark {selectedCount} order{selectedCount === 1 ? '' : 's'} as Shipped?
+        </h3>
+        <div
+          style={{
+            fontSize: 13,
+            color: 'var(--text-secondary)',
+            marginBottom: 20,
+            lineHeight: 1.5,
+          }}
+        >
+          Only orders currently in <strong>Printing</strong> status will be
+          updated to <strong>Shipped</strong>. Orders in other statuses
+          (Queue, Shipped, etc.) will be skipped — you'll see a summary
+          after.
+          <br />
+          <br />
+          Each transition is logged. This is reversible from the order
+          detail page.
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={shipping}
+            style={{
+              padding: '8px 14px',
+              background: 'transparent',
+              color: 'var(--text-secondary)',
+              border: '1px solid var(--border-color)',
+              borderRadius: 6,
+              fontSize: 13,
+              cursor: shipping ? 'wait' : 'pointer',
+              fontFamily: 'inherit',
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={shipping}
+            style={{
+              padding: '8px 18px',
+              background: '#4caf50',
+              color: '#fff',
+              border: 'none',
+              borderRadius: 6,
+              fontSize: 14,
+              fontWeight: 600,
+              cursor: shipping ? 'wait' : 'pointer',
+              fontFamily: 'inherit',
+            }}
+          >
+            {shipping ? 'Shipping…' : 'Yes, mark shipped'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Phase 28 — Result banner shown after a bulk-ship operation
+ * completes. Displays the shipped/skipped counts and (on hover/click)
+ * a per-order breakdown of any failures.
+ */
+function BatchShipResultBanner({ result, onDismiss }) {
+  const [showDetails, setShowDetails] = useState(false);
+  const { shippedCount = 0, skippedCount = 0, results = [], error } = result;
+  const skipped = results.filter((r) => !r.ok);
+
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        right: 24,
+        bottom: 24,
+        zIndex: 999,
+        background: 'var(--bg-card)',
+        border: `1px solid ${error ? '#dc3545' : '#4caf50'}`,
+        borderRadius: 8,
+        padding: 16,
+        minWidth: 340,
+        maxWidth: 480,
+        boxShadow: '0 6px 24px rgba(0,0,0,0.4)',
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12 }}>
+        <div style={{ flex: 1 }}>
+          {error ? (
+            <>
+              <div style={{ fontSize: 14, fontWeight: 600, color: '#dc3545', marginBottom: 4 }}>
+                Batch ship failed
+              </div>
+              <div style={{ fontSize: 13, color: 'var(--text-secondary)' }}>{error}</div>
+            </>
+          ) : (
+            <>
+              <div style={{ fontSize: 14, fontWeight: 600, color: '#4caf50', marginBottom: 4 }}>
+                Shipped {shippedCount} · Skipped {skippedCount}
+              </div>
+              {skippedCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setShowDetails((v) => !v)}
+                  style={{
+                    background: 'transparent',
+                    border: 'none',
+                    color: 'var(--accent, #4a7fc1)',
+                    fontSize: 12,
+                    padding: 0,
+                    cursor: 'pointer',
+                    fontFamily: 'inherit',
+                    textDecoration: 'underline',
+                  }}
+                >
+                  {showDetails ? 'Hide' : 'Show'} skipped details
+                </button>
+              )}
+            </>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={onDismiss}
+          aria-label="Dismiss"
+          style={{
+            background: 'transparent',
+            border: 'none',
+            color: 'var(--text-muted)',
+            fontSize: 18,
+            cursor: 'pointer',
+            padding: 0,
+            lineHeight: 1,
+          }}
+        >
+          ×
+        </button>
+      </div>
+
+      {showDetails && skipped.length > 0 && (
+        <div
+          style={{
+            marginTop: 12,
+            padding: 10,
+            background: 'var(--bg-input)',
+            borderRadius: 6,
+            fontSize: 12,
+            maxHeight: 200,
+            overflowY: 'auto',
+          }}
+        >
+          {skipped.map((r) => (
+            <div
+              key={r.orderId}
+              style={{
+                padding: '4px 0',
+                borderBottom: '1px solid var(--border-color)',
+                display: 'flex',
+                justifyContent: 'space-between',
+                gap: 8,
+              }}
+            >
+              <span style={{ fontFamily: 'var(--font-mono, monospace)' }}>
+                #{r.orderId}
+              </span>
+              <span style={{ color: 'var(--text-muted)', textAlign: 'right' }}>
+                {r.code === 'not_eligible'
+                  ? `not in Printing (status ${r.currentStatus})`
+                  : r.error || r.code || 'unknown'}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

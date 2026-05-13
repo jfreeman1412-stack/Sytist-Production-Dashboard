@@ -48,6 +48,12 @@ async function _fetch(path, options = {}) {
     const err = new Error(message);
     err.status = response.status;
     err.code = data && data.code;
+    // Phase 43 hotfix 2: attach the full response data so callers
+    // can read structured fields (e.g. suggestedSuffix for the
+    // ShipStation 404 retry flow). Backwards compatible — older
+    // call sites that only check .status / .code / .message keep
+    // working.
+    err.data = data;
     throw err;
   }
 

@@ -1,0 +1,126 @@
+Phase 29 — OrderDetailPage card consolidation
+
+═══════════════════════════════════════════════════════
+WHAT THIS DOES
+═══════════════════════════════════════════════════════
+
+Three visual cleanups to the order detail page so it doesn't take
+up so much vertical space at the top:
+
+1. MERGE Process + Production Status — what used to be two stacked
+   full-width cards is now a single two-column card. Process button
+   on the left; "Production Status" with Mark Shipped / Mark Back
+   to Printing on the right; vertical divider between them. On
+   narrow screens (<280px each side) the columns wrap to stacked.
+
+2. DROP "(id 0)" suffix from the Production Status display.
+   Currently the status reads "Open (id 0)" — Phase 29 shows just
+   "Open". The status name alone is what operators care about.
+
+3. COLLAPSE the Shipping card by default. The full card with
+   carrier/service/dims form was the largest single thing on the
+   page even when the operator wasn't interacting with it. Now it
+   defaults to a one-line summary header. Click to expand for the
+   full controls. When the order is Shipped, the collapsed header
+   shows the tracking number inline so you can see it at a glance.
+
+═══════════════════════════════════════════════════════
+COLLAPSED SHIPPING HEADER — STATES
+═══════════════════════════════════════════════════════
+
+Adapts to the four possible ShipStation states:
+
+  SHIPPED:
+    Shipping · ✓ Shipped · USPS 9400123456789012345678
+
+  LINKED (sent, not yet shipped):
+    Shipping · Sent to ShipStation · stamps_com/usps_first_class_mail
+
+  ELIGIBLE (not yet sent, will use suggested packaging if present):
+    Shipping · Eligible · 9x11 Flat Mailer · 4oz · stamps_com
+
+  NOT ELIGIBLE:
+    Shipping · Not eligible · all digital products
+
+Click anywhere on the collapsed header OR the chevron (▾) to expand.
+Click the chevron (▴) in the expanded card header to re-collapse.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/pages/OrderDetailPage.js
+    - New <ProcessAndShipStatusRow> component wrapping both inner
+      blocks in a single shared card with a 2-column flex layout
+    - ProcessOrderBlock gains `bare` prop (renders without outer
+      card wrapper when true)
+    - ShipStatusBlock gains `bare` prop AND drops the "(id N)"
+      suffix from the status display
+    - ShippingBlock gains an `expanded` state (default false) and
+      a CollapsedShippingHeader render-path that short-circuits
+      the eligibility / linked / shipped panels
+    - LinkedShippingPanel gains an optional `onCollapse` prop and
+      a minimize chevron (▴) in its header
+    - New collapseBtnStyle shared by both expanded and collapsed
+      headers
+    - The main render area replaces the two-block invocation with
+      a single <ProcessAndShipStatusRow>
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-29.tar.gz --strip-components=1
+
+You should see 1 file line:
+  x client/src/pages/OrderDetailPage.js
+
+Webpack picks it up. Hard refresh the browser.
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+Open any order in the dashboard. Look for:
+
+  1. The top of the page should show ONE combined card containing
+     both "Process this order" (left) and "Production Status"
+     (right) side-by-side.
+
+  2. The Production Status line should read e.g. "Open" — no
+     "(id 0)" suffix.
+
+  3. The Shipping card below should be a single-line summary by
+     default, e.g. "Shipping · Eligible · 9x11 Flat Mailer · 4oz".
+     Click anywhere on the line to expand. Then click the ▴
+     chevron at the top-right of the expanded card to collapse.
+
+  4. For an order that's been shipped: the collapsed Shipping line
+     should include "USPS 9400..." (the tracking number) inline.
+
+  5. Resize the browser narrow — the Process + Production Status
+     row should wrap to stacked (each column gets the full width).
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD client/src/pages/OrderDetailPage.js
+
+Hard refresh.
+
+═══════════════════════════════════════════════════════
+NOTES
+═══════════════════════════════════════════════════════
+
+  The collapsed state isn't persisted — it resets to collapsed on
+  every navigation between orders. That's intentional: most of the
+  time operators are just glancing at the status, not editing
+  carrier/service. The expand action is cheap, so the default
+  collapsed state matches the common case.
+
+  If you'd prefer the Shipping card to auto-expand when the order
+  is Shipped (so tracking is always fully visible), I can flip
+  that easily — let me know.

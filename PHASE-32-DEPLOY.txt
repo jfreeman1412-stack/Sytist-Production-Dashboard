@@ -1,0 +1,208 @@
+Phase 32 — Wire ShipStation auto-detect through orderStatusService
+          (closes the loop: SS label purchased → Sytist status flipped
+          to Shipped automatically)
+
+═══════════════════════════════════════════════════════
+THE BUG THIS FIXES
+═══════════════════════════════════════════════════════
+
+Before Phase 32, when ShipStation reported an order as shipped:
+
+  1. The scheduler polled SS every 5min
+  2. Found newly-shipped orders, extracted tracking number
+  3. Updated the LOCAL shipstation_links row to reflect "shipped"
+  4. Logged "[Scheduler] Order N marked shipped: ..."
+
+But it stopped there. It NEVER:
+  - Wrote ms_orders.order_open_status = 39 (Shipped) in Sytist
+  - Wrote ms_orders.order_shipped_date / track / by / cost
+  - Audited the transition
+
+So the dashboard's "[Scheduler] marked shipped" log message was
+misleading — it only meant the local link table got updated, not
+Sytist itself. Operators looking at Sytist would still see the
+order in Printing or whatever status it was in before.
+
+After Phase 32, the scheduler ALSO calls
+orderStatusService.shipOrder() for each detected shipment, which
+goes through the same code path as a manual Mark Shipped click:
+
+  - ms_orders.order_open_status → 39 (or whatever shippedStatusId
+    is configured to)
+  - ms_orders.order_shipped_date → today
+  - ms_orders.order_shipped_track → tracking from SS link
+  - ms_orders.order_shipped_by → mapped carrier (USPS, UPS, FEDEX, ...)
+  - ms_orders.order_shipped_by_id → 0
+  - ms_orders.order_ship_cost → fetched live from ShipStation API
+  - order_status_audit row created with source='shipstation_auto'
+
+═══════════════════════════════════════════════════════
+KEY BEHAVIOR DECISIONS
+═══════════════════════════════════════════════════════
+
+FORCE=TRUE:
+  The scheduler's call to shipOrder() uses force=true, bypassing
+  the eligibility check (which normally requires order to be in
+  Printing/40). Rationale: if ShipStation says it shipped, the
+  shipping happened. Whatever Sytist's status currently says is
+  the lagging value that needs to catch up. So we always sync.
+
+ROLLBACK ON FAILURE:
+  Order of operations:
+    1. Update local link to 'shipped' (with tracking, carrier, etc.)
+    2. Call shipOrder() to push Sytist
+    3. If shipOrder fails → roll back the local link to its
+       previous state so the NEXT poll cycle retries
+
+  Without rollback, a one-time Sytist write failure (network blip,
+  pool exhausted, etc.) would leave the local link as 'shipped'
+  forever and the scheduler would never try again. Rollback keeps
+  retrying until the sync succeeds.
+
+  Both the link update and the rollback are local SQLite writes,
+  so this is fast and reliable.
+
+ORDER OF OPERATIONS:
+  Link first, Sytist second. This is intentional because
+  orderStatusService.shipOrder() looks up the local SS link to
+  build the shipping fields (specifically tracking_number and
+  carrier_code). The link has to reflect the just-detected
+  shipment BEFORE shipOrder reads it.
+
+GRACEFUL FALLBACK:
+  If orderStatusService.js doesn't load (older install, partial
+  deploy, etc.) the scheduler degrades gracefully to its old
+  link-only behavior and logs a warning. So Phase 32 won't break
+  an install that's missing Phase 30's service.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/services/schedulerService.js
+    - summary object gains sytistSynced + sytistFailed counters
+    - Added orderStatusService require with try/catch (graceful
+      fallback if module is unavailable)
+    - In the per-link "found shipped" loop, after updating the
+      local link, call orderStatusService.shipOrder() with
+      force=true and source='shipstation_auto'
+    - On Sytist write failure: roll back the local link to its
+      pre-update state so next poll retries
+    - Enriched poll-complete log line includes Sytist sync counts
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-32.tar.gz --strip-components=1
+
+One file:
+  x server/services/schedulerService.js
+
+nodemon picks it up. No client changes.
+
+The scheduler runs an immediate poll on every restart, so within
+seconds of the deploy you should see new log output reflecting
+the Phase 32 behavior.
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+  1. Wait for the next scheduler poll (or restart the server to
+     trigger an immediate poll).
+
+  2. If any orders have shipped in ShipStation since the last
+     successful sync, you should see new log lines like:
+
+       [Scheduler] Order 110682 marked shipped: stamps_com 9400123456789012345
+       [SytistDB] updateOrderStatus (with shipping): order 110682:
+         40 (Printing) → 39 (Shipped), tracking=9400..., carrier=USPS, cost=4.50
+       [Scheduler] Order 110682 synced to Sytist: status 40 → 39
+         (tracking=9400..., carrier=USPS, cost=4.5)
+       [Scheduler] Poll complete: 1 order(s) marked shipped, 1 synced to Sytist
+
+  3. Confirm in Sytist:
+       SELECT order_id, order_open_status, order_shipped_date,
+              order_shipped_track, order_shipped_by, order_ship_cost
+       FROM ms_orders WHERE order_id = 110682;
+
+     Should show:
+       order_open_status = 39
+       order_shipped_date = today
+       order_shipped_track = (tracking number)
+       order_shipped_by = USPS (or whatever carrier)
+       order_ship_cost = (shipment cost from SS API, or 0 if unavailable)
+
+  4. Confirm audit log:
+       sqlite3 server/config/sytist-dashboard.db
+       SELECT id, ts, order_id, from_status, to_status, source,
+              shipping_fields_json
+       FROM order_status_audit
+       WHERE order_id = 110682 ORDER BY ts DESC LIMIT 1;
+     The row should have source='shipstation_auto'.
+
+═══════════════════════════════════════════════════════
+WHAT YOU GET NOW (END-TO-END FLOW)
+═══════════════════════════════════════════════════════
+
+With Phases 28+30+31+32 all deployed, the full lifecycle is:
+
+  1. Operator clicks "Process this order" on the detail page
+     → processingService runs imposition, packing slip, .txt
+     → IF autoStatusUpdate: ms_orders.order_open_status = 40
+        (set in Processing settings — you turned this on)
+     → IF the SS order didn't exist: creates it with packaging
+     → IF the SS order already existed: Phase 31 pushes packaging
+        to the existing SS order (no longer leaves it with
+        blank weight/carrier)
+
+  2. Operator (or ShipStation's batch tools) purchases a label
+     on the SS side
+     → SS marks the order as 'shipped' internally with tracking
+
+  3. Scheduler polls SS every 5min
+     → Detects 110682 is now 'shipped' in SS
+     → Updates local shipstation_links row with tracking + carrier
+     → [Phase 32] Calls orderStatusService.shipOrder(force=true)
+        → ms_orders.order_open_status = 39
+        → ms_orders.order_shipped_date = today
+        → ms_orders.order_shipped_track = tracking
+        → ms_orders.order_shipped_by = USPS
+        → ms_orders.order_shipped_by_id = 0
+        → ms_orders.order_ship_cost = (fetched from SS API)
+        → order_status_audit row, source='shipstation_auto'
+
+For ship_to_managers / ship_to_league orders (no SS label flow),
+the operator clicks "Mark Shipped" on the detail page or via the
+bulk action in the orders list. Same Phase 30 write happens with
+source='manual' or 'bulk'.
+
+═══════════════════════════════════════════════════════
+KNOWN LIMITS
+═══════════════════════════════════════════════════════
+
+  - 7-day window in the SS query. Orders shipped more than 7 days
+    ago that the scheduler never caught (e.g. server was offline
+    for a week) won't be picked up. Workaround: manually Mark
+    Shipped via the detail page.
+
+  - Polls every 5min by default (SHIPSTATION_POLL_MS env). After
+    a label purchase you'll see Sytist update within 5 minutes,
+    not instantly. To trigger an immediate poll, restart the
+    server or wait.
+
+  - Cost fetch makes one extra API call per detected ship. With
+    a busy ShipStation account this adds load — but only when
+    the scheduler actually detects new shipments.
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD server/services/schedulerService.js
+
+Restart the server. Scheduler reverts to link-only updates (the
+old behavior where Sytist stayed out of sync with SS).

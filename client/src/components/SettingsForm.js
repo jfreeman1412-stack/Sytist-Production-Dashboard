@@ -32,7 +32,8 @@ export function PageHeader({ title, subtitle, actions }) {
         {subtitle && (
           <div
             style={{
-              fontSize: 13,
+              // Phase 26: 13 → 15.
+              fontSize: 15,
               color: 'var(--text-muted)',
               marginTop: 4,
             }}
@@ -70,7 +71,8 @@ export function Section({ title, description, children, actions }) {
             <h2
               style={{
                 margin: 0,
-                fontSize: 14,
+                // Phase 26: 14 → 16.
+                fontSize: 16,
                 fontWeight: 600,
                 textTransform: 'uppercase',
                 letterSpacing: 0.5,
@@ -86,7 +88,8 @@ export function Section({ title, description, children, actions }) {
       {description && (
         <div
           style={{
-            fontSize: 12,
+            // Phase 26: 12 → 14.
+            fontSize: 14,
             color: 'var(--text-muted)',
             marginBottom: 16,
           }}
@@ -107,7 +110,8 @@ export function FormRow({ label, hint, children, htmlFor }) {
           htmlFor={htmlFor}
           style={{
             display: 'block',
-            fontSize: 12,
+            // Phase 24 bumped 12 → 13. Phase 26 bumped 13 → 15.
+            fontSize: 15,
             fontWeight: 600,
             color: 'var(--text-secondary)',
             marginBottom: 6,
@@ -120,7 +124,8 @@ export function FormRow({ label, hint, children, htmlFor }) {
       {hint && (
         <div
           style={{
-            fontSize: 11,
+            // Phase 24: 11 → 12. Phase 26: 12 → 14.
+            fontSize: 14,
             color: 'var(--text-muted)',
             marginTop: 4,
           }}
@@ -139,7 +144,8 @@ const baseInputStyle = {
   border: '1px solid var(--border-color)',
   borderRadius: 6,
   color: 'var(--text-primary)',
-  fontSize: 13,
+  // Phase 24: 13 → 14. Phase 26: 14 → 16.
+  fontSize: 16,
   fontFamily: 'inherit',
   boxSizing: 'border-box',
 };
@@ -252,7 +258,8 @@ export function Button({
       style={{
         padding: '7px 14px',
         borderRadius: 6,
-        fontSize: 12,
+        // Phase 24: 12 → 13. Phase 26: 13 → 15.
+        fontSize: 15,
         fontWeight: 500,
         cursor: disabled ? 'not-allowed' : 'pointer',
         opacity: disabled ? 0.6 : 1,
@@ -303,7 +310,8 @@ export function StatusBanner({ kind = 'info', message, onDismiss }) {
         border: `1px solid ${p.border}`,
         borderRadius: 6,
         color: p.color,
-        fontSize: 13,
+        // Phase 26: 13 → 15.
+        fontSize: 15,
         marginBottom: 16,
         display: 'flex',
         justifyContent: 'space-between',
@@ -386,12 +394,14 @@ export const settingsStyles = {
   table: {
     width: '100%',
     borderCollapse: 'collapse',
-    fontSize: 12,
+    // Phase 24: 12 → 13. Phase 26: 13 → 15.
+    fontSize: 15,
   },
   th: {
     textAlign: 'left',
     padding: '8px 12px',
-    fontSize: 11,
+    // Phase 26: 11 → 13.
+    fontSize: 13,
     fontWeight: 600,
     color: 'var(--text-muted)',
     textTransform: 'uppercase',

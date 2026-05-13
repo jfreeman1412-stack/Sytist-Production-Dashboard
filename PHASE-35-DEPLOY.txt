@@ -1,0 +1,257 @@
+Phase 35 — Reprint workflow
+            1. Auto-detect reprint state (status 39 or 40)
+            2. Whole-order reprint with _REPRINT_N filename suffix
+            3. Per-item reprint button on each line item card
+            4. Reprints skip Sytist status update + ShipStation step
+            5. Audit log entry with source='reprint'
+
+═══════════════════════════════════════════════════════
+WHAT THIS DOES
+═══════════════════════════════════════════════════════
+
+When an order has already been processed (Sytist status 40 =
+Printing, or 39 = Shipped), the dashboard now treats a click of
+the Process button as a REPRINT instead of a fresh print:
+
+  - Output filenames get a _REPRINT[_N] suffix
+       110685.txt                      ← original
+       110685_REPRINT.txt              ← 1st reprint
+       110685_REPRINT_2.txt            ← 2nd reprint
+       110685_REPRINT_3.txt            ← 3rd reprint
+
+  - Sytist status is NOT changed (stays at 39 or 40)
+
+  - ShipStation is NOT touched (no auto-create, no update)
+
+  - An audit row is written with source='reprint' so the history
+    of every reprint event is preserved
+
+The Process button itself adapts: when the order is in reprint
+state, it changes color (orange) and label ("Reprint this
+order"), and a confirm dialog appears before clicking (since
+reprints are less-routine and the operator should explicitly
+opt in each time).
+
+═══════════════════════════════════════════════════════
+PER-ITEM REPRINT
+═══════════════════════════════════════════════════════
+
+Each line item card gets a "Reprint this item" button (orange)
+in the same row as "Render preview". The button is ONLY visible
+when the order is in reprint state (status 39 or 40) — for
+fresh orders it stays hidden so it doesn't tempt operators into
+unnecessary fragmentation.
+
+Clicking it:
+  1. Asks for confirmation
+  2. Calls POST /api/sytist/process/order/:orderId/reprint-item/:cartId
+  3. Runs processOrder with reprint:true + lineItemFilter:[cartId]
+  4. Produces ONLY:
+       - One imposed sheet for this cartId
+       - One .txt referencing only this line item
+     No packing slip (you decided single-item reprints don't
+     need one — the operator already knows what they're
+     reprinting).
+  5. Returns success with paths to the new files, displayed in
+     a small orange banner under the line item card.
+
+Filenames include both the reprint suffix AND the cartId so
+multiple per-item reprints don't collide:
+  110685_481629_REPRINT_JV_Baseball-0016.png
+  110685_481629_REPRINT_2_JV_Baseball-0016.png
+
+═══════════════════════════════════════════════════════
+REPRINT STATE DETECTION
+═══════════════════════════════════════════════════════
+
+Detection is based on Sytist order_open_status:
+  - 0 (Open/Queue)   → fresh: "Process this order" (blue button)
+  - 40 (Printing)    → reprint: "Reprint this order" (orange)
+  - 39 (Shipped)     → reprint: "Reprint this order" (orange)
+
+The dashboard reads order.productionStatus.id from its canonical
+order shape. No new fields, no new tables.
+
+For multiple reprints, the server's _nextReprintNumber() helper
+scans the output dir for existing _REPRINT files for that
+orderNumber and picks the next available N. So you can reprint
+the same order 5 times and end up with _REPRINT, _REPRINT_2,
+_REPRINT_3, _REPRINT_4, _REPRINT_5 — each gets its own clean set
+of files.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED (4 files):
+
+  server/services/processingService.js
+    - processOrder() accepts { reprint, lineItemFilter, reason, userId }
+    - New _nextReprintNumber(order) helper
+    - _buildPhotoFilename(order, li, reprintSuffix='')
+    - _buildCompositeFilename(order, li, layout, reprintSuffix='')
+    - _processSubOrder() threads reprintSuffix to:
+        - photo filenames
+        - composite filenames
+        - packing slip filename (via filenameSuffix option)
+        - regular .txt filename (combined with teamSuffix)
+        - specialty .txt filename
+    - Reprint skips Sytist status update
+    - Reprint skips ShipStation auto-create entirely
+    - Single-item reprint (lineItemFilter present) skips packing slip
+    - Direct DB insert audit row with source='reprint',
+      notes='REPRINT_N <items=... | full order> reason="..."'
+
+  server/services/packingSlipService.js
+    - No new changes in Phase 35 (uses existing filenameSuffix
+      option from earlier work). Kept in tarball for parity.
+
+  server/routes/sytist.js
+    - POST /process/order/:orderId — accepts { reprint, reason }
+      in body, passes through to processingService
+    - NEW: POST /process/order/:orderId/reprint-item/:cartId
+        - Validates the cartId exists in the order
+        - Calls processOrder with reprint:true + lineItemFilter
+        - Returns the full processing result
+
+  client/src/pages/OrderDetailPage.js
+    - ProcessOrderBlock:
+        - Detects reprint state via order.productionStatus.id
+        - Button label switches to "Reprint this order"
+        - Button color switches to #d97706 (orange)
+        - Confirm dialog only shows for reprint, not for fresh
+        - Subtitle text adapts to reprint state
+        - POST body includes { reprint: true } in reprint mode
+    - ImpositionItemRow:
+        - New state: reprinting, reprintResult
+        - New handler: handleReprintItem
+        - New button "Reprint this item" (only when isReprintMode)
+        - Result banner shows .txt + sheet paths on success
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-35.tar.gz --strip-components=1
+
+You should see 4 file lines:
+  x server/services/processingService.js
+  x server/services/packingSlipService.js
+  x server/routes/sytist.js
+  x client/src/pages/OrderDetailPage.js
+
+nodemon picks up server files. Hard refresh (Ctrl+Shift+R)
+for the client.
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+  1. Open a fresh order (status 0/Queue)
+     The Process button should be blue, label "Process this order".
+     No reprint UI visible. Click works as before.
+
+  2. Open an order that's already in Printing (status 40) or
+     Shipped (status 39)
+     - The Process button should be ORANGE, label "Reprint this
+       order"
+     - Subtitle changes to note "Order is Printing/Shipped..."
+     - Click it → confirm dialog appears with reprint context
+     - Each line item card should now show an orange "Reprint
+       this item" button next to "Render preview"
+
+  3. Click the whole-order "Reprint this order"
+     Confirm. Watch the server log:
+       [Processing] Order 110685: REPRINT mode (suffix=_REPRINT)
+       [Processing] Order 110685: 1 sub-order(s) ... [REPRINT]
+       ... (download, compose, imposition logs)
+       (NO [SS] logs — reprint skips ShipStation)
+       (NO 'status → 40' logs — reprint skips Sytist update)
+
+     Check output dir:
+       Z:\Photo Day\__Open Orders\Sytist_Orders\
+         110685.txt                      ← original (untouched)
+         110685_REPRINT.txt              ← reprint .txt
+         110685_packing_slip.jpg         ← original slip
+         110685_REPRINT_packing_slip.jpg ← reprint slip
+         110685_481629_..._JV_Baseball-0016.png        ← original
+         110685_481629_REPRINT_..._JV_Baseball-0016.png ← reprint
+
+     Click "Reprint this order" again → produces _REPRINT_2 set.
+
+  4. Click "Reprint this item" on a single line item
+     Confirm. Watch the server log:
+       [Processing] Order 110685: REPRINT mode (suffix=_REPRINT_3)
+         filter=cartIds:481629
+       [Processing] Order 110685: skipping slip for single-item reprint
+
+     Check output dir:
+       110685_481629_REPRINT_3_..._JV_Baseball-0016.png
+       110685_REPRINT_3.txt   (contains only the one line)
+     No slip generated.
+
+     A small orange banner appears under the line item card with
+     the paths.
+
+  5. Verify audit log
+       cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard\server
+       node -e "const db = require('better-sqlite3')('config/sytist-dashboard.db'); console.log(JSON.stringify(db.prepare('SELECT * FROM order_status_audit WHERE source=?  ORDER BY ts DESC LIMIT 5').all('reprint'), null, 2));"
+
+     You should see rows with source='reprint', notes that
+     describe the reprint number and either "(full order)" or
+     "items=NNN".
+
+  6. Sytist not touched
+     Run against Sytist:
+       SELECT order_id, order_open_status, order_shipped_date,
+              order_shipped_track FROM ms_orders WHERE order_id = 110685;
+     These should be EXACTLY what they were before the reprint.
+
+═══════════════════════════════════════════════════════
+KNOWN LIMITATIONS / FUTURE WORK
+═══════════════════════════════════════════════════════
+
+  - The _nextReprintNumber() helper looks at the regular download
+    dir only. If a previous reprint went to a different folder
+    (different folder-sort config, different mode, etc.), it
+    won't see those files and may pick a colliding number. In
+    practice this is rare because the folder-sort + mode are
+    typically stable for the same gallery.
+
+  - For ship_to_managers / ship_to_league orders that get split
+    into per-team sub-orders, each sub-order writes its own
+    _REPRINT files. The numbering is per-team-folder, not global,
+    so a multi-team reprint produces _REPRINT in each team's
+    folder (which is what you want).
+
+  - The per-item reprint button is only shown when status is 39
+    or 40. If you ever want to print just one item out of a
+    fresh order, you'd currently need to Process the whole order,
+    then come back and use the per-item button. We can flip that
+    decision in a future phase if it becomes annoying.
+
+  - Audit rows for reprints use to_status=0 + from_status=null
+    since reprints don't change the status. The 'notes' column
+    is where the meaningful data lives ('REPRINT_N items=...
+    reason="..."'). Filter for source='reprint' to find them.
+
+  - No "reason" field is currently exposed in the UI. If you
+    want to track WHY each reprint happened (damaged in shipping,
+    wrong photo selected, etc.), let me know and I'll add a
+    reason input to both reprint confirm dialogs. The server-side
+    plumbing is already in place — just need to wire up the UI.
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD server/services/processingService.js \
+                     server/services/packingSlipService.js \
+                     server/routes/sytist.js \
+                     client/src/pages/OrderDetailPage.js
+
+Restart server + browser hard refresh.
+
+Reprint outputs already on disk are harmless leftovers. Delete
+them manually if cleanup matters.

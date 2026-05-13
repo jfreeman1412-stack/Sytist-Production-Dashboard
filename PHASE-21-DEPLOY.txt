@@ -1,0 +1,91 @@
+Phase 21 — Bleed support in composite layout designer
+
+═══════════════════════════════════════════════════════
+WHAT THIS DOES
+═══════════════════════════════════════════════════════
+
+Removes the constraint that slots in the composite layout designer
+must fit entirely within the canvas. Slots can now extend past the
+canvas edge ("bleed") in any direction.
+
+  - Position: x or y can be negative, or x+w / y+h can exceed canvas
+  - Size: a slot can be larger than the canvas
+  - Minimum size still 0.1" so slots can't disappear
+  - Generous outer bound (10× canvas size) prevents fat-finger drags
+    from sending a slot off into infinity
+
+Output behavior: anything outside the canvas does NOT render in the
+final composited image. Sharp's compositing naturally clips to the
+output canvas size. The renderer (server/services/compositeService.js)
+was already correct — no changes needed there.
+
+Visual feedback in the designer:
+  - The SVG now has overflow="visible" so slots extending past
+    the canvas render visibly outside the trim area
+  - A dashed orange line marks the canvas (trim) boundary so you
+    can see at a glance which part of a bleed slot will print
+  - The white canvas fill stays where it was; nothing changes
+    visually for slots that stay inside the canvas
+
+Both the main layout designer (LayoutDesignerPage) and the per-order
+override editor (OverrideEditorPage) use this component, so both
+get bleed support from this single file change.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/components/LayoutCanvas.js
+
+NOT MODIFIED (verified — no changes needed):
+  server/services/compositeService.js
+    Compositing already clips to the output canvas size via
+    sharp. No bounds-clamping in the render path.
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-21.tar.gz --strip-components=1
+
+You should see one file line:
+  x client/src/components/LayoutCanvas.js
+
+Webpack picks up client changes automatically. Hard refresh the
+designer page (Ctrl+Shift+R).
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+1. Open Settings → Composite Layouts → click into a layout's
+   designer.
+
+2. Select an existing slot. Try dragging it past the right edge
+   of the canvas — it should now move past the trim line instead
+   of bouncing back.
+
+3. Drag a corner handle outward to make the slot larger than the
+   canvas. It should grow past the canvas edge.
+
+4. Notice the dashed orange line — that's the trim boundary. Any
+   part of a slot outside the orange line won't print.
+
+5. Save the layout, then render a preview or process an order
+   using this layout. The final composited image should show
+   ONLY the part of the slot inside the canvas — bleed area
+   gets cropped.
+
+6. (Optional) Open a per-order override (Phase 11) for an order
+   using this layout. Bleed should work there too since it uses
+   the same LayoutCanvas component.
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD client/src/components/LayoutCanvas.js
+
+Hard refresh the designer.

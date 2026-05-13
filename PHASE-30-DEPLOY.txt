@@ -1,0 +1,208 @@
+Phase 30 — Write shipping metadata to ms_orders (date, tracking,
+          carrier, cost) when shipping/unshipping
+
+═══════════════════════════════════════════════════════
+WHAT THIS DOES
+═══════════════════════════════════════════════════════
+
+Until now the Mark Shipped action only wrote `order_open_status`
+to ms_orders. This phase expands the write to include the four
+shipping columns Sytist uses:
+
+  order_shipped_date    DATE         — today (YYYY-MM-DD)
+  order_shipped_track   varchar(255) — tracking number
+  order_shipped_by      varchar(50)  — carrier (USPS, UPS, FEDEX, etc.)
+  order_shipped_by_id   int          — always 0 (Sytist user namespace
+                                        differs from dashboard's)
+  order_ship_cost       decimal(10,2)— shipping cost
+
+The dashboard's "Sytist write allow-list" is now expanded from the
+single `order_open_status` column to also include these five
+shipping columns. All other Sytist tables remain read-only.
+
+═══════════════════════════════════════════════════════
+HOW VALUES ARE DERIVED
+═══════════════════════════════════════════════════════
+
+When an order is marked shipped:
+
+  shippedDate    → today (YYYY-MM-DD UTC)
+  trackingNumber → from shipstation_links.tracking_number if a
+                    SS link exists for this order, else ''
+  carrier        → shipstation_links.carrier_code mapped through
+                    CARRIER_CODE_MAP (e.g. 'stamps_com' → 'USPS',
+                    'fedex' → 'FEDEX', 'ups' → 'UPS', 'dhl_*' → 'DHL'),
+                    else ''
+  shippedById    → 0 (always — dashboard user IDs aren't in
+                    Sytist's namespace, and the dashboard maintains
+                    its own audit log)
+  shipCost       → fetched live from ShipStation API at ship time:
+                    GET /orders/{ss_order_id} → response.shipmentCost.
+                    The fetch is wrapped in try/catch with the
+                    shipstationService client's timeout. If it
+                    fails (no API key, slow response, no link, etc.)
+                    we just write 0.00 and log a warning — the ship
+                    operation still succeeds.
+
+For ship_to_managers / ship_to_league orders (no ShipStation link),
+all shipping fields except shippedDate get their zero-defaults
+('' for strings, 0 for numbers).
+
+When an order is reversed (Mark Back to Printing / unship), ALL
+five shipping fields reset to zero-defaults too:
+
+  shippedDate    → '0000-00-00'
+  trackingNumber → ''
+  carrier        → ''
+  shippedById    → 0
+  shipCost       → 0
+
+This is the clean-slate behavior — no stale ship info hangs around
+on a re-printed order.
+
+═══════════════════════════════════════════════════════
+CARRIER CODE MAP
+═══════════════════════════════════════════════════════
+
+ShipStation carrier_code values get translated to the
+human-readable carrier name Sytist's order_shipped_by expects.
+Current mappings (case-insensitive):
+
+  stamps_com / usps / endicia        → USPS
+  ups / ups_walleted                 → UPS
+  fedex / fedex_walleted             → FEDEX
+  dhl_express / dhl_express_worldwide
+    / dhl_global_mail / dhl_ecommerce → DHL
+  ontrac                             → OnTrac
+  apc                                → APC
+  globegistics                       → Globegistics
+  asendia                            → Asendia
+
+Anything else falls through to the uppercased carrier code (e.g.
+an unmapped 'usps_priority' would be written as 'USPS_PRIORITY').
+If new carriers show up in your install, add them to the
+CARRIER_CODE_MAP at the top of orderStatusService.js.
+
+═══════════════════════════════════════════════════════
+AUDIT LOG
+═══════════════════════════════════════════════════════
+
+The order_status_audit table gains a new column:
+
+  shipping_fields_json TEXT
+
+This stores the JSON snapshot of the {shippedDate, trackingNumber,
+carrier, shippedById, shipCost} payload that was written to Sytist.
+Useful for "wait, what did we tell Sytist for this order" forensics.
+
+The migration runs automatically on first ship action after the
+deploy. ALTER TABLE ADD COLUMN is wrapped in try/catch on
+"duplicate column" so it's idempotent across restarts.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/services/sytistDbService.js
+    - updateOrderStatus(orderId, statusId) gains an optional 3rd
+      arg `shippingFields`. When provided, builds an UPDATE that
+      writes all 6 columns in one round-trip (status + 5 shipping).
+      When null/undefined (existing PUT /orders/:id/status caller),
+      the original single-column UPDATE runs unchanged.
+
+  server/services/orderStatusService.js
+    - New CARRIER_CODE_MAP + mapCarrierCode() helper
+    - New buildShippingFieldsForShip(orderId) async helper that
+      looks up the SS link, fetches cost from ShipStation API
+    - New buildShippingFieldsForUnship() helper (zero-defaults)
+    - shipOrder() now derives and passes shipping fields
+    - unshipOrder() now resets shipping fields
+    - Audit table ALTER for shipping_fields_json column
+    - logAudit() persists the JSON snapshot
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-30.tar.gz --strip-components=1
+
+You should see 2 file lines:
+  x server/services/sytistDbService.js
+  x server/services/orderStatusService.js
+
+nodemon picks them up. No client changes — no browser refresh
+needed.
+
+The audit-table migration runs lazily on the first ship action
+after deploy.
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+  1. Pick a ship-to-home order in Printing that has a ShipStation
+     link with tracking. Click "Mark Shipped" on the detail page.
+
+  2. Look at the server console — you should see a line like:
+       [SytistDB] updateOrderStatus (with shipping): order 111182:
+       40 (Printing) → 39 (Shipped), tracking=9400123456789012345,
+       carrier=USPS, cost=4.50
+
+  3. Query Sytist directly to confirm:
+       SELECT order_id, order_open_status, order_shipped_date,
+              order_shipped_track, order_shipped_by, order_ship_cost
+       FROM ms_orders WHERE order_id = 111182;
+
+     Expected: status=39, date=today, tracking=9400…, by=USPS, cost=4.50
+
+  4. Pick a ship-to-managers order in Printing (no SS link). Mark
+     Shipped. Confirm in Sytist:
+       status=39, date=today, tracking='', by='', cost=0.00
+
+  5. On the now-shipped order, click "Mark Back to Printing". Confirm:
+       status=40, date=0000-00-00, tracking='', by='', cost=0.00
+
+  6. Check the audit log:
+       sqlite3 server/config/sytist-dashboard.db
+       SELECT id, ts, order_id, from_status, to_status, source,
+              shipping_fields_json
+       FROM order_status_audit ORDER BY ts DESC LIMIT 5;
+     Recent rows should have a JSON object in shipping_fields_json.
+
+═══════════════════════════════════════════════════════
+LIMITATIONS / KNOWN GAPS
+═══════════════════════════════════════════════════════
+
+  - Cost fetch requires the ShipStation API to be configured and
+    reachable. If it's not, cost falls back to 0 (the ship action
+    still succeeds — we don't block on cost).
+
+  - Bulk ship doesn't currently parallelize the cost-fetch API
+    calls — they run sequentially. For a batch of 20 orders, that
+    could add ~10s if each call takes 500ms. Acceptable for now;
+    can parallelize later if it becomes annoying. The batch result
+    UI shows progress via the per-order results array.
+
+  - Cost is only fetched once per ship action. If ShipStation later
+    changes the cost (insurance, label refund, etc.), our snapshot
+    is stale. To refresh, you'd unship and re-ship — or we add a
+    "Refresh shipping data" button in a future phase.
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD server/services/sytistDbService.js
+  git checkout HEAD server/services/orderStatusService.js
+
+The shipping_fields_json column on order_status_audit can stay —
+it's harmless. To remove:
+  sqlite3 server/config/sytist-dashboard.db
+  ALTER TABLE order_status_audit DROP COLUMN shipping_fields_json;
+  (SQLite 3.35+ supports DROP COLUMN; older versions require a
+  table-rebuild.)
+
+Restart the server. The PUT /orders/:id/status endpoint will go
+back to writing only order_open_status as before Phase 30.

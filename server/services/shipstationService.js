@@ -253,17 +253,42 @@ class ShipStationService {
                 resolve(body);
               }
             } else {
+              // Phase 43 hotfix 2: dump everything ShipStation gave us
+              // when the request fails. SS's V1 createOrder endpoint
+              // returns 404 with empty body for several distinct
+              // failure modes (malformed JSON, unrecognized field,
+              // tombstoned orderKey, etc.), and we need the response
+              // headers to tell them apart.
               console.error(
                 `[ShipStation] createOrder ${res.statusCode}: ${
                   body || '(empty body)'
                 }`
               );
-              console.error(`[ShipStation] Request body:`, jsonBody);
-              reject(
-                new Error(
-                  `ShipStation ${res.statusCode}: ${body || '(empty)'}`
-                )
+              console.error(
+                `[ShipStation] response headers:`,
+                JSON.stringify(res.headers, null, 2)
               );
+              console.error(
+                `[ShipStation] request body byte length:`,
+                Buffer.byteLength(jsonBody)
+              );
+              // Sample of payload for forensics. Truncate giant payloads.
+              const sample =
+                jsonBody.length > 3000
+                  ? jsonBody.slice(0, 3000) + '... (truncated)'
+                  : jsonBody;
+              console.error(`[ShipStation] Request body:`, sample);
+              // Build an Error that carries the status code, response
+              // headers, and body so route handlers can branch on
+              // specific failure modes.
+              const err = new Error(
+                `ShipStation ${res.statusCode}: ${body || '(empty)'}`
+              );
+              err.statusCode = res.statusCode;
+              err.responseBody = body || '';
+              err.responseHeaders = res.headers || {};
+              err.requestBody = jsonBody;
+              reject(err);
             }
           });
         }
@@ -500,6 +525,44 @@ class ShipStationService {
         ].filter(Boolean),
       };
 
+      // Phase 41: per-item thumbnail in ShipStation's UI. ShipStation's
+      // V1 API accepts `imageUrl` as a public URL string and fetches
+      // it server-side to render the line-item thumbnail in their
+      // order detail view. Useful for operators packing the box —
+      // they can visually confirm the customer's photo without
+      // cross-referencing against Sytist.
+      //
+      // Phase 42: prefer li.composedImageUrl if present. That's set
+      // by processingService's Step 1.4 when green-screen items are
+      // composed AND the configured composedThumbnailService backend
+      // returns a usable public URL (i.e. S3 is configured). For
+      // non-green-screen items it stays undefined, and we fall back
+      // to Sytist's photo URLs.
+      //
+      // Why composedImageUrl matters: green-screen items have a
+      // transparent PNG as their photo.thumbUrl (subject keyed out
+      // with no background). Sending that to ShipStation gives a
+      // misleading thumbnail. The composed thumbnail shows the
+      // subject AND the customer's chosen background, matching what
+      // will actually print.
+      //
+      // Omitted entirely (not sent as null) when no URL is available —
+      // ShipStation's API has been observed to 400 on null imageUrl
+      // in some accounts.
+      //
+      // Package constituents inherit their parent's photo via the
+      // expansion in sytistDbService._expandPackageLineItems, so this
+      // works for package orders without special-casing.
+      const imageUrl =
+        li.composedImageUrl ||
+        li.photo?.thumbUrl ||
+        li.photo?.largeUrl ||
+        li.photo?.fullUrl ||
+        null;
+      if (imageUrl) {
+        payload.imageUrl = imageUrl;
+      }
+
       // Per-unit weight in grams. Engine gives us LINE total (qty×unit)
       // so divide back out first. Use grams because SS truncates
       // fractional ounces per line when summing.
@@ -597,10 +660,27 @@ class ShipStationService {
       overrides.packageCode || packaging?.packageCode || defaultPackage;
 
     // ─── Final payload ──────────────────────────────────
+    // Phase 43: ensure orderDate is in ISO 8601 format. Sytist's
+    // MySQL returns DATETIME columns as strings in the form
+    // "YYYY-MM-DD HH:MM:SS" (space separator), which ShipStation's
+    // V1 API rejects with a confusing 404 / empty body. Convert
+    // any truthy value through Date so the output is always ISO.
+    let orderDateISO;
+    try {
+      orderDateISO = order.orderDate
+        ? new Date(order.orderDate).toISOString()
+        : new Date().toISOString();
+    } catch (dateErr) {
+      console.warn(
+        `[ShipStation] orderDate "${order.orderDate}" couldn't be parsed; using current time: ${dateErr.message}`
+      );
+      orderDateISO = new Date().toISOString();
+    }
+
     return {
       orderNumber: order.orderNumber || String(order.orderId),
       orderKey: String(order.orderId),
-      orderDate: order.orderDate || new Date().toISOString(),
+      orderDate: orderDateISO,
       orderStatus: 'awaiting_shipment',
       customerEmail,
       billTo: billToAddress,

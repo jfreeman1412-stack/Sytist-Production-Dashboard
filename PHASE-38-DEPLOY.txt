@@ -1,0 +1,121 @@
+Phase 38 — Packaging filter: skip unknown SKUs and missing SKUs
+
+═══════════════════════════════════════════════════════
+THE BUG
+═══════════════════════════════════════════════════════
+
+Order 110692 had 5 items: one 5x7 Team Photo (SKU 45) and
+three "3 digital images" rows (SKU 3D). After Sytist processing
+filters, 2 items reached the packaging engine.
+
+The packaging engine's physicalItems filter was permissive:
+
+  // Original — keeps unknown SKUs
+  items.filter((item) => {
+    const pw = config.productWeights[String(item.sku)];
+    return !pw || pw.category !== 'digital';
+  });
+
+  // For SKU '3D' (not in productWeights), !pw === true → KEPT
+
+So SKU 3D was treated as a physical item with the fallback
+weight of 1oz, contributing to a "Medium Box" packaging
+decision when it should have been completely ignored.
+
+═══════════════════════════════════════════════════════
+THE FIX
+═══════════════════════════════════════════════════════
+
+Tightened the filter to be conservative — only items we KNOW
+are physical influence packaging. Five filter cases now:
+
+  1. Missing/empty SKU                    → skip
+  2. flags.download = true                → skip
+  3. flags.isPackageHeader = true         → KEEP (routing only)
+  4. Known SKU with category 'digital'    → skip
+  5. Unknown SKU (not in productWeights)  → skip   ← THE CHANGE
+
+If an SKU isn't in Settings → Packaging, the packaging engine
+now ignores it. To make a new SKU influence packaging, add it
+to Settings → Packaging with appropriate weight + category.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED (1 file):
+
+  server/services/packagingService.js
+    + Tightened physicalItems filter at line ~360
+    + Added inline documentation of all five filter cases
+    + No other changes; rest of packaging math untouched
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-38.tar.gz \
+            --strip-components=1
+
+One file: server/services/packagingService.js
+nodemon picks it up.
+
+═══════════════════════════════════════════════════════
+VERIFY
+═══════════════════════════════════════════════════════
+
+Process an order that contains a digital-only SKU you haven't
+configured in Settings → Packaging (like order 110692 with
+SKU 3D). Watch the [Packaging Trace] log lines.
+
+BEFORE this fix, you'd see:
+  Items subtotal: ~3.4 oz (digital SKUs adding to the math)
+  Packaging (Medium Box): +5.5 oz
+  FINAL: ~7 oz → package=package
+
+AFTER this fix:
+  Items subtotal: 0.2 oz (only the 5x7 counted)
+  Packaging (9x11 Flat Mailer or similar): +3 oz
+  FINAL: ~4 oz → package=large_envelope_or_flat
+
+The SS payload's package type and weight will reflect just
+the physical contents.
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD server/services/packagingService.js
+
+Restart server.
+
+═══════════════════════════════════════════════════════
+ADMIN FOLLOWUP RECOMMENDED
+═══════════════════════════════════════════════════════
+
+For every SKU that legitimately appears in orders but isn't
+in Settings → Packaging:
+
+  - Digital products: add them with category='digital',
+    weight=0. They'll be tracked but not influence packaging.
+
+  - Physical products: add them with the correct category
+    + weight so they influence packaging properly.
+
+  - Unknown/legacy products: leave them out. The new filter
+    handles them correctly (skip).
+
+To find unmapped SKUs that have been ordered recently:
+
+  SELECT cart_product_sku, COUNT(*) AS cnt
+    FROM ms_cart
+    WHERE cart_order_id IN (
+      SELECT order_id FROM ms_orders
+      WHERE order_date >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+    )
+    GROUP BY cart_product_sku
+    ORDER BY cnt DESC;
+
+Cross-reference against productWeights in packaging-config.json
+to find gaps.

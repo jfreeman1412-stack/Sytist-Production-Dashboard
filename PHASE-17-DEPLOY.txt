@@ -1,23 +1,47 @@
-Phase 17 — Green-screen background compositing
+Phase 17 — Green-screen background compositing for non-composite SKUs
+
+═══════════════════════════════════════════════════════
+PROBLEM
+═══════════════════════════════════════════════════════
+
+The composite engine ALREADY handles green-screen backgrounds for
+SKUs mapped to a composite layout (Memory Mate, etc.) — it consumes
+backgroundPhoto via the playerBackground slot.
+
+But for SKUs NOT mapped to a composite layout (regular 8x10, 5x7,
+wallets, etc.), green-screen lines render with the transparent
+subject directly. The imposition preview and the production print
+both show the keyed-out subject with no background.
+
+Visible in the imposition preview screenshot: figure surrounded by
+the page background instead of the chosen photo backdrop.
 
 ═══════════════════════════════════════════════════════
 WHAT THIS PHASE DOES
 ═══════════════════════════════════════════════════════
 
-For green-screen line items on SKUs that DON'T use the composite
-engine (regular 8x10, 5x7, wallets, etc.), composites the chosen
-photo background under the keyed-out subject. Without this, the
-transparent PNG goes through imposition and prints with the page
-color showing through behind the figure.
+Adds a new green-screen compositing step that runs BEFORE imposition,
+ONLY for line items that:
+  - Are green-screen (flags.greenScreen === true)
+  - Have a chosen background (backgroundPhoto.fullUrl is set)
+  - Are NOT going through the composite engine (which already
+    handles its own background)
 
-Composite engine (Memory Mate, etc.) already handles its own
-backgrounds via the playerBackground slot — this phase doesn't
-touch those.
+For those lines:
+  1. Download the chosen background from S3
+  2. Resize it to fit the subject's dimensions using fit:'cover'
+     (preserves aspect ratio, fills canvas, crops overflow)
+  3. Composite the subject PNG on top
+  4. Write the result back to the on-disk file, replacing the
+     transparent PNG with the composited JPG
 
-Three places get the compositing:
-  1. Production pipeline (processingService Step 1.6)
-  2. Imposition preview endpoint (GET .../imposition/preview/...)
-  3. Imposition save endpoint (POST .../imposition/preview/.../save)
+Downstream — imposition, packing slip thumbnails, Darkroom .txt —
+naturally pick up the composited file because they all read from
+the same path.
+
+Also fixes the imposition PREVIEW endpoint to do the same compositing
+before rendering the preview image, so what you see in the browser
+matches what gets printed.
 
 ═══════════════════════════════════════════════════════
 WHAT'S IN THIS TARBALL
@@ -25,34 +49,167 @@ WHAT'S IN THIS TARBALL
 
 NEW:
   server/services/greenscreenService.js
-    Singleton with composeWithBackground() and shouldComposite().
-    Uses sharp, fit:'cover' for background sizing, JPEG quality 92.
+    Singleton with composeWithBackground(subjectBuffer, backgroundUrl)
+    and shouldComposite(lineItem). Uses sharp; jpeg quality 92;
+    fit:'cover' for the background sizing.
 
-MODIFIED:
+PATCHES TO APPLY (do these by hand, see SECTIONS A and B below):
   server/services/processingService.js
-    Inserted Step 1.6 between Step 1.5 (composite) and Step 2
-    (imposition). Iterates line items, calls greenscreenService for
-    any that pass shouldComposite() and aren't already handled by
-    the composite engine.
+    Add Step 1.6 between Step 1.5 (composite) and Step 2 (imposition).
 
   server/routes/sytist.js
-    Both imposition endpoints (preview GET + save POST) now check
-    shouldComposite() and if true, fetch the subject, composite the
-    background, and feed the composited buffer directly into
-    impositionService.buildSheetBuffer().
+    Update the imposition preview endpoint to composite the
+    background under the subject before passing to imposition.
 
 ═══════════════════════════════════════════════════════
-COMPOSITING RULES
+SECTION A — patch for server/services/processingService.js
 ═══════════════════════════════════════════════════════
 
-  - Background sized with sharp fit:'cover' — fills the entire
-    canvas of the subject, aspect ratio preserved, overflow cropped
-    on the long axis. No blank pixels.
-  - Subject layered on top at (0,0)
-  - Output JPEG at quality 92
-  - On any failure (background URL missing, fetch fails, resize
-    fails), falls back to subject-only and logs a warning. The
-    order doesn't crash.
+Find the line that starts Step 2:
+
+    // ─── Step 2: imposition in-place on every successfully-downloaded photo
+
+Add this NEW block IMMEDIATELY BEFORE it (so the new code is Step
+1.6, running after composite and before imposition):
+
+```javascript
+    // ─── Step 1.6 (Phase 17): green-screen background composite ──
+    //
+    // For line items that are green-screen (flags.greenScreen) AND
+    // have a chosen background (backgroundPhoto) AND are NOT being
+    // handled by the composite engine (skipImpositionCartIds), we
+    // need to flatten the transparent subject onto the background
+    // before imposition or the print shows up with the page color
+    // visible behind the figure.
+    //
+    // The composite engine already handles its own backgrounds via
+    // the playerBackground slot, so we skip those lines here to
+    // avoid double-compositing.
+    //
+    // We overwrite the downloaded file at downloaded.path so Step 2
+    // (imposition) and the slip thumb step pick up the composited
+    // image with no other changes.
+    const greenscreenService = require('./greenscreenService');
+    for (const li of sub.lineItems) {
+      const downloaded = photosByCartId[li.cartId];
+      if (!downloaded) continue;
+      if (skipImpositionCartIds.has(li.cartId)) continue;
+      if (!greenscreenService.shouldComposite(li)) continue;
+
+      try {
+        const subjectBuffer = await fsp.readFile(downloaded.path);
+        const { buffer: composedBuffer, warnings: gsWarnings } =
+          await greenscreenService.composeWithBackground(
+            subjectBuffer,
+            li.backgroundPhoto.fullUrl,
+            { outputFormat: 'jpeg', jpegQuality: 92 }
+          );
+        // Atomic .tmp + rename so partial writes never reach
+        // downstream readers.
+        const tmp = downloaded.path + '.gs.tmp';
+        await fsp.writeFile(tmp, composedBuffer);
+        await fsp.rename(tmp, downloaded.path);
+
+        for (const w of gsWarnings || []) {
+          subResult.warnings.push({
+            type: 'greenscreen_' + (w.type || 'warning'),
+            cartId: li.cartId,
+            message: w.message,
+          });
+        }
+      } catch (err) {
+        subResult.warnings.push({
+          type: 'greenscreen_compose_error',
+          cartId: li.cartId,
+          message: `Green-screen composite failed: ${err.message}`,
+        });
+      }
+    }
+```
+
+That's the only change to processingService.js.
+
+═══════════════════════════════════════════════════════
+SECTION B — patch for server/routes/sytist.js
+═══════════════════════════════════════════════════════
+
+Find the imposition preview endpoint, which starts with:
+
+    router.get('/imposition/preview/:orderId/:cartId', async (req, res) => {
+
+Inside it, find this block:
+
+```javascript
+    const ctx = impositionService.buildContext(order, lineItem);
+    const result = await impositionService.composeFromUrl(
+      lineItem.photo.fullUrl,
+      lineItem.sku,
+      ctx,
+      orientation
+    );
+```
+
+REPLACE that whole block with:
+
+```javascript
+    const ctx = impositionService.buildContext(order, lineItem);
+
+    // Phase 17: if this line is green-screen with a chosen
+    // background, composite the background under the subject before
+    // imposition. Otherwise feed the URL straight through as before.
+    const greenscreenService = require('../services/greenscreenService');
+    let result;
+    if (greenscreenService.shouldComposite(lineItem)) {
+      try {
+        // Fetch the keyed-out subject first
+        const subjectResp = await fetch(lineItem.photo.fullUrl);
+        if (!subjectResp.ok) {
+          throw new Error(`Failed to fetch subject: HTTP ${subjectResp.status}`);
+        }
+        const subjectBuffer = Buffer.from(await subjectResp.arrayBuffer());
+        const { buffer: composedBuffer } =
+          await greenscreenService.composeWithBackground(
+            subjectBuffer,
+            lineItem.backgroundPhoto.fullUrl,
+            { outputFormat: 'jpeg', jpegQuality: 92 }
+          );
+        result = await impositionService.buildSheetBuffer(
+          composedBuffer,
+          lineItem.sku,
+          ctx,
+          orientation
+        );
+      } catch (gsErr) {
+        // Fall back to subject-only on green-screen errors so the
+        // preview still renders something. Log the warning so the
+        // operator notices.
+        console.warn(
+          `[imposition/preview] greenscreen failed for ${req.params.orderId}/${req.params.cartId}: ${gsErr.message}`
+        );
+        result = await impositionService.composeFromUrl(
+          lineItem.photo.fullUrl,
+          lineItem.sku,
+          ctx,
+          orientation
+        );
+      }
+    } else {
+      result = await impositionService.composeFromUrl(
+        lineItem.photo.fullUrl,
+        lineItem.sku,
+        ctx,
+        orientation
+      );
+    }
+```
+
+Why we call `buildSheetBuffer` directly instead of `composeFromUrl`:
+composeFromUrl fetches a URL. We already have the composited image
+in memory as a Buffer, so we go one level lower and pass the Buffer
+straight to buildSheetBuffer (which is what composeFromUrl calls
+internally after the fetch).
+
+That's the only change to routes/sytist.js.
 
 ═══════════════════════════════════════════════════════
 DEPLOY
@@ -61,45 +218,91 @@ DEPLOY
   cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
   tar -xzf F:\Downloads\sytist-dashboard-phase-17.tar.gz --strip-components=1
 
-Nodemon picks up server changes automatically. Hard refresh the
-browser (Ctrl+Shift+R).
+That drops the new greenscreenService.js into place.
+
+Then apply Sections A and B above to your existing
+processingService.js and routes/sytist.js by hand. Each is a single
+insertion or replacement — a couple of minutes.
+
+After both files are edited, nodemon will auto-restart the server.
+Hard refresh in the browser.
 
 ═══════════════════════════════════════════════════════
 VERIFY
 ═══════════════════════════════════════════════════════
 
-1. Open an order with a green-screen line item (something other
-   than a Memory Mate — say a 5x7 or 8x10).
+1. Open an order with a green-screen line item (flags.greenScreen +
+   backgroundPhoto). Confirm Settings → Add-ons or wherever you
+   normally see the line.
 
-2. From the order detail, click Imposition Preview on that line.
+2. Click into the order. Open the imposition preview for one of the
+   regular SKUs (an 8x10 or 5x7 — NOT a Memory Mate).
    The preview should now render with the chosen background filling
    the canvas behind the subject.
 
-3. Optional: process the order. Inspect the .txt'd file on disk —
-   should be a composited JPG (still .png on the path is OK; the
-   bytes are JPG).
+3. Process that order. Verify:
+   - The downloaded file at downloadDir/<order>/<file>.png is now
+     a JPG with the composited background (the file is renamed
+     from .png to .png-on-disk but is JPG content; downstream
+     doesn't care because it reads bytes, not extension)
+   - The Darkroom .txt's Filepath= line points at that same path
+   - The packing slip thumbnail shows the photo with background
 
-4. Open a green-screen order with a Memory Mate (composite-mapped
-   SKU). The composite engine still owns this — verify it renders
-   correctly and isn't double-composited (subject placed twice).
+4. Open a green-screen order with a Memory Mate (SKU mapped to
+   composite). Confirm the Memory Mate still renders correctly
+   with its background — meaning the composite engine still
+   handles its own background and we didn't double-composite.
 
 ═══════════════════════════════════════════════════════
-SERVER LOGS TO LOOK FOR
+EDGE CASES HANDLED
 ═══════════════════════════════════════════════════════
 
-Success is silent.
+  - Background URL missing: warning logged, subject-only image
+    used. Order keeps processing.
 
-On a green-screen line where the background fetch fails:
-  [imposition/preview] greenscreen background_fetch_failed: ...
+  - Background fetch fails: warning logged, subject-only image
+    used. Order keeps processing.
 
-On unrecoverable error in the route, falls back to subject-only:
-  [imposition/preview] greenscreen failed for <orderId>/<cartId>: ...
+  - SKU has composite mapping (skipImpositionCartIds): skipped.
+    composite engine's playerBackground slot does the work.
+
+  - Background and subject have different aspect ratios: background
+    scales to cover the subject's dimensions, overflow cropped on
+    the long axis. No blank pixels, aspect preserved.
+
+  - Subject is already opaque (no actual transparency): composite
+    still works — alpha=1.0 everywhere means subject fully covers
+    background. Equivalent to original output.
 
 ═══════════════════════════════════════════════════════
 ROLLBACK
 ═══════════════════════════════════════════════════════
 
-1. git checkout HEAD server/services/processingService.js
-2. git checkout HEAD server/routes/sytist.js
-3. del server\services\greenscreenService.js
-4. Restart server
+If something goes sideways:
+
+1. Revert your edits to processingService.js and routes/sytist.js
+   via git:
+     git checkout HEAD server/services/processingService.js
+     git checkout HEAD server/routes/sytist.js
+
+2. Delete server/services/greenscreenService.js
+
+3. Restart the server.
+
+That returns you to pre-Phase-17 behavior.
+
+═══════════════════════════════════════════════════════
+FUTURE / NICE-TO-HAVE
+═══════════════════════════════════════════════════════
+
+  - Cache resized backgrounds per (backgroundUrl, dimensions) so
+    multiple cart lines using the same background don't re-fetch
+    and re-resize. Trivial to add later.
+
+  - A Settings → Backgrounds page that shows which backgrounds are
+    in use across recent orders. Not needed today since Sytist owns
+    the catalog.
+
+  - Idempotent re-processing: detect a composited file on disk and
+    skip the composite step if the background hasn't changed. Tiny
+    optimization for reprocessing.

@@ -1,0 +1,114 @@
+Phase 25 — Clip oversized slots to canvas (composite render fix)
+
+═══════════════════════════════════════════════════════
+THE PROBLEM
+═══════════════════════════════════════════════════════
+
+After Phase 21 (bleed support), slots can be sized or positioned
+to extend past the canvas. The designer renders this correctly
+because SVG naturally clips to viewBox bounds.
+
+But the server-side composite engine uses sharp's composite()
+operation, which REJECTS inputs larger than the destination
+canvas with:
+
+  Error: Image to composite must have same dimensions or smaller
+
+So as soon as you tried to render a real order with a player photo
+slot that bled past the canvas edge, the preview endpoint returned
+500 and live preview broke.
+
+═══════════════════════════════════════════════════════
+THE FIX
+═══════════════════════════════════════════════════════
+
+Two new helpers in compositeService:
+
+  _clipToCanvas(buffer, slotX, slotY, slotW, slotH, sheetW, sheetH)
+    Crops a fitted slot buffer to the intersection of the slot
+    rect and the canvas rect. Returns { input, top, left } with
+    the cropped buffer and adjusted position, OR null if the slot
+    is entirely outside the canvas.
+
+  _clipDescriptor(descriptor, slotW, slotH, sheetW, sheetH)
+    Wrapper for the { input, top, left } shape used by
+    _placeholderSvg and _textSvg. Calls _clipToCanvas under the
+    hood.
+
+Every place that pushed a composite descriptor to the composites[]
+array now runs through one of these helpers first. Eight call
+sites total:
+
+  - playerPhoto (image + placeholder)
+  - playerBackground (image only — no placeholder for green-screen)
+  - teamPhoto (image + placeholder)
+  - logo (image + placeholder)
+  - text (Phase 22's rotated text SVG can be larger than slot
+    bounds; we read actual SVG metadata to clip correctly)
+  - staticGraphic (image)
+
+Behavior:
+  - Slot fully inside canvas: fast path, no crop, identical to
+    pre-Phase-25 behavior. No perf regression.
+  - Slot exceeds canvas on any side: cropped to visible region
+    using sharp's .extract(). Output looks exactly like the
+    designer's trim-line preview.
+  - Slot entirely off canvas: skipped silently. No error.
+  - Negative slot positions (slot.x or slot.y < 0): cropped
+    correctly using max(0, slotX) for the visible-region origin.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/services/compositeService.js
+    + _clipToCanvas method
+    + _clipDescriptor wrapper
+    All composite-push sites updated to clip before pushing.
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-25.tar.gz --strip-components=1
+
+One file:
+  x server/services/compositeService.js
+
+Nodemon picks it up. No client changes.
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+1. Open the designer for a composite layout (the one with the
+   player photo slot extended past the canvas).
+2. Type an order ID in the preview panel, press Enter.
+3. The order should now load and render in the preview area —
+   no more 500 error.
+4. The rendered output should show the player photo clipped at
+   the canvas (orange dashed) line. Anything outside the canvas
+   shouldn't appear.
+
+5. Process the order. The final composited image should also
+   render correctly with the same clipping behavior.
+
+═══════════════════════════════════════════════════════
+EDGE CASES TESTED
+═══════════════════════════════════════════════════════
+
+  - Slot bigger than canvas (the failing case): crops to canvas
+  - Slot bleeds left/up (negative x or y): crops to visible region
+  - Slot entirely off canvas: skipped, no error
+  - Slot fully inside (existing layouts): fast path, no change
+  - Rotated text (Phase 22): SVG dimensions read via sharp
+    metadata, then clipped — handles the enlarged rotation
+    bounding box correctly
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD server/services/compositeService.js

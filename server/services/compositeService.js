@@ -425,13 +425,18 @@ class CompositeService {
               type: 'missing_player_photo',
               message: 'Player photo not supplied',
             });
-            composites.push(this._placeholderSvg(x, y, w, h, 'player photo missing', '#ffe4e4'));
+            const placeholder = this._placeholderSvg(x, y, w, h, 'player photo missing', '#ffe4e4');
+            const clippedPh = await this._clipDescriptor(placeholder, w, h, sheetWidthPx, sheetHeightPx);
+            if (clippedPh) composites.push(clippedPh);
             continue;
           }
           const fitted = await sharp(playerPhoto)
             .resize(w, h, { fit: slot.fit || 'cover' })
             .toBuffer();
-          composites.push({ input: fitted, top: y, left: x });
+          const clipped = await this._clipToCanvas(
+            fitted, x, y, w, h, sheetWidthPx, sheetHeightPx
+          );
+          if (clipped) composites.push(clipped);
         } else if (slot.kind === 'playerBackground') {
           // Phase 10: customer-selected background photo (from
           // ms_cart.cart_photo_bg). When absent, render NOTHING — the
@@ -449,27 +454,37 @@ class CompositeService {
           const fitted = await sharp(playerBackground)
             .resize(w, h, { fit: slot.fit || 'cover' })
             .toBuffer();
-          composites.push({ input: fitted, top: y, left: x });
+          const clipped = await this._clipToCanvas(
+            fitted, x, y, w, h, sheetWidthPx, sheetHeightPx
+          );
+          if (clipped) composites.push(clipped);
         } else if (slot.kind === 'teamPhoto') {
           if (!teamPhoto) {
             warnings.push({
               type: 'missing_team_photo',
               message: 'Team photo missing — rendering placeholder',
             });
-            composites.push(this._placeholderSvg(x, y, w, h, 'team photo missing', '#e4e4e4'));
+            const placeholder = this._placeholderSvg(x, y, w, h, 'team photo missing', '#e4e4e4');
+            const clippedPh = await this._clipDescriptor(placeholder, w, h, sheetWidthPx, sheetHeightPx);
+            if (clippedPh) composites.push(clippedPh);
             continue;
           }
           const fitted = await sharp(teamPhoto)
             .resize(w, h, { fit: slot.fit || 'cover' })
             .toBuffer();
-          composites.push({ input: fitted, top: y, left: x });
+          const clipped = await this._clipToCanvas(
+            fitted, x, y, w, h, sheetWidthPx, sheetHeightPx
+          );
+          if (clipped) composites.push(clipped);
         } else if (slot.kind === 'logo') {
           if (!logo) {
             warnings.push({
               type: 'missing_logo',
               message: 'Logo missing — rendering placeholder',
             });
-            composites.push(this._placeholderSvg(x, y, w, h, 'no logo', '#e8eef7'));
+            const placeholder = this._placeholderSvg(x, y, w, h, 'no logo', '#e8eef7');
+            const clippedPh = await this._clipDescriptor(placeholder, w, h, sheetWidthPx, sheetHeightPx);
+            if (clippedPh) composites.push(clippedPh);
             continue;
           }
           const fitted = await sharp(logo)
@@ -479,10 +494,33 @@ class CompositeService {
             })
             .png()
             .toBuffer();
-          composites.push({ input: fitted, top: y, left: x });
+          const clipped = await this._clipToCanvas(
+            fitted, x, y, w, h, sheetWidthPx, sheetHeightPx
+          );
+          if (clipped) composites.push(clipped);
         } else if (slot.kind === 'text') {
           const resolvedText = this._substituteTokens(slot.text || '', tokens || {});
-          composites.push(this._textSvg(slot, x, y, w, h, resolvedText));
+          const textDesc = this._textSvg(slot, x, y, w, h, resolvedText);
+          // Phase 22 rotation may have produced an SVG larger than
+          // the original slot bounds. Use the actual SVG dimensions
+          // for clipping math, not the slot's w × h.
+          //
+          // We re-read the position from the descriptor (which may
+          // have been shifted to center an enlarged rotated-text SVG
+          // on the slot center) and infer the SVG's w/h.
+          const meta = await sharp(textDesc.input).metadata();
+          const textW = meta.width || w;
+          const textH = meta.height || h;
+          const clippedText = await this._clipToCanvas(
+            textDesc.input,
+            textDesc.left,
+            textDesc.top,
+            textW,
+            textH,
+            sheetWidthPx,
+            sheetHeightPx
+          );
+          if (clippedText) composites.push(clippedText);
         } else if (slot.kind === 'overlay' || slot.kind === 'staticGraphic') {
           // Phase 9c: rename overlay → staticGraphic. Both kinds work
           // (backward compat for any existing layout JSON). Both lookup
@@ -514,7 +552,10 @@ class CompositeService {
             })
             .png()
             .toBuffer();
-          composites.push({ input: fitted, top: y, left: x });
+          const clipped = await this._clipToCanvas(
+            fitted, x, y, w, h, sheetWidthPx, sheetHeightPx
+          );
+          if (clipped) composites.push(clipped);
         } else {
           warnings.push({
             type: 'unknown_slot_kind',
@@ -566,6 +607,88 @@ class CompositeService {
 
   // ─── Helpers ──────────────────────────────────────────
 
+  /**
+   * Phase 25: crop a fitted slot buffer to the canvas bounds.
+   *
+   * Sharp's composite() rejects inputs that exceed the destination
+   * canvas dimensions. With bleed slots (Phase 21+) we have to do
+   * the clip ourselves: extract the visible portion of the buffer
+   * (where slot intersects canvas) and adjust the placement.
+   *
+   * @param {Buffer} buffer       The slot's rendered/fitted bytes.
+   *                              Must already be at exactly slotW × slotH.
+   * @param {number} slotX        Slot's left in canvas pixels (can be negative).
+   * @param {number} slotY        Slot's top in canvas pixels (can be negative).
+   * @param {number} slotW        Slot width in pixels.
+   * @param {number} slotH        Slot height in pixels.
+   * @param {number} sheetW       Canvas width in pixels.
+   * @param {number} sheetH       Canvas height in pixels.
+   * @returns {Promise<{ input: Buffer, top: number, left: number } | null>}
+   *          null if the slot is entirely outside the canvas.
+   */
+  async _clipToCanvas(buffer, slotX, slotY, slotW, slotH, sheetW, sheetH) {
+    // Intersection of slot rect with canvas rect.
+    const vx = Math.max(0, slotX);
+    const vy = Math.max(0, slotY);
+    const vRight = Math.min(slotX + slotW, sheetW);
+    const vBottom = Math.min(slotY + slotH, sheetH);
+    const vw = vRight - vx;
+    const vh = vBottom - vy;
+
+    if (vw <= 0 || vh <= 0) {
+      // Slot is entirely outside the canvas.
+      return null;
+    }
+
+    // If the slot is fully inside, no crop needed — fast path.
+    if (
+      slotX >= 0 &&
+      slotY >= 0 &&
+      slotX + slotW <= sheetW &&
+      slotY + slotH <= sheetH
+    ) {
+      return { input: buffer, top: slotY, left: slotX };
+    }
+
+    // Crop the buffer to the visible region. Coordinates inside the
+    // buffer (which is exactly slotW × slotH):
+    const cropX = vx - slotX;
+    const cropY = vy - slotY;
+
+    const cropped = await sharp(buffer)
+      .extract({ left: cropX, top: cropY, width: vw, height: vh })
+      .toBuffer();
+    return { input: cropped, top: vy, left: vx };
+  }
+
+  /**
+   * Phase 25: takes a composite descriptor (whatever _placeholderSvg
+   * or _textSvg returns — { input: Buffer, top, left }) plus the
+   * original slot size, and runs it through _clipToCanvas. Returns
+   * null if the slot is entirely off-canvas.
+   *
+   * The buffer is allowed to be an SVG; sharp will rasterize it
+   * during the extract operation.
+   *
+   * @param {{ input: Buffer, top: number, left: number }} descriptor
+   * @param {number} slotW
+   * @param {number} slotH
+   * @param {number} sheetW
+   * @param {number} sheetH
+   */
+  async _clipDescriptor(descriptor, slotW, slotH, sheetW, sheetH) {
+    if (!descriptor) return null;
+    return this._clipToCanvas(
+      descriptor.input,
+      descriptor.left,
+      descriptor.top,
+      slotW,
+      slotH,
+      sheetW,
+      sheetH
+    );
+  }
+
   _placeholderSvg(x, y, w, h, label, fillColor) {
     const svg = Buffer.from(
       `<svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">` +
@@ -585,7 +708,6 @@ class CompositeService {
     const align = slot.align || 'center';
     const weight = slot.weight || 'normal';
     const anchor = align === 'left' ? 'start' : align === 'right' ? 'end' : 'middle';
-    const textX = align === 'left' ? 0 : align === 'right' ? w : w / 2;
 
     // Phase 9f: autoFit. When slot.autoFit is enabled (or the engine
     // detects overflow even without the flag — defensive default),
@@ -624,15 +746,71 @@ class CompositeService {
     // Don't go absurdly small — minimum readable
     fontSize = Math.max(fontSize, 6);
 
+    // Phase 22: rotation. If the slot has a rotation in degrees, we
+    // enlarge the bounding SVG to fit the rotated text without
+    // clipping. The rotated text's max bounding box dimension is the
+    // diagonal of the slot — sqrt(w² + h²) — so we size the SVG to
+    // that diagonal (rounded up), center the text in it, and shift
+    // the composite's left/top so the SVG's CENTER sits where the
+    // slot's center would be.
+    //
+    // Bonus: this means hit-test bounds (which the client uses to
+    // detect clicks on the slot) stay the original w × h rectangle.
+    // Only the visual rendering moves.
+    const rotation = Number(slot.rotation) || 0;
+
+    if (rotation === 0) {
+      // Fast path: no rotation, render exactly like before.
+      const textX = align === 'left' ? 0 : align === 'right' ? w : w / 2;
+      const svg = Buffer.from(
+        `<svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">` +
+          `<text x="${textX}" y="${h / 2}" text-anchor="${anchor}" dominant-baseline="middle" ` +
+          `font-family="${escapeXml(fontFamily)}" font-size="${fontSize}" font-weight="${weight}" ` +
+          `fill="${color}">` +
+          escapeXml(text) +
+          `</text></svg>`
+      );
+      return { input: svg, top: y, left: x };
+    }
+
+    // Rotated path: enlarged SVG, text rotated around its center.
+    // Use the slot diagonal so any rotation angle fits.
+    const diag = Math.ceil(Math.sqrt(w * w + h * h));
+    // Round up to a slightly larger box to keep ascender/descender
+    // and aliasing room — sharp can rasterize cleanly.
+    const sw = diag + 4;
+    const sh = diag + 4;
+    const cx = sw / 2;
+    const cy = sh / 2;
+
+    // Re-compute textX inside the enlarged box. The text-anchor still
+    // honors the alignment setting, but anchored relative to the
+    // slot's logical (pre-rotation) horizontal axis through the
+    // center. We use a horizontal axis along the slot's middle in
+    // un-rotated space; the rotate(deg cx cy) transform moves both
+    // the anchor point and glyphs together.
+    const offsetW = (sw - w) / 2;
+    const textX =
+      align === 'left'
+        ? offsetW
+        : align === 'right'
+          ? offsetW + w
+          : cx;
+
     const svg = Buffer.from(
-      `<svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">` +
-        `<text x="${textX}" y="${h / 2}" text-anchor="${anchor}" dominant-baseline="middle" ` +
+      `<svg width="${sw}" height="${sh}" xmlns="http://www.w3.org/2000/svg">` +
+        `<text x="${textX}" y="${cy}" text-anchor="${anchor}" dominant-baseline="middle" ` +
         `font-family="${escapeXml(fontFamily)}" font-size="${fontSize}" font-weight="${weight}" ` +
-        `fill="${color}">` +
+        `fill="${color}" transform="rotate(${rotation} ${cx} ${cy})">` +
         escapeXml(text) +
         `</text></svg>`
     );
-    return { input: svg, top: y, left: x };
+
+    // Shift the composite position so the SVG's center sits on the
+    // slot's center.
+    const left = Math.round(x + w / 2 - cx);
+    const top = Math.round(y + h / 2 - cy);
+    return { input: svg, top, left };
   }
 
   /**

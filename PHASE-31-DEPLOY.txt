@@ -1,0 +1,138 @@
+Phase 31 — Push packaging info to ShipStation when adopting an
+          existing SS order
+
+═══════════════════════════════════════════════════════
+WHAT THIS DOES
+═══════════════════════════════════════════════════════
+
+When you Process an order that ALREADY exists on the ShipStation
+side (created manually by an operator, or by an earlier version
+of the dashboard that didn't compute packaging), the dashboard
+used to:
+
+  1. Compute fresh packaging (weight, dimensions, carrier, service)
+  2. See that an SS order exists with the same orderNumber
+  3. Link the local row to it
+  4. Return "adopted_existing" — WITHOUT pushing the new
+     packaging to SS
+
+The result: ShipStation kept whatever blank/default values it had
+from the original create. The operator saw no weight, no carrier,
+no package on the SS side.
+
+After Phase 31, the adopt-existing path ALSO sends the new
+packaging payload to ShipStation as an upsert (using their
+/orders/createorder endpoint with the existing orderId, which
+ShipStation treats as an update). Now the freshly-computed weight,
+dimensions, carrier, service, package code all land on the SS
+side every time you process.
+
+This is the same behavior you'd get on a fresh create, just
+applied to existing SS orders too.
+
+═══════════════════════════════════════════════════════
+BEHAVIOR
+═══════════════════════════════════════════════════════
+
+ADOPT + UPDATE FLOW:
+  1. Compute packaging payload (existing logic)
+  2. List SS orders by orderNumber
+  3. Found one? Call createOrder with payload + orderId of the
+     existing SS order. SS treats this as an update.
+  4. Insert / update the local link row with carrier/service/
+     package codes from the payload (these used to be NULL on
+     adopted links — Phase 31 fixes that too).
+  5. Return success — message indicates whether the packaging
+     update succeeded or failed.
+
+FAILURE HANDLING:
+  - If the update API call fails (network, auth, SS rejection),
+    the adoption itself still succeeds. The link row gets
+    created so future operations know the SS order exists.
+  - A warning logs the failure: "[Processing] Order N adopted
+    SS#X but packaging update failed: <reason>"
+  - The result object includes `packagingUpdated: false` and
+    `packagingUpdateError: "<reason>"` so callers can react.
+
+OVERWRITE BEHAVIOR:
+  - Per the operator's preference (asked during spec), this
+    ALWAYS overwrites whatever's on the SS side, even if the
+    operator manually edited fields in ShipStation. Trade-off:
+    consistent dashboard-driven packaging vs respecting manual
+    edits. We chose consistency.
+  - If you want to preserve manual edits in the future, we can
+    add a "preserveManualEdits" setting that diffs against the
+    existing SS order before pushing.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/services/processingService.js
+    - The adopt-existing branch (around line 415) now:
+      1. Builds an upsert payload: { ...payload, orderId: found.orderId }
+      2. Calls shipstationService.createOrder(updatePayload)
+      3. Logs success or failure with packageCode/weight/carrier
+         details (mirrors the format used by the fresh-create
+         path)
+      4. Passes carrierCode/serviceCode/packageCode to the link
+         row insert (previously left NULL)
+      5. Returns enriched result: packagingUpdated bool,
+         packagingUpdateError string when applicable
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-31.tar.gz --strip-components=1
+
+You should see 1 file line:
+  x server/services/processingService.js
+
+nodemon picks it up. No client changes. No browser refresh needed.
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+For order 110682 specifically (the one from your test that
+didn't push packaging):
+
+  1. Click "Process this order" again on the dashboard.
+  2. Watch the server console — instead of:
+       [Processing] Order 110682 already exists in SS (SS#525371639)
+       — adopting existing
+     You should now see:
+       [Processing] Order 110682 already exists in SS (SS#525371639)
+       — adopting existing + pushing current packaging
+       [Processing] Order 110682 → SS#525371639 (adopt+update)
+       packageCode=large_envelope, weightOz=4, carrier=stamps_com/
+       usps_first_class_mail
+  3. Refresh ShipStation in your browser. SS#525371639 should
+     now have:
+       - Weight: 4 oz
+       - Package: 6x8 Flat Mailer (or whatever your packaging
+         engine recommended)
+       - Carrier: Stamps.com
+       - Service: USPS First Class Mail
+       - Dimensions populated
+
+For a FRESH order that doesn't yet exist in SS:
+  Process it. Behavior is unchanged from before — goes through
+  the normal create path at step 5.
+
+For an order whose SS order was manually edited:
+  Process it. The dashboard will overwrite the manual edits with
+  its own packaging recommendation. Watch for any complaints —
+  if this is a problem, let me know and we'll add a setting.
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD server/services/processingService.js
+
+Restart the server. Adopt-existing reverts to link-only (no
+packaging push).

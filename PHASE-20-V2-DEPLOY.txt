@@ -1,0 +1,30 @@
+Phase 20-v2 — Hotfix: use order_id not order_number
+
+V1 BUG: assumed ms_orders had an order_number column. It does
+not. Sytist uses order_id as the only order identifier (the
+displayed "Order 110487" IS the order_id).
+
+V2 FIX: searchOrders rewritten to query against o.order_id
+with CAST(... AS CHAR) for LIKE matching against the integer
+column. All other behavior unchanged.
+
+DEPLOY:
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-20-v2.tar.gz --strip-components=1
+
+Should extract 3 files:
+  x server/services/sytistDbService.js
+  x server/routes/sytist.js
+  x client/src/pages/OrdersListPage.js
+
+(Same files as v1 — routes/sytist.js and OrdersListPage.js are
+unchanged from v1, only sytistDbService.js was rewritten. They're
+all in the tarball for a clean drop-in.)
+
+Nodemon picks up the change. Try the search again.
+
+VERIFY:
+  - Type 111102 in the search → should find that order (was your
+    failing test query)
+  - Type "Jess" → customer name search
+  - Type a partial like "1101" → partial order_id match

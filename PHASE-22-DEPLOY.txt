@@ -1,0 +1,128 @@
+Phase 22 — Mouse wheel resize + text rotation
+
+═══════════════════════════════════════════════════════
+WHAT THIS DOES
+═══════════════════════════════════════════════════════
+
+Two related improvements to the composite layout designer.
+
+1. MOUSE WHEEL RESIZE — was already implemented but gated behind a
+   prop that defaulted to false in the main designer. Now enabled
+   by default everywhere. Select a slot, scroll the wheel:
+     - Wheel up = grow 5%
+     - Wheel down = shrink 5%
+   Resize is centered on the slot, so the slot stays positioned
+   while size changes.
+
+2. TEXT ROTATION — new feature. Text slots get a Rotation (degrees)
+   control in the slot editor. Examples:
+     -   0 — horizontal (default)
+     -  90 — sideways, baseline pointing up
+     - 180 — upside down
+     - -90 or 270 — sideways, baseline pointing down
+
+   Rotation pivots around the slot's CENTER, so a rotated text feels
+   natural regardless of alignment. The slot's bounding box stays in
+   un-rotated space, so clicks still register on the original
+   rectangle.
+
+   Server-side rendering matches: compositeService.js now applies
+   the same rotation to the final composited image. Enlarges the
+   text's bounding SVG by sqrt(w² + h²) so the rotated text never
+   gets clipped at the slot's edges.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/components/LayoutCanvas.js
+    - enableWheelScale prop default flipped from false to true
+    - SlotText renders with transform="rotate(deg cx cy)" when
+      slot.rotation is non-zero, pivoting on slot center
+    - (Phase 21 carries forward: bleed support is still in place)
+
+  server/services/compositeService.js
+    - _textSvg gains rotation support: when slot.rotation is set,
+      builds an enlarged SVG (sized to slot diagonal), centers the
+      text, applies rotate(deg cx cy), and shifts the composite
+      position so the enlarged SVG's center sits on the slot's
+      center. Zero rotation uses the same fast-path code as
+      before (zero perf regression).
+
+  client/src/pages/settings/LayoutDesignerPage.js
+    - "Rotation (°)" FormRow added under text slot controls
+      (right after Auto-fit)
+    - update() coerces 'rotation' as numeric like the other dims
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-22.tar.gz --strip-components=1
+
+You should see 3 file lines:
+  x client/src/components/LayoutCanvas.js
+  x client/src/pages/settings/LayoutDesignerPage.js
+  x server/services/compositeService.js
+
+Nodemon picks up the server file. Webpack picks up the client
+files. Hard refresh the designer page.
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+Wheel resize:
+  1. Open Settings → Composite Layouts → into a layout.
+  2. Click a slot to select it.
+  3. Hover over the canvas and scroll the wheel. Slot should
+     resize, centered.
+  4. Try on different slot kinds (image, text, static graphic).
+     All should resize.
+
+Text rotation in designer:
+  1. Select a text slot. Scroll down the inspector — there should
+     be a new "Rotation (°)" field.
+  2. Enter "45". The text in the canvas rotates 45° around its
+     center, but the slot's blue selection rect stays in place.
+  3. Click outside the slot, then click on the original rectangle
+     bounds — slot should re-select (hit-test isn't broken).
+
+Text rotation in render:
+  1. Save the layout.
+  2. Open an order using that layout. Click "Render preview" or
+     process the order.
+  3. The rendered output should show the text at 45° in the same
+     position.
+
+  Test a few rotations:
+    - 90°  → text reads upward (great for vertical sports posters)
+    - 180° → upside down
+    - -45° / 315° → tilted the other way
+
+═══════════════════════════════════════════════════════
+EDGE CASES HANDLED
+═══════════════════════════════════════════════════════
+
+  - Existing layouts (no rotation field): treated as 0°, render
+    identically to before
+  - Zero rotation: fast path, no SVG enlargement (zero perf cost)
+  - Extreme angles (e.g. 720°): valid — SVG transform handles
+    modular rotation natively
+  - Long text with rotation + autoFit: autoFit still works in
+    un-rotated space (sizes to slot's w × h), then rotation is
+    applied to the result
+  - Hit-test: slot bounding box stays in un-rotated space, so
+    clicking on the slot rect still works regardless of rotation
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD client/src/components/LayoutCanvas.js
+  git checkout HEAD client/src/pages/settings/LayoutDesignerPage.js
+  git checkout HEAD server/services/compositeService.js
+
+Restart server, hard refresh.

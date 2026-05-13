@@ -1,4 +1,9 @@
 {
-  "autoStatusUpdate": false,
-  "targetStatusId": null
+  "autoStatusUpdate": true,
+  "targetStatusId": 40,
+  "autoShipStation": true,
+  "shippedStatusId": 39,
+  "shipEligibleFromStatusIds": [
+    40
+  ]
 }

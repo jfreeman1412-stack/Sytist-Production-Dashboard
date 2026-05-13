@@ -1,0 +1,126 @@
+Phase 41 — Per-item thumbnails in ShipStation
+
+═══════════════════════════════════════════════════════
+WHAT THIS DELIVERS
+═══════════════════════════════════════════════════════
+
+ShipStation's order detail page has an image column for
+each line item. Previously the dashboard sent no imageUrl,
+so SS showed a placeholder. Now each item gets a thumbnail
+URL pointing at Sytist's S3 photo.
+
+When the operator opens the SS order to print a label, they
+can visually identify each line item without cross-
+referencing against Sytist.
+
+═══════════════════════════════════════════════════════
+HOW IT WORKS
+═══════════════════════════════════════════════════════
+
+shipstationService.buildOrderFromSytist now sets an
+imageUrl on each line item payload:
+
+  imageUrl: li.photo?.thumbUrl
+            || li.photo?.largeUrl
+            || li.photo?.fullUrl
+            || null
+
+The URL is whatever the canonical line item shape exposes.
+Order of preference:
+  1. thumbUrl  — Sytist's small watermarked thumbnail.
+                 Smallest payload for SS to fetch and the
+                 image is just for identification.
+  2. largeUrl  — medium-resolution fallback if there's no
+                 thumb.
+  3. fullUrl   — full-resolution last-resort fallback.
+
+If none of the three are available (no S3 photo, or
+non-S3 photo with no URLs), the imageUrl field is omitted
+from the payload entirely — NOT sent as null, since some
+SS accounts have been observed to 400 on null imageUrl.
+
+Package constituents automatically inherit their parent's
+photo (set during _expandPackageLineItems), so package
+orders just work with no special handling.
+
+═══════════════════════════════════════════════════════
+WHERE IT APPLIES
+═══════════════════════════════════════════════════════
+
+  ✓ Fresh order creation (Process button on a Queue order)
+  ✓ Push Packaging button (uses the same buildOrder path,
+    so the manual update endpoint will also send imageUrls)
+
+  ✗ Adopt path (SS order already exists from upstream tool;
+    Phase 33 default is "adopt without push," so imageUrls
+    don't get attached to adopted orders unless operator
+    later clicks Push Packaging)
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED (1 file):
+
+  server/services/shipstationService.js
+    + In the items.map() loop inside buildOrderFromSytist:
+      compute imageUrl from photo URLs with fallback chain,
+      and add to payload only when a URL exists.
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-41.tar.gz \
+            --strip-components=1
+
+One file. nodemon picks it up.
+
+═══════════════════════════════════════════════════════
+VERIFY
+═══════════════════════════════════════════════════════
+
+  1. Process a fresh order. Wait a few seconds for SS to
+     fetch the imageUrls.
+  2. Open the order in ShipStation's UI.
+  3. The "Item Details" section should show a small
+     thumbnail next to each line item's name/SKU.
+
+     If you see placeholders instead of thumbnails:
+     - The URL may be unreachable from SS's servers.
+       Check the URL in the dashboard order detail page's
+       photo link — does it open the image in your
+       browser? If yes, SS should be able to fetch it too.
+     - Sytist's S3 bucket may have an IP allowlist; ask
+       Sytist support whether they whitelist SS's IPs.
+
+  4. For an already-existing SS order (adopt path or older
+     order), click "Push packaging to ShipStation" — that
+     should also push the imageUrls.
+
+═══════════════════════════════════════════════════════
+SWITCHING TO LARGER IMAGES LATER
+═══════════════════════════════════════════════════════
+
+If the thumbnails look too small or low-quality in SS's
+UI, change the fallback chain order in
+shipstationService.js around line 480:
+
+  const imageUrl =
+    li.photo?.thumbUrl  ← swap this to largeUrl or fullUrl
+    || li.photo?.largeUrl
+    || li.photo?.fullUrl
+    || null;
+
+Larger images mean longer fetches for SS but better visual
+fidelity. The watermark stays on regardless.
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD server/services/shipstationService.js
+
+Restart server. New orders go out without imageUrls.
+Existing SS orders keep whatever they already have.

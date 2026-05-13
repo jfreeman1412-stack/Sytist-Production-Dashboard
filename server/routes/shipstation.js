@@ -144,7 +144,60 @@ router.post('/orders/:orderId/create', async (req, res) => {
     const order = await sytistDb.getOrderById(orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
+    // Phase 43 hotfix 2: hydrate composedImageUrl from the SQLite
+    // cache. processOrder's Step 1.4 writes URLs to this cache when
+    // green-screen items are composed and uploaded to S3. Without
+    // hydration here, the SS payload's imageUrl falls back to
+    // Sytist's raw thumbUrl — which is the keyed-out subject without
+    // background. The cache is keyed by (orderId, cartId); for
+    // package constituents the cart_id is the synthetic string like
+    // "482071-pkg-27".
+    try {
+      const composedThumbnailCacheService = require('../services/composedThumbnailCacheService');
+      const cachedRows = composedThumbnailCacheService.listByOrder(orderId);
+      if (cachedRows.length > 0) {
+        const byCartId = new Map(
+          cachedRows.map((r) => [String(r.cart_id), r.public_url])
+        );
+        let hydrated = 0;
+        for (const li of order.lineItems || []) {
+          const url = byCartId.get(String(li.cartId));
+          if (url) {
+            li.composedImageUrl = url;
+            hydrated += 1;
+          }
+        }
+        if (hydrated > 0) {
+          console.log(
+            `[shipstation create:${orderId}] hydrated composedImageUrl on ${hydrated} line item(s) from cache`
+          );
+        }
+      }
+    } catch (cacheErr) {
+      console.warn(
+        `[shipstation create:${orderId}] thumbnail cache read failed (non-fatal): ${cacheErr.message}`
+      );
+    }
+
     const overrides = req.body || {};
+
+    // Phase 43 hotfix 2: support retry-with-modified-orderKey. When
+    // SS rejects a fresh-create with 404 and we suspect orderKey
+    // tombstoning, the client can re-submit with retryOrderKeySuffix
+    // set, which we append to BOTH orderKey and orderNumber to make
+    // the request look brand-new to ShipStation. orderNumber stays
+    // searchable (we'll keep the original ID at the start) and the
+    // suffix is short enough to fit in SS's orderNumber field
+    // (typically 50 chars).
+    const retrySuffix =
+      typeof overrides.retryOrderKeySuffix === 'string' &&
+      overrides.retryOrderKeySuffix.trim()
+        ? overrides.retryOrderKeySuffix.trim()
+        : null;
+    // Remove the retry field from overrides so it doesn't leak into
+    // the SS payload as an unknown field.
+    delete overrides.retryOrderKeySuffix;
+
     const payload = await shipstationService.buildOrderFromSytist(
       order,
       overrides
@@ -159,6 +212,21 @@ router.post('/orders/:orderId/create', async (req, res) => {
         message: payload.message,
         skipped: payload.skipped,
       });
+    }
+
+    // Apply retry suffix BEFORE the lookup so the lookup matches the
+    // payload we'll actually send.
+    if (retrySuffix) {
+      const safeSuffix = retrySuffix.replace(/[^A-Za-z0-9-]/g, '');
+      payload.orderKey = `${payload.orderKey}-${safeSuffix}`;
+      payload.orderNumber = `${payload.orderNumber}-${safeSuffix}`;
+      // Note in internal notes so the recreation is auditable.
+      payload.internalNotes =
+        (payload.internalNotes ? payload.internalNotes + ' | ' : '') +
+        `Recreated after 404 with suffix "${safeSuffix}"`;
+      console.log(
+        `[shipstation create:${orderId}] retry mode — orderKey=${payload.orderKey} orderNumber=${payload.orderNumber}`
+      );
     }
 
     // Belt + suspenders: ShipStation can also return a duplicate
@@ -198,7 +266,47 @@ router.post('/orders/:orderId/create', async (req, res) => {
       );
     }
 
-    const result = await shipstationService.createOrder(payload);
+    let result;
+    try {
+      result = await shipstationService.createOrder(payload);
+    } catch (sendErr) {
+      // Phase 43 hotfix 2: detect the 404-empty-body pattern that
+      // typically means "orderKey is in a state ShipStation can't
+      // resolve" — usually a previously-deleted order. Return a
+      // specific code the UI can use to prompt for a retry with a
+      // modified orderKey.
+      //
+      // We ONLY trigger the retry-eligible flow if:
+      //   - the response status was 404
+      //   - the response body was empty (not a real error message)
+      //   - we weren't already on a retry attempt (avoid loops)
+      const is404Empty =
+        sendErr.statusCode === 404 &&
+        (!sendErr.responseBody || sendErr.responseBody.trim() === '');
+      if (is404Empty && !retrySuffix) {
+        console.warn(
+          `[shipstation create:${orderId}] got 404 with empty body from SS — likely orderKey tombstone. Returning retry-eligible error.`
+        );
+        return res.status(409).json({
+          error:
+            'ShipStation rejected the create with 404. The orderKey may be tombstoned from a previous deletion.',
+          code: 'orderkey_tombstone_suspected',
+          retryEligible: true,
+          suggestedSuffix: `r${Date.now()}`,
+          orderId,
+        });
+      }
+      // Any other error: pass through.
+      console.error(
+        `[shipstation create:${orderId}] createOrder failed: ${sendErr.message}`
+      );
+      return res.status(502).json({
+        error: sendErr.message,
+        code: 'ss_error',
+        statusCode: sendErr.statusCode || null,
+      });
+    }
+
     const link = shipstationLinkService.create({
       orderId,
       ssOrderId: result.orderId,
@@ -209,7 +317,13 @@ router.post('/orders/:orderId/create', async (req, res) => {
       packageCode: result.packageCode || payload.packageCode,
       payload,
     });
-    res.json({ linked: true, link: _maskLink(link), result });
+    res.json({
+      linked: true,
+      link: _maskLink(link),
+      result,
+      recreated: !!retrySuffix,
+      recreatedSuffix: retrySuffix || null,
+    });
   } catch (err) {
     console.error('[shipstation] create error:', err.message);
     res.status(500).json({ error: err.message });

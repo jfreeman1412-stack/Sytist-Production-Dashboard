@@ -22,6 +22,27 @@ const compositeGraphicsService = require('../services/compositeGraphicsService')
 const orderOverrideService = require('../services/orderOverrideService');
 const { requireAuth, requireRole } = require('../middleware/auth');
 
+// Phase 36: small helper to pull the audit context (display name +
+// IP) off req for downstream services. Falls back gracefully when
+// any field is missing. Used by every action that writes to
+// ms_notes — keeps the routes from having to repeat the same
+// field-coalescing logic.
+function userContextFromReq(req) {
+  return {
+    userId: req.user?.id ?? null,
+    userDisplayName:
+      req.user?.display_name ||
+      req.user?.displayName ||
+      req.user?.username ||
+      'dashboard',
+    userIp:
+      req.ip ||
+      req.connection?.remoteAddress ||
+      req.headers?.['x-forwarded-for'] ||
+      '',
+  };
+}
+
 // ─── Public routes (registered before auth middleware) ───────
 //
 // Phase 9e-hotfix3: image preview endpoints serve files via SVG
@@ -356,6 +377,33 @@ router.get('/orders/test', async (req, res) => {
 });
 
 /**
+ * Phase 20: GET /api/sytist/orders/search?q=<query>
+ *
+ * Global order search by order number, customer name, email, or
+ * phone. Returns at most 10 results, paid + non-erased only.
+ *
+ * Must be registered BEFORE /orders/:orderId so Express doesn't
+ * route "search" through the param-matching handler.
+ */
+router.get('/orders/search', async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    if (!q) {
+      return res.json({ results: [], query: '' });
+    }
+    if (q.length < 2) {
+      // Avoid hammering the DB with a single character. Empty result.
+      return res.json({ results: [], query: q, message: 'Query too short' });
+    }
+    const results = await sytistDb.searchOrders(q);
+    res.json({ results, query: q });
+  } catch (err) {
+    console.error('[sytist/orders/search]', err);
+    res.status(500).json({ error: err.message || 'Search failed' });
+  }
+});
+
+/**
  * GET /api/sytist/orders/:orderId
  * Returns a single canonical-shaped order, or 404 if not found.
  */
@@ -464,6 +512,545 @@ router.put(
         error: err.message,
         code: err.code,
       });
+    }
+  }
+);
+
+// ─── Phase 28: shipping status transitions ───────────────────
+//
+// Three endpoints:
+//   POST /orders/:orderId/ship        — mark a single order shipped
+//   POST /orders/batch-ship           — mark many orders shipped at once
+//   POST /orders/:orderId/unship      — manual override; reverse to Printing
+//
+// All check eligibility (status must be in shipEligibleFromStatusIds,
+// configured in processing-settings.json) unless force=true. Every
+// transition is logged to the local SQLite order_status_audit table.
+//
+// The eligibility model lets us prevent operator mistakes like
+// "Mark Shipped" on an order still in Queue. The override (unship)
+// bypasses this for admin corrections.
+const orderStatusService = require('../services/orderStatusService');
+
+router.post(
+  '/orders/:orderId/ship',
+  requireRole('admin', 'operator'),
+  async (req, res) => {
+    try {
+      const ctx = userContextFromReq(req);
+      const result = await orderStatusService.shipOrder({
+        orderId: req.params.orderId,
+        force: !!req.body?.force,
+        source: 'manual',
+        userId: ctx.userId,
+        userDisplayName: ctx.userDisplayName,
+        userIp: ctx.userIp,
+      });
+      if (!result.ok) {
+        const status =
+          result.code === 'not_found'
+            ? 404
+            : result.code === 'not_eligible'
+              ? 409
+              : 400;
+        return res.status(status).json(result);
+      }
+      res.json(result);
+    } catch (err) {
+      console.error('[sytist/orders/:orderId/ship]', err);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  }
+);
+
+router.post(
+  '/orders/batch-ship',
+  requireRole('admin', 'operator'),
+  async (req, res) => {
+    try {
+      const orderIds = Array.isArray(req.body?.orderIds)
+        ? req.body.orderIds
+        : [];
+      if (orderIds.length === 0) {
+        return res
+          .status(400)
+          .json({ ok: false, error: 'orderIds array required' });
+      }
+      const ctx = userContextFromReq(req);
+      const result = await orderStatusService.batchShipOrders({
+        orderIds,
+        force: !!req.body?.force,
+        source: 'bulk',
+        userId: ctx.userId,
+        userDisplayName: ctx.userDisplayName,
+        userIp: ctx.userIp,
+      });
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      console.error('[sytist/orders/batch-ship]', err);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  }
+);
+
+router.post(
+  '/orders/:orderId/unship',
+  requireRole('admin'),
+  async (req, res) => {
+    try {
+      const ctx = userContextFromReq(req);
+      const result = await orderStatusService.unshipOrder({
+        orderId: req.params.orderId,
+        targetStatusId: req.body?.targetStatusId,
+        source: 'manual_override',
+        userId: ctx.userId,
+        userDisplayName: ctx.userDisplayName,
+        userIp: ctx.userIp,
+        notes: req.body?.notes,
+      });
+      if (!result.ok) {
+        const status = result.code === 'not_found' ? 404 : 400;
+        return res.status(status).json(result);
+      }
+      res.json(result);
+    } catch (err) {
+      console.error('[sytist/orders/:orderId/unship]', err);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  }
+);
+
+// ─── Phase 36: ms_notes endpoints ──────────────────────────────
+//
+// These let the dashboard's order detail page read and write the
+// Sytist activity log. INSERTs are append-only (a new row each
+// call) and DELETE is a soft-delete (sets note_delete=1 + records
+// who/when in note_edited / note_edited_who).
+//
+// Auth: any authenticated user can list and add notes. Only the
+// note's own author (matched on display name) or an admin can
+// soft-delete; the rule lives here at the route layer rather than
+// in sytistDbService.
+
+/**
+ * GET /api/sytist/orders/:orderId/notes
+ *
+ * Lists ms_notes rows for this order, newest-first, excluding
+ * soft-deleted ones. Returns the UI-shaped rows from
+ * sytistDb.listNotes().
+ */
+router.get('/orders/:orderId/notes', async (req, res) => {
+  try {
+    const orderId = req.params.orderId;
+    const includeDeleted = req.query.includeDeleted === '1';
+    const notes = await sytistDb.listNotes(orderId, { includeDeleted });
+    res.json({ ok: true, notes });
+  } catch (err) {
+    console.error('[sytist/orders/:orderId/notes GET]', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * POST /api/sytist/orders/:orderId/notes
+ * Body: { noteText: string }
+ *
+ * Adds a manual operator note. Stored with the manual flag triple
+ * (admin=1, is_note=1, log=0) so Sytist's UI styles it as a real
+ * "Note" rather than a system log event.
+ *
+ * Returns the new note shape so the client can append it to its
+ * local state without re-fetching.
+ */
+router.post('/orders/:orderId/notes', async (req, res) => {
+  try {
+    const orderId = req.params.orderId;
+    const noteText = req.body && req.body.noteText
+      ? String(req.body.noteText).trim()
+      : '';
+    if (!noteText) {
+      return res.status(400).json({ ok: false, error: 'noteText required' });
+    }
+    const ctx = userContextFromReq(req);
+    const { noteId } = await sytistDb.insertNote({
+      orderId,
+      noteText,
+      who: ctx.userDisplayName,
+      ip: ctx.userIp,
+      isManual: true,
+    });
+    res.json({
+      ok: true,
+      note: {
+        id: noteId,
+        date: new Date(),
+        body: noteText,
+        who: ctx.userDisplayName,
+        ip: ctx.userIp,
+        type: 'note',
+        admin: true,
+        deleted: false,
+      },
+    });
+  } catch (err) {
+    console.error('[sytist/orders/:orderId/notes POST]', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * DELETE /api/sytist/orders/:orderId/notes/:noteId
+ *
+ * Soft-deletes a single note. Authorization:
+ *   - Admins can delete any note
+ *   - Non-admins can only delete notes they themselves authored
+ *
+ * Author matching is done on display name. Logged-in user's
+ * display name must equal note_who on the existing row, else we
+ * 403. We don't allow deleting system log events (log=1) at all
+ * since those are the audit trail — the only way to "remove" one
+ * would be a manual operator note explaining what happened.
+ */
+router.delete('/orders/:orderId/notes/:noteId', async (req, res) => {
+  try {
+    const orderId = req.params.orderId;
+    const noteId = req.params.noteId;
+    const ctx = userContextFromReq(req);
+    const role = req.user?.role || '';
+    const isAdmin = role === 'admin';
+
+    // Find the note first so we can apply authorization.
+    const notes = await sytistDb.listNotes(orderId, {
+      includeDeleted: false,
+      limit: 1000,
+    });
+    const target = notes.find((n) => String(n.id) === String(noteId));
+    if (!target) {
+      return res.status(404).json({ ok: false, error: 'Note not found' });
+    }
+    if (target.type === 'log') {
+      return res
+        .status(403)
+        .json({ ok: false, error: 'System log entries cannot be deleted' });
+    }
+    if (!isAdmin && target.who !== ctx.userDisplayName) {
+      return res
+        .status(403)
+        .json({ ok: false, error: 'Only the author or an admin can delete this note' });
+    }
+
+    const result = await sytistDb.softDeleteNote(noteId, {
+      editedWho: ctx.userDisplayName,
+    });
+    res.json({ ok: true, affectedRows: result.affectedRows });
+  } catch (err) {
+    console.error('[sytist/orders/:orderId/notes DELETE]', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ─── Phase 33: manual "Push packaging to ShipStation" ──────────
+//
+// Opt-in re-push for orders that ALREADY exist in ShipStation
+// (have a local link row). Recomputes the packaging payload from
+// the order's current Sytist state and upserts it to SS via
+// /orders/createorder.
+//
+// Why this exists: by default, reprocessing an order does NOT
+// push to ShipStation (Phase 33 reversed Phase 31's auto-push).
+// When the operator legitimately needs to update SS — e.g. they
+// changed a product weight, edited an addon, or the engine now
+// recommends a different package — they click "Push packaging
+// to ShipStation" on the order detail page, which hits this
+// endpoint.
+//
+// Also updates the local link row to reflect what was pushed
+// (carrier/service/package codes, payload snapshot).
+// ─── COMPOSED THUMBNAIL URL LOOKUP (Phase 44) ──────────────────
+// Returns the cached public URL(s) for an order's composite/composed
+// thumbnails, keyed by cart_id. The dashboard's order detail page
+// calls this to show the rendered composite (Memory Mate, etc.) as
+// the line item card's thumbnail when one exists, falling back to
+// the raw photo otherwise.
+//
+// Rows are written during processOrder (Step 1.4 green-screen
+// compose AND the composite-engine render step) and cleared by
+// the scheduler when an order ships.
+//
+// Returns:
+//   { ok: true, thumbnails: { [cart_id]: public_url, ... } }
+router.get('/orders/:orderId/composed-thumbnails', async (req, res) => {
+  try {
+    const orderId = req.params.orderId;
+    const composedThumbnailCacheService = require('../services/composedThumbnailCacheService');
+    const rows = composedThumbnailCacheService.listByOrder(orderId);
+    const thumbnails = {};
+    for (const r of rows) {
+      thumbnails[r.cart_id] = r.public_url;
+    }
+    res.json({ ok: true, thumbnails });
+  } catch (err) {
+    // Non-fatal — UI falls back to its existing photo thumbnail.
+    console.warn(
+      `[sytist/orders/${req.params.orderId}/composed-thumbnails] read failed: ${err.message}`
+    );
+    res.json({ ok: true, thumbnails: {} });
+  }
+});
+
+router.post(
+  '/orders/:orderId/push-packaging',
+  requireRole('admin', 'operator'),
+  async (req, res) => {
+    const orderId = req.params.orderId;
+    const tag = `[push-packaging:${orderId}]`;
+    try {
+      const shipstationService = require('../services/shipstationService');
+      const shipstationLinkService = require('../services/shipstationLinkService');
+      const composedThumbnailCacheService = require('../services/composedThumbnailCacheService');
+
+      // 1. Must have an existing link. If not, the operator should
+      // just process the order normally (which creates fresh).
+      const link = shipstationLinkService.getByOrderId(orderId);
+      if (!link) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            'No ShipStation link exists for this order. Process the order first to create one.',
+          code: 'no_link',
+        });
+      }
+
+      // 2. Load the order fresh from Sytist + build the payload.
+      const order = await sytistDb.getOrderById(orderId);
+      if (!order) {
+        return res.status(404).json({
+          ok: false,
+          error: `Order ${orderId} not found in Sytist`,
+          code: 'not_found',
+        });
+      }
+
+      // Phase 43: hydrate composedImageUrl onto each line item from
+      // the SQLite cache. processOrder Step 1.4 wrote these URLs
+      // when the order was processed; without hydration, the SS
+      // payload would fall back to Sytist's raw thumbUrl (the keyed
+      // out subject without background) for green-screen items.
+      try {
+        const cachedRows = composedThumbnailCacheService.listByOrder(orderId);
+        if (cachedRows.length > 0) {
+          const byCartId = new Map(
+            cachedRows.map((r) => [String(r.cart_id), r.public_url])
+          );
+          let hydrated = 0;
+          for (const li of order.lineItems || []) {
+            const url = byCartId.get(String(li.cartId));
+            if (url) {
+              li.composedImageUrl = url;
+              hydrated += 1;
+            }
+          }
+          if (hydrated > 0) {
+            console.log(
+              `${tag} hydrated composedImageUrl on ${hydrated} line item(s) from cache`
+            );
+          }
+        }
+      } catch (cacheErr) {
+        // Non-fatal — cache miss just means we fall back to thumbUrl.
+        console.warn(
+          `${tag} thumbnail cache read failed (non-fatal): ${cacheErr.message}`
+        );
+      }
+
+      let payload;
+      try {
+        payload = await shipstationService.buildOrderFromSytist(order, {});
+      } catch (err) {
+        console.error(`${tag} buildOrderFromSytist failed: ${err.message}`);
+        return res.status(500).json({
+          ok: false,
+          error: `Payload build failed: ${err.message}`,
+        });
+      }
+
+      if (payload && payload.__skipShipStation) {
+        return res.status(400).json({
+          ok: false,
+          error: `Packaging engine says order is not shippable: ${payload.message}`,
+          code: 'not_shippable',
+        });
+      }
+
+      // Phase 43: pre-check whether the linked SS order still exists.
+      // If the operator deleted it externally (or it was purged on
+      // SS's side), we'd get a confusing 404 from createOrder when
+      // we try to UPDATE it. Detect that case upfront and switch to
+      // fresh-create mode.
+      //
+      // Lookup is by orderNumber (the Sytist order ID) — same key
+      // used by Process's phantom check. Non-fatal: if listOrders
+      // itself fails, we proceed with the update path and let the
+      // auto-retry below catch any 404.
+      let ssOrderExists = true;
+      try {
+        const orderNumStr = payload.orderNumber || String(order.orderId);
+        const lookup = await shipstationService.listOrders({
+          orderNumber: orderNumStr,
+        });
+        const matches = (lookup?.orders || []).filter(
+          (o) => o.orderNumber === orderNumStr
+        );
+        if (matches.length === 0) {
+          ssOrderExists = false;
+          console.log(
+            `${tag} pre-check: SS#${link.ss_order_id} not found via listOrders (operator likely deleted it). Will create fresh.`
+          );
+        } else {
+          // Sanity check: does at least one match have the SS ID we
+          // think we're linked to? If not, the link is stale but a
+          // different SS order with the same orderNumber exists —
+          // adopt the existing one rather than creating a duplicate.
+          const exactMatch = matches.find(
+            (o) => o.orderId === link.ss_order_id
+          );
+          if (!exactMatch) {
+            const adopted = matches[0];
+            console.log(
+              `${tag} pre-check: SS#${link.ss_order_id} not found but SS#${adopted.orderId} has the same orderNumber. Re-linking and updating.`
+            );
+            shipstationLinkService.update(orderId, {
+              ssOrderId: adopted.orderId,
+              ssOrderNumber: adopted.orderNumber,
+              ssOrderStatus: adopted.orderStatus,
+            });
+            link.ss_order_id = adopted.orderId;
+          }
+        }
+      } catch (lookupErr) {
+        console.warn(
+          `${tag} listOrders pre-check failed (non-fatal): ${lookupErr.message}`
+        );
+      }
+
+      console.log(
+        `${tag} pushing payload — weight=${payload.weight?.value}${payload.weight?.units || 'oz'}, ` +
+          `dims=${payload.dimensions?.length}x${payload.dimensions?.width}x${payload.dimensions?.height}${payload.dimensions?.units || 'in'}, ` +
+          `carrier=${payload.carrierCode}/${payload.serviceCode}, package=${payload.packageCode} → ` +
+          (ssOrderExists
+            ? `SS#${link.ss_order_id} (update)`
+            : 'fresh create (link was stale)')
+      );
+
+      // 3. Push. If SS exists, send orderId to UPDATE; otherwise
+      // omit it for a fresh CREATE. Belt-and-suspenders: if the
+      // UPDATE returns 404 (e.g. our pre-check was wrong, or the
+      // order got deleted between pre-check and push), auto-retry
+      // as fresh-create.
+      let ssResult;
+      let pathTaken = ssOrderExists ? 'update' : 'fresh_create';
+      try {
+        const sendPayload = ssOrderExists
+          ? { ...payload, orderId: link.ss_order_id }
+          : payload;
+        ssResult = await shipstationService.createOrder(sendPayload);
+      } catch (err) {
+        const is404 =
+          /\b404\b/.test(err.message) ||
+          /not\s*found/i.test(err.message);
+        if (is404 && ssOrderExists) {
+          console.warn(
+            `${tag} update returned 404 — SS order was deleted between pre-check and push. Retrying as fresh create.`
+          );
+          try {
+            ssResult = await shipstationService.createOrder(payload);
+            pathTaken = 'fresh_create_after_404';
+          } catch (retryErr) {
+            console.error(
+              `${tag} fresh-create retry also failed: ${retryErr.message}`
+            );
+            return res.status(502).json({
+              ok: false,
+              error: `ShipStation rejected both update and fresh create: ${retryErr.message}`,
+              code: 'ss_error',
+            });
+          }
+        } else {
+          console.error(`${tag} createOrder failed: ${err.message}`);
+          return res.status(502).json({
+            ok: false,
+            error: `ShipStation rejected the ${pathTaken}: ${err.message}`,
+            code: 'ss_error',
+          });
+        }
+      }
+
+      const storedPkg = ssResult.packageCode;
+      const drift = payload.packageCode !== storedPkg;
+      console.log(
+        `${tag} createOrder OK (${pathTaken}) → SS#${ssResult.orderId} packageCode=${storedPkg}${drift ? ` (⚠ drift from sent=${payload.packageCode})` : ''}`
+      );
+
+      // 4. Update the local link row's metadata so the UI reflects
+      // what's now in SS. If the SS order ID changed (we created
+      // fresh after a stale link), this re-points the link too.
+      try {
+        const linkUpdate = {
+          ssOrderStatus: ssResult.orderStatus,
+          carrierCode: payload.carrierCode,
+          serviceCode: payload.serviceCode,
+          packageCode: storedPkg,
+          payload,
+        };
+        if (ssResult.orderId !== link.ss_order_id) {
+          linkUpdate.ssOrderId = ssResult.orderId;
+          linkUpdate.ssOrderNumber = ssResult.orderNumber;
+        }
+        shipstationLinkService.update(orderId, linkUpdate);
+      } catch (linkErr) {
+        console.warn(`${tag} link update failed (SS update succeeded): ${linkErr.message}`);
+      }
+
+      // Phase 36: append to ms_notes so the push shows up in
+      // Sytist's order detail. Non-fatal.
+      try {
+        const ctx = userContextFromReq(req);
+        let noteText = 'Sytist Dashboard: Packaging pushed to ShipStation';
+        const bits = [];
+        if (payload.weight?.value) bits.push(`${payload.weight.value}oz`);
+        if (storedPkg) bits.push(storedPkg);
+        if (payload.carrierCode && payload.serviceCode)
+          bits.push(`${payload.carrierCode}/${payload.serviceCode}`);
+        if (bits.length > 0) noteText += ' — ' + bits.join(', ');
+        if (drift) noteText += ' (⚠ SS reassigned package code)';
+        if (pathTaken !== 'update') noteText += ' (recreated)';
+        await sytistDb.insertNote({
+          orderId,
+          noteText,
+          who: ctx.userDisplayName,
+          ip: ctx.userIp,
+          isManual: false,
+        });
+      } catch (noteErr) {
+        console.warn(`${tag} ms_notes insert failed: ${noteErr.message}`);
+      }
+
+      res.json({
+        ok: true,
+        orderId: ssResult.orderId,
+        orderNumber: ssResult.orderNumber,
+        orderStatus: ssResult.orderStatus,
+        packageCodeSent: payload.packageCode,
+        packageCodeStored: storedPkg,
+        packageCodeDrift: drift,
+        carrierCode: payload.carrierCode,
+        serviceCode: payload.serviceCode,
+        weightOz: payload.weight?.value,
+        pathTaken, // 'update' | 'fresh_create' | 'fresh_create_after_404'
+      });
+    } catch (err) {
+      console.error(`${tag} unexpected error:`, err);
+      res.status(500).json({ ok: false, error: err.message });
     }
   }
 );
@@ -1658,18 +2245,29 @@ router.get('/imposition/text-variables', async (req, res) => {
 
 /**
  * POST /api/sytist/process/order/:orderId
- * Body: { generateDivider?: boolean }
+ * Body: { generateDivider?: boolean, reprint?: boolean, reason?: string }
  *
  * Synchronously processes one order. Returns the full result with every
  * sub-order's outcome. Auth required (any role).
+ *
+ * Phase 35: when reprint=true, the order is processed as a REPRINT —
+ * outputs land with a _REPRINT[_N] filename suffix, Sytist status is
+ * not changed, ShipStation is skipped. Useful for re-running a print
+ * job after damage/lost item without disturbing the original.
  */
 router.post('/process/order/:orderId', async (req, res) => {
   try {
     const order = await sytistDb.getOrderById(req.params.orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
+    const ctx = userContextFromReq(req);
     const result = await processingService.processOrder(order, {
       generateDivider: !!(req.body && req.body.generateDivider),
+      reprint: !!(req.body && req.body.reprint),
+      reason: req.body && req.body.reason ? String(req.body.reason).slice(0, 500) : null,
+      userId: ctx.userId,
+      userDisplayName: ctx.userDisplayName,
+      userIp: ctx.userIp,
     });
     res.json({ success: true, result });
   } catch (err) {
@@ -1677,6 +2275,58 @@ router.post('/process/order/:orderId', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+/**
+ * POST /api/sytist/process/order/:orderId/reprint-item/:cartId
+ * Body: { reason?: string }
+ *
+ * Phase 35: reprint a SINGLE line item of an order. Useful when one
+ * print got damaged or lost and only that line needs to be redone.
+ * Output filenames include both the reprint suffix and (implicitly,
+ * via the photo-filename pattern) the cartId so multiple single-item
+ * reprints can coexist.
+ *
+ * NO packing slip is produced for a single-item reprint — the
+ * operator already knows what they're reprinting. Just the .txt and
+ * the imposed sheet for that one line.
+ *
+ * Sytist status: untouched (matches whole-order reprint behavior).
+ * ShipStation: skipped (matches whole-order reprint behavior).
+ */
+router.post(
+  '/process/order/:orderId/reprint-item/:cartId',
+  async (req, res) => {
+    try {
+      const order = await sytistDb.getOrderById(req.params.orderId);
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+
+      const cartId = String(req.params.cartId);
+      const hasLine = (order.lineItems || []).some(
+        (li) => String(li.cartId) === cartId
+      );
+      if (!hasLine) {
+        return res.status(404).json({
+          error: `Order ${order.orderId} has no line item with cartId ${cartId}`,
+        });
+      }
+
+      const ctx = userContextFromReq(req);
+      const result = await processingService.processOrder(order, {
+        reprint: true,
+        lineItemFilter: [cartId],
+        reason:
+          req.body && req.body.reason ? String(req.body.reason).slice(0, 500) : null,
+        userId: ctx.userId,
+        userDisplayName: ctx.userDisplayName,
+        userIp: ctx.userIp,
+      });
+      res.json({ success: true, result });
+    } catch (err) {
+      console.error('[sytist/process/order/reprint-item]', err);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
 
 /**
  * POST /api/sytist/process/batch

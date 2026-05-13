@@ -1,0 +1,90 @@
+Phase 24 — Bigger designer, bigger bleed area, narrower right panel,
+            bigger settings text
+
+═══════════════════════════════════════════════════════
+WHAT THIS DOES
+═══════════════════════════════════════════════════════
+
+1. DESIGNER CANVAS BIGGER
+   TARGET_LONG_SIDE bumped from 700 → 950 pixels in LayoutDesignerPage.
+   The canvas takes more horizontal space on the page.
+
+2. BLEED AREA BIGGER
+   In LayoutCanvas, the viewBox padding around the canvas bumped
+   from 30% → 60% of the smaller canvas dimension. For a 6×4 canvas
+   that's 2.4″ of bleed on each side instead of 1.2″.
+
+3. RIGHT PANEL NARROWER
+   Grid columns changed from `${canvasWidth + 80}px 1fr` to `3fr 1fr`.
+   Now the right column takes ~25% of the row (was: everything left
+   over after a fixed-width canvas column).
+
+4. SETTINGS TEXT BIGGER
+   In SettingsForm.js — used by EVERY settings page in the app:
+     - FormRow label:      12 → 13
+     - FormRow hint:       11 → 12
+     - Input fontSize:     13 → 14  (TextInput, NumberInput, Select, TextArea)
+     - Button fontSize:    12 → 13
+     - settingsStyles.table fontSize: 12 → 13
+
+   This affects all of /settings/* (Paths, Add-ons, Packages,
+   Specialty, Composite, Imposition, etc.) — not just the designer.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/components/LayoutCanvas.js
+    bleedPaddingForLayout: 0.3 → 0.6
+
+  client/src/pages/settings/LayoutDesignerPage.js
+    TARGET_LONG_SIDE: 700 → 950
+    gridTemplateColumns: ratio-based 3fr 1fr
+
+  client/src/components/SettingsForm.js
+    FormRow label: 12 → 13
+    FormRow hint:  11 → 12
+    baseInputStyle fontSize: 13 → 14
+    Button fontSize: 12 → 13
+    settingsStyles.table fontSize: 12 → 13
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-24.tar.gz --strip-components=1
+
+You should see 3 file lines. Webpack picks up the changes. Hard
+refresh the designer.
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+Designer:
+  - Open Settings → Composite Layouts → into a layout. The canvas
+    should be noticeably bigger (~950 px target instead of 700).
+  - Dark bleed area around the canvas is roughly twice as wide as
+    before.
+  - The right column (Layers / Layout Properties / Graphics
+    Library cards) takes about 25% of the row width.
+
+Settings pages generally:
+  - Open Settings → Add-ons. Labels, inputs, table cells should
+    all read a little larger.
+  - Same for Settings → Packages, Settings → Paths, etc.
+
+If anything looks misaligned or cramped after the change, send a
+screenshot and I'll fine-tune.
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD client/src/components/LayoutCanvas.js
+  git checkout HEAD client/src/pages/settings/LayoutDesignerPage.js
+  git checkout HEAD client/src/components/SettingsForm.js
+
+Hard refresh.

@@ -44,6 +44,15 @@ export default function OrderDetailPage() {
     setShippingRefreshTrigger((n) => n + 1);
   }, []);
 
+  // Phase 36: bump this to trigger the OrderActivityCard to refetch.
+  // Wired into every action that writes a system note to ms_notes
+  // (Process, Reprint, Ship, Unship, Push Packaging) so the new note
+  // appears right away.
+  const [activityRefreshTrigger, setActivityRefreshTrigger] = useState(0);
+  const refreshActivity = useCallback(() => {
+    setActivityRefreshTrigger((n) => n + 1);
+  }, []);
+
   // Filter context from URL (Phase 14b). The orders list page
   // forwards its current filter state when navigating into the
   // detail page so prev/next can scope to the same set.
@@ -63,7 +72,11 @@ export default function OrderDetailPage() {
   // every render even when contents don't).
   const filterParamsKey = searchParams.toString();
 
-  useEffect(() => {
+  // Phase 28: extracted into a callback so child components can
+  // request a refetch after they mutate the order's status. The
+  // useEffect below calls this on mount and whenever orderId changes;
+  // child callbacks (ShipStatusBlock) call it after they save.
+  const reloadOrder = useCallback(() => {
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -92,6 +105,10 @@ export default function OrderDetailPage() {
       cancelled = true;
     };
   }, [orderId]);
+
+  useEffect(() => {
+    return reloadOrder();
+  }, [reloadOrder]);
 
   // Phase 14b: fetch neighbors whenever the order or the filter context
   // changes. Fast endpoint (a few small SQL queries), so we don't need
@@ -220,11 +237,23 @@ export default function OrderDetailPage() {
 
       <HeaderStrip order={order} teamCount={teamCount} />
 
-      <ProcessOrderBlock
+      {/* Phase 29: Process + Production Status merged into one
+          two-column card so the top of the page is more compact.
+          The body content of each block is rendered with `bare`
+          mode, then surrounded by a single shared card border
+          with a vertical divider between the columns. */}
+      <ProcessAndShipStatusRow
         order={order}
         teamCount={teamCount}
         isBundledHome={isBundledHome}
-        onProcessComplete={refreshShipping}
+        onProcessComplete={() => {
+          refreshShipping();
+          refreshActivity();
+        }}
+        onShipChanged={() => {
+          reloadOrder();
+          refreshActivity();
+        }}
       />
 
       {/* Phase 12: warn if the gallery has no logo set. Composites that
@@ -238,7 +267,8 @@ export default function OrderDetailPage() {
           order's relationship to ShipStation — eligible / not yet
           sent / sent / shipped — and provides controls to send and
           mark-as-shipped manually. Phase 13c: refreshTrigger lets
-          parent force a refetch after Process auto-creates a SS order. */}
+          parent force a refetch after Process auto-creates a SS order.
+          Phase 29: collapsed by default. */}
       <ShippingBlock order={order} refreshTrigger={shippingRefreshTrigger} />
 
       <div style={twoColumnStyle}>
@@ -274,6 +304,11 @@ export default function OrderDetailPage() {
       <TotalsBlock order={order} />
 
       <NotesBlocks order={order} />
+
+      <OrderActivityCard
+        orderId={order.orderId}
+        refreshKey={activityRefreshTrigger}
+      />
 
       <OutputPathsBlock orderId={order.orderId} />
 
@@ -589,6 +624,35 @@ function SubjectBlock({ fields }) {
 
 function LineItemsBlock({ order, groupByTeam }) {
   const lineItems = order.lineItems || [];
+
+  // Phase 44: fetch the per-cartId composed/composite thumbnail
+  // URL map. processOrder writes these URLs to the SQLite cache
+  // when Step 1.4 composes a green-screen image OR when the
+  // composite engine renders a product layout (Memory Mate, etc.).
+  // The thumbnails map is keyed by cart_id and gets passed down to
+  // each LineItemRow, which shows the rendered composite instead
+  // of the raw subject photo when one exists.
+  const [composedThumbnails, setComposedThumbnails] = useState({});
+  useEffect(() => {
+    let cancelled = false;
+    if (!order?.orderId) return undefined;
+    api
+      .get(`/api/sytist/orders/${order.orderId}/composed-thumbnails`)
+      .then((data) => {
+        if (cancelled) return;
+        if (data && data.ok && data.thumbnails) {
+          setComposedThumbnails(data.thumbnails);
+        }
+      })
+      .catch(() => {
+        // Non-fatal — cards fall back to existing photo thumbnail.
+        if (!cancelled) setComposedThumbnails({});
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [order?.orderId]);
+
   if (lineItems.length === 0) {
     return (
       <Card title="Line items">
@@ -619,7 +683,11 @@ function LineItemsBlock({ order, groupByTeam }) {
           </>
         }
       >
-        <LineItemList lineItems={lineItems} />
+        <LineItemList
+          order={order}
+          lineItems={lineItems}
+          composedThumbnails={composedThumbnails}
+        />
       </Card>
     );
   }
@@ -669,27 +737,86 @@ function LineItemsBlock({ order, groupByTeam }) {
               ({g.items.length} {g.items.length === 1 ? 'item' : 'items'})
             </span>
           </div>
-          <LineItemList lineItems={g.items} />
+          <LineItemList
+            order={order}
+            lineItems={g.items}
+            composedThumbnails={composedThumbnails}
+          />
         </div>
       ))}
     </Card>
   );
 }
 
-function LineItemList({ lineItems }) {
+function LineItemList({ order, lineItems, composedThumbnails = {} }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
       {lineItems.map((li, idx) => (
-        <LineItemRow key={li.cartId || idx} lineItem={li} />
+        <LineItemRow
+          key={li.cartId || idx}
+          order={order}
+          lineItem={li}
+          composedThumbnailUrl={composedThumbnails[String(li.cartId)] || null}
+        />
       ))}
     </div>
   );
 }
 
-function LineItemRow({ lineItem }) {
+function LineItemRow({ order, lineItem, composedThumbnailUrl = null }) {
   const photo = lineItem.photo;
   const backgroundPhoto = lineItem.backgroundPhoto;
   const flags = lineItem.flags || {};
+
+  // Phase 35: per-item reprint button — visible only when the
+  // parent order is in reprint state (status 39 Shipped or 40
+  // Printing). Reuses the same endpoint as ImpositionItemRow's
+  // version of the button, so clicking either produces the same
+  // result.
+  const currentStatusId = order?.productionStatus?.id ?? null;
+  const isReprintMode = currentStatusId === 39 || currentStatusId === 40;
+  const [reprinting, setReprinting] = useState(false);
+  const [reprintResult, setReprintResult] = useState(null);
+  const [reprintError, setReprintError] = useState(null);
+
+  async function handleReprintItem() {
+    // Phase 35 hotfix: removed window.confirm (consistent with the
+    // Phase 33 removal of the Process button's confirm — operators
+    // shouldn't have to click through dialogs on routine actions).
+    setReprinting(true);
+    setReprintError(null);
+    setReprintResult(null);
+    try {
+      const response = await api.post(
+        `/api/sytist/process/order/${order.orderId}/reprint-item/${lineItem.cartId}`,
+        {}
+      );
+      const r = response.result;
+      const sub = (r.subOrders || [])[0];
+      const txt = sub?.txtPath || sub?.specialtyTxtPath || null;
+      const sheet = (sub?.imposedSheets || [])[0]?.path || null;
+      setReprintResult({
+        ok: true,
+        suffix: r.reprintSuffix,
+        number: r.reprintNumber,
+        txt,
+        sheet,
+      });
+      // Phase 36: trigger Order Activity card refresh so the new
+      // ms_notes row appears without a page reload.
+      window.dispatchEvent(
+        new CustomEvent('sytist:activity-changed', {
+          detail: { orderId: order.orderId },
+        })
+      );
+    } catch (err) {
+      setReprintError(err.message);
+      setReprintResult({ ok: false, error: err.message });
+    } finally {
+      setReprinting(false);
+    }
+  }
+
   const flagChips = [];
   if (flags.greenScreen) flagChips.push({ label: 'Green Screen', color: '#37b6cf' });
   if (flags.download) flagChips.push({ label: 'Includes Download', color: '#9c6ade' });
@@ -766,36 +893,18 @@ function LineItemRow({ lineItem }) {
           overflow: 'hidden',
         }}
       >
-        {/* Background photo — only rendered for green-screen items.
-            Sits underneath the player PNG so its transparent areas
-            reveal it. */}
-        {bgUrl && (
-          <img
-            src={bgUrl}
-            alt=""
-            style={{
-              position: 'absolute',
-              inset: 0,
-              width: '100%',
-              height: '100%',
-              objectFit: 'cover',
-              display: 'block',
-            }}
-          />
-        )}
-
-        {playerUrl ? (
+        {composedThumbnailUrl ? (
+          // Phase 44: when a composed/composite thumbnail exists for
+          // this line item (from processOrder + S3 publish), show
+          // that single image. It's the actual rendered product
+          // (Memory Mate, etc.) or the composed green-screen subject
+          // on a chosen background — what gets printed and shipped.
+          // Click opens it full-size in a new tab.
           <a
-            href={playerUrl}
+            href={composedThumbnailUrl}
             target="_blank"
             rel="noopener noreferrer"
-            title={
-              bgUrl
-                ? `Composite preview · Background: ${
-                    backgroundPhoto.originalFilename || ''
-                  } · click to open player photo`
-                : 'Open full-size in new tab'
-            }
+            title="Composed preview (what will print) — click to open"
             style={{
               display: 'block',
               width: '100%',
@@ -804,10 +913,8 @@ function LineItemRow({ lineItem }) {
             }}
           >
             <img
-              // Phase 12: prefer fullUrl (un-watermarked original)
-              // over thumbUrl/largeUrl (both watermarked).
-              src={playerUrl}
-              alt={photo.originalFilename || ''}
+              src={composedThumbnailUrl}
+              alt="Composed preview"
               style={{
                 width: '100%',
                 height: '100%',
@@ -817,17 +924,71 @@ function LineItemRow({ lineItem }) {
             />
           </a>
         ) : (
-          <div
-            style={{
-              width: '100%',
-              height: '100%',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-            }}
-          >
-            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>no photo</span>
-          </div>
+          <>
+            {/* Background photo — only rendered for green-screen items.
+                Sits underneath the player PNG so its transparent areas
+                reveal it. */}
+            {bgUrl && (
+              <img
+                src={bgUrl}
+                alt=""
+                style={{
+                  position: 'absolute',
+                  inset: 0,
+                  width: '100%',
+                  height: '100%',
+                  objectFit: 'cover',
+                  display: 'block',
+                }}
+              />
+            )}
+
+            {playerUrl ? (
+              <a
+                href={playerUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                title={
+                  bgUrl
+                    ? `Composite preview · Background: ${
+                        backgroundPhoto.originalFilename || ''
+                      } · click to open player photo`
+                    : 'Open full-size in new tab'
+                }
+                style={{
+                  display: 'block',
+                  width: '100%',
+                  height: '100%',
+                  position: 'relative',
+                }}
+              >
+                <img
+                  // Phase 12: prefer fullUrl (un-watermarked original)
+                  // over thumbUrl/largeUrl (both watermarked).
+                  src={playerUrl}
+                  alt={photo.originalFilename || ''}
+                  style={{
+                    width: '100%',
+                    height: '100%',
+                    objectFit: 'cover',
+                    display: 'block',
+                  }}
+                />
+              </a>
+            ) : (
+              <div
+                style={{
+                  width: '100%',
+                  height: '100%',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+              >
+                <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>no photo</span>
+              </div>
+            )}
+          </>
         )}
       </div>
 
@@ -867,7 +1028,27 @@ function LineItemRow({ lineItem }) {
           }}
         >
           {lineItem.sku && <span>SKU {lineItem.sku}</span>}
-          {photo?.originalFilename && (
+          {photo?.originalFilename && photo?.fullUrl && (
+            <>
+              <span>·</span>
+              <a
+                href={photo.fullUrl}
+                download={photo.originalFilename}
+                target="_blank"
+                rel="noopener noreferrer"
+                title="Click to download the un-watermarked source photo"
+                style={{
+                  fontFamily: 'var(--font-mono, monospace)',
+                  color: 'var(--accent, #4a7fc1)',
+                  textDecoration: 'none',
+                  borderBottom: '1px dotted var(--accent, #4a7fc1)',
+                }}
+              >
+                {photo.originalFilename}
+              </a>
+            </>
+          )}
+          {photo?.originalFilename && !photo?.fullUrl && (
             <>
               <span>·</span>
               <span style={{ fontFamily: 'var(--font-mono, monospace)' }}>
@@ -882,6 +1063,28 @@ function LineItemRow({ lineItem }) {
                 {photo.width}×{photo.height}
                 {photo.width >= photo.height ? ' (H)' : ' (V)'}
               </span>
+            </>
+          )}
+          {/* Phase 37: background photo download link for green-screen items */}
+          {backgroundPhoto?.fullUrl && (
+            <>
+              <span>·</span>
+              <span style={{ color: 'var(--text-muted)' }}>Background:</span>
+              <a
+                href={backgroundPhoto.fullUrl}
+                download={backgroundPhoto.originalFilename || 'background.jpg'}
+                target="_blank"
+                rel="noopener noreferrer"
+                title="Click to download the chosen background photo"
+                style={{
+                  fontFamily: 'var(--font-mono, monospace)',
+                  color: 'var(--accent, #4a7fc1)',
+                  textDecoration: 'none',
+                  borderBottom: '1px dotted var(--accent, #4a7fc1)',
+                }}
+              >
+                {backgroundPhoto.originalFilename || 'background image'}
+              </a>
             </>
           )}
         </div>
@@ -944,6 +1147,87 @@ function LineItemRow({ lineItem }) {
             }}
           >
             {lineItem.notes}
+          </div>
+        )}
+
+        {isReprintMode && (
+          <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div>
+              <button
+                onClick={handleReprintItem}
+                disabled={reprinting}
+                title={`Reprint just this item — writes a _REPRINT .txt and imposed sheet for cartId ${lineItem.cartId} only`}
+                style={{
+                  background: '#d97706',
+                  border: '1px solid #d97706',
+                  color: '#fff',
+                  padding: '5px 12px',
+                  borderRadius: 6,
+                  fontSize: 11,
+                  fontWeight: 600,
+                  cursor: reprinting ? 'wait' : 'pointer',
+                  fontFamily: 'inherit',
+                  opacity: reprinting ? 0.6 : 1,
+                }}
+              >
+                {reprinting ? 'Reprinting…' : 'Reprint this item'}
+              </button>
+            </div>
+            {reprintError && (
+              <div
+                style={{
+                  padding: 8,
+                  background: 'rgba(220,53,69,0.1)',
+                  border: '1px solid rgba(220,53,69,0.3)',
+                  borderRadius: 4,
+                  color: '#dc3545',
+                  fontSize: 11,
+                }}
+              >
+                {reprintError}
+              </div>
+            )}
+            {reprintResult && reprintResult.ok && (
+              <div
+                style={{
+                  padding: 8,
+                  background: 'rgba(217,119,6,0.1)',
+                  border: '1px solid rgba(217,119,6,0.4)',
+                  borderRadius: 4,
+                  color: '#d97706',
+                  fontSize: 11,
+                }}
+              >
+                ✓ Reprinted as <code>{reprintResult.suffix}</code> (run #
+                {reprintResult.number}).
+                {reprintResult.txt && (
+                  <div
+                    style={{
+                      marginTop: 4,
+                      fontFamily: 'var(--font-mono, monospace)',
+                      fontSize: 10,
+                      wordBreak: 'break-all',
+                      color: 'var(--text-muted)',
+                    }}
+                  >
+                    .txt → {reprintResult.txt}
+                  </div>
+                )}
+                {reprintResult.sheet && (
+                  <div
+                    style={{
+                      marginTop: 2,
+                      fontFamily: 'var(--font-mono, monospace)',
+                      fontSize: 10,
+                      wordBreak: 'break-all',
+                      color: 'var(--text-muted)',
+                    }}
+                  >
+                    sheet → {reprintResult.sheet}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -1048,6 +1332,312 @@ function NotesBlocks({ order }) {
         </Card>
       )}
     </>
+  );
+}
+
+// ──────────────────────────────────────────────────────────
+// Order Activity — Phase 36 (ms_notes)
+// ──────────────────────────────────────────────────────────
+//
+// Surfaces the same activity log that Sytist's own order detail
+// page shows under "Notes". Includes:
+//   - System log entries written by Sytist itself ("Taylor changed
+//     to Shipped", "Order created by customer", etc.)
+//   - System log entries written by THIS dashboard (every action
+//     we take prefixes the body with "[Dashboard]")
+//   - Manual operator notes added from either Sytist OR our UI
+//
+// The card auto-refreshes when its `refreshKey` prop changes,
+// which lets the parent bump it after any action (Process, Ship,
+// Reprint, etc.) so the new system note shows up without the
+// operator pressing reload.
+//
+// Operators can add notes from this card (stored as is_note=1
+// manual notes in ms_notes) and soft-delete their own notes.
+
+function OrderActivityCard({ orderId, refreshKey }) {
+  const [notes, setNotes] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [newNoteText, setNewNoteText] = useState('');
+  const [adding, setAdding] = useState(false);
+  const [addError, setAddError] = useState(null);
+  const [deletingId, setDeletingId] = useState(null);
+
+  // Load notes whenever the orderId or refreshKey changes.
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    api
+      .get(`/api/sytist/orders/${orderId}/notes`)
+      .then((d) => {
+        if (cancelled) return;
+        setNotes(d.notes || []);
+        setLoading(false);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(err.message);
+        setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [orderId, refreshKey]);
+
+  // Phase 36: per-item reprint buttons live deep in the component
+  // tree (inside LineItemRow / ImpositionItemRow) and don't have
+  // easy access to the parent's refreshActivity callback. Rather
+  // than thread a callback through every layer, those components
+  // dispatch a CustomEvent on window when they finish, and we
+  // listen here. Same end result as a refreshKey bump.
+  const [eventRefreshKey, setEventRefreshKey] = useState(0);
+  useEffect(() => {
+    function handler(ev) {
+      if (!ev?.detail?.orderId) return;
+      if (String(ev.detail.orderId) !== String(orderId)) return;
+      setEventRefreshKey((n) => n + 1);
+    }
+    window.addEventListener('sytist:activity-changed', handler);
+    return () => window.removeEventListener('sytist:activity-changed', handler);
+  }, [orderId]);
+
+  // When the window event refreshes us, run the same fetch.
+  useEffect(() => {
+    if (eventRefreshKey === 0) return; // initial mount handled above
+    let cancelled = false;
+    api
+      .get(`/api/sytist/orders/${orderId}/notes`)
+      .then((d) => {
+        if (cancelled) return;
+        setNotes(d.notes || []);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(err.message);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [orderId, eventRefreshKey]);
+
+  async function handleAdd() {
+    const text = newNoteText.trim();
+    if (!text) return;
+    setAdding(true);
+    setAddError(null);
+    try {
+      const result = await api.post(`/api/sytist/orders/${orderId}/notes`, {
+        noteText: text,
+      });
+      // Prepend the new note so newest is at top, matching the
+      // list's existing sort.
+      setNotes((prev) => [result.note, ...prev]);
+      setNewNoteText('');
+    } catch (err) {
+      setAddError(err.message);
+    } finally {
+      setAdding(false);
+    }
+  }
+
+  async function handleDelete(noteId) {
+    setDeletingId(noteId);
+    try {
+      await api.del(`/api/sytist/orders/${orderId}/notes/${noteId}`);
+      setNotes((prev) => prev.filter((n) => n.id !== noteId));
+    } catch (err) {
+      // Surface as alert since the action is destructive.
+      // eslint-disable-next-line no-alert
+      alert(`Could not delete note: ${err.message}`);
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
+  function formatDate(d) {
+    if (!d) return '';
+    const dt = new Date(d);
+    if (Number.isNaN(dt.getTime())) return String(d);
+    return dt.toLocaleString(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+  }
+
+  return (
+    <Card title="Order activity">
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        {/* Add note input */}
+        <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+          <textarea
+            value={newNoteText}
+            onChange={(e) => setNewNoteText(e.target.value)}
+            placeholder="Add a note for this order…"
+            rows={2}
+            style={{
+              flex: 1,
+              padding: '8px 10px',
+              fontSize: 13,
+              fontFamily: 'inherit',
+              background: 'var(--bg-input)',
+              border: '1px solid var(--border-color)',
+              borderRadius: 6,
+              color: 'var(--text-primary)',
+              resize: 'vertical',
+              minHeight: 38,
+            }}
+            disabled={adding}
+          />
+          <button
+            onClick={handleAdd}
+            disabled={adding || !newNoteText.trim()}
+            style={{
+              background: '#4a7fc1',
+              border: '1px solid #4a7fc1',
+              color: '#fff',
+              padding: '8px 16px',
+              borderRadius: 6,
+              fontSize: 12,
+              fontWeight: 600,
+              cursor: adding || !newNoteText.trim() ? 'not-allowed' : 'pointer',
+              opacity: adding || !newNoteText.trim() ? 0.5 : 1,
+              fontFamily: 'inherit',
+              whiteSpace: 'nowrap',
+              alignSelf: 'flex-start',
+            }}
+          >
+            {adding ? 'Adding…' : 'Add note'}
+          </button>
+        </div>
+        {addError && (
+          <div
+            style={{
+              padding: 8,
+              background: 'rgba(220,53,69,0.1)',
+              border: '1px solid rgba(220,53,69,0.3)',
+              borderRadius: 4,
+              color: '#dc3545',
+              fontSize: 11,
+            }}
+          >
+            {addError}
+          </div>
+        )}
+
+        {/* Notes list */}
+        {loading && (
+          <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+            Loading activity…
+          </div>
+        )}
+        {error && (
+          <div
+            style={{
+              padding: 8,
+              background: 'rgba(220,53,69,0.1)',
+              border: '1px solid rgba(220,53,69,0.3)',
+              borderRadius: 4,
+              color: '#dc3545',
+              fontSize: 12,
+            }}
+          >
+            Could not load activity: {error}
+          </div>
+        )}
+        {!loading && !error && notes.length === 0 && (
+          <div style={{ fontSize: 12, color: 'var(--text-muted)', fontStyle: 'italic' }}>
+            No activity yet for this order.
+          </div>
+        )}
+        {!loading && !error && notes.length > 0 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
+            {notes.map((n, idx) => {
+              const isManual = n.type === 'note';
+              return (
+                <div
+                  key={n.id}
+                  style={{
+                    padding: '10px 0',
+                    borderBottom:
+                      idx < notes.length - 1
+                        ? '1px solid var(--border-color)'
+                        : 'none',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 4,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      fontSize: 11,
+                      color: 'var(--text-muted)',
+                    }}
+                  >
+                    <span
+                      style={{
+                        fontSize: 10,
+                        padding: '1px 6px',
+                        borderRadius: 4,
+                        background: isManual
+                          ? 'rgba(120,120,200,0.18)'
+                          : 'rgba(120,160,120,0.18)',
+                        color: isManual ? '#aab' : '#9c9',
+                        fontWeight: 600,
+                        textTransform: 'uppercase',
+                        letterSpacing: 0.5,
+                      }}
+                    >
+                      {isManual ? 'Note' : 'Log'}
+                    </span>
+                    <span style={{ fontWeight: 600 }}>{n.who || 'unknown'}</span>
+                    <span>·</span>
+                    <span>{formatDate(n.date)}</span>
+                    {isManual && (
+                      <button
+                        onClick={() => handleDelete(n.id)}
+                        disabled={deletingId === n.id}
+                        title="Delete this note (server enforces who can delete it)"
+                        style={{
+                          marginLeft: 'auto',
+                          background: 'transparent',
+                          border: '1px solid var(--border-color)',
+                          color: 'var(--text-muted)',
+                          padding: '2px 8px',
+                          borderRadius: 4,
+                          fontSize: 10,
+                          cursor: deletingId === n.id ? 'wait' : 'pointer',
+                          fontFamily: 'inherit',
+                        }}
+                      >
+                        {deletingId === n.id ? '…' : 'Delete'}
+                      </button>
+                    )}
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 13,
+                      color: 'var(--text-primary)',
+                      whiteSpace: 'pre-wrap',
+                      wordBreak: 'break-word',
+                    }}
+                  >
+                    {n.body}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </Card>
   );
 }
 
@@ -2093,6 +2683,15 @@ function ImpositionItemRow({ order, lineItem }) {
   const [saving, setSaving] = useState(false);
   const [savedPath, setSavedPath] = useState(null);
 
+  // Phase 35: per-item reprint state. The button is only visible
+  // when the order's production status indicates it's already been
+  // processed (status 39 Shipped or 40 Printing). Calls a dedicated
+  // endpoint that runs processingService.processOrder with a
+  // single-item filter, producing only the .txt and imposed sheet
+  // for this one line (no slip).
+  const [reprinting, setReprinting] = useState(false);
+  const [reprintResult, setReprintResult] = useState(null);
+
   const objectUrlRef = useRef(null);
   const infoFetchedRef = useRef(false);
   const imgFetchedRef = useRef(false);
@@ -2164,6 +2763,47 @@ function ImpositionItemRow({ order, lineItem }) {
       setSaving(false);
     }
   }
+
+  // Phase 35: reprint just this one line item.
+  // Phase 35 hotfix: removed window.confirm.
+  async function handleReprintItem() {
+    setReprinting(true);
+    setError(null);
+    setReprintResult(null);
+    try {
+      const response = await api.post(
+        `/api/sytist/process/order/${order.orderId}/reprint-item/${lineItem.cartId}`,
+        {}
+      );
+      const r = response.result;
+      // Build a friendly success summary
+      const sub = (r.subOrders || [])[0];
+      const txt = sub?.txtPath || sub?.specialtyTxtPath || null;
+      const sheet = (sub?.imposedSheets || [])[0]?.path || null;
+      setReprintResult({
+        ok: true,
+        suffix: r.reprintSuffix,
+        number: r.reprintNumber,
+        txt,
+        sheet,
+      });
+      // Phase 36: trigger Order Activity card refresh so the new
+      // ms_notes row appears without a page reload.
+      window.dispatchEvent(
+        new CustomEvent('sytist:activity-changed', {
+          detail: { orderId: order.orderId },
+        })
+      );
+    } catch (err) {
+      setError(err.message);
+      setReprintResult({ ok: false, error: err.message });
+    } finally {
+      setReprinting(false);
+    }
+  }
+
+  const currentStatusId = order?.productionStatus?.id ?? null;
+  const isReprintMode = currentStatusId === 39 || currentStatusId === 40;
 
   const noRule = info && !info.hasRule;
   const hasRule = info && info.hasRule;
@@ -2267,22 +2907,44 @@ function ImpositionItemRow({ order, lineItem }) {
         </div>
 
         {hasRule && (
-          <button
-            onClick={() => setExpanded((v) => !v)}
-            style={{
-              background: 'transparent',
-              border: '1px solid var(--border-color)',
-              color: 'var(--text-secondary)',
-              padding: '4px 10px',
-              borderRadius: 6,
-              fontSize: 11,
-              cursor: 'pointer',
-              fontFamily: 'inherit',
-              flexShrink: 0,
-            }}
-          >
-            {expanded ? 'Collapse' : 'Render preview'}
-          </button>
+          <div style={{ display: 'flex', gap: 8, flexShrink: 0, alignItems: 'center' }}>
+            {isReprintMode && (
+              <button
+                onClick={handleReprintItem}
+                disabled={reprinting}
+                title={`Reprint just this item — writes a _REPRINT .txt and imposed sheet for cartId ${lineItem.cartId} only`}
+                style={{
+                  background: '#d97706',
+                  border: '1px solid #d97706',
+                  color: '#fff',
+                  padding: '4px 10px',
+                  borderRadius: 6,
+                  fontSize: 11,
+                  fontWeight: 600,
+                  cursor: reprinting ? 'wait' : 'pointer',
+                  fontFamily: 'inherit',
+                  opacity: reprinting ? 0.6 : 1,
+                }}
+              >
+                {reprinting ? 'Reprinting…' : 'Reprint this item'}
+              </button>
+            )}
+            <button
+              onClick={() => setExpanded((v) => !v)}
+              style={{
+                background: 'transparent',
+                border: '1px solid var(--border-color)',
+                color: 'var(--text-secondary)',
+                padding: '4px 10px',
+                borderRadius: 6,
+                fontSize: 11,
+                cursor: 'pointer',
+                fontFamily: 'inherit',
+              }}
+            >
+              {expanded ? 'Collapse' : 'Render preview'}
+            </button>
+          </div>
         )}
       </div>
 
@@ -2299,6 +2961,49 @@ function ImpositionItemRow({ order, lineItem }) {
           }}
         >
           {error}
+        </div>
+      )}
+
+      {reprintResult && reprintResult.ok && (
+        <div
+          style={{
+            marginTop: 8,
+            padding: 8,
+            background: 'rgba(217,119,6,0.1)',
+            border: '1px solid rgba(217,119,6,0.4)',
+            borderRadius: 4,
+            color: '#d97706',
+            fontSize: 11,
+          }}
+        >
+          ✓ Reprinted as <code>{reprintResult.suffix}</code> (run #
+          {reprintResult.number}).
+          {reprintResult.txt && (
+            <div
+              style={{
+                marginTop: 4,
+                fontFamily: 'var(--font-mono, monospace)',
+                fontSize: 10,
+                wordBreak: 'break-all',
+                color: 'var(--text-muted)',
+              }}
+            >
+              .txt → {reprintResult.txt}
+            </div>
+          )}
+          {reprintResult.sheet && (
+            <div
+              style={{
+                marginTop: 2,
+                fontFamily: 'var(--font-mono, monospace)',
+                fontSize: 10,
+                wordBreak: 'break-all',
+                color: 'var(--text-muted)',
+              }}
+            >
+              sheet → {reprintResult.sheet}
+            </div>
+          )}
         </div>
       )}
 
@@ -2385,6 +3090,85 @@ function ImpositionItemRow({ order, lineItem }) {
 }
 
 // ──────────────────────────────────────────────────────────
+// ProcessAndShipStatusRow (Phase 29)
+// ──────────────────────────────────────────────────────────
+//
+// Two-column row that combines the "Process this order" panel
+// on the left with the production-status / ship controls on the
+// right. Replaces what used to be two stacked full-width cards
+// (ProcessOrderBlock + ShipStatusBlock), saving vertical space
+// at the top of the order detail page.
+//
+// Each child renders in `bare` mode so we control the shared
+// card border + vertical divider from here. On narrow screens
+// the columns wrap to a single column thanks to flex-wrap.
+
+function ProcessAndShipStatusRow({
+  order,
+  teamCount,
+  isBundledHome,
+  onProcessComplete,
+  onShipChanged,
+}) {
+  return (
+    <div
+      style={{
+        marginBottom: 20,
+        padding: 16,
+        background: 'var(--bg-card)',
+        border: '1px solid var(--border-color)',
+        borderRadius: 8,
+        display: 'flex',
+        gap: 24,
+        flexWrap: 'wrap',
+        alignItems: 'stretch',
+      }}
+    >
+      {/* LEFT: Process this order */}
+      <div style={{ flex: '1 1 320px', minWidth: 280 }}>
+        <ProcessOrderBlock
+          order={order}
+          teamCount={teamCount}
+          isBundledHome={isBundledHome}
+          onProcessComplete={onProcessComplete}
+          bare
+        />
+      </div>
+
+      {/* Vertical divider — only visible when columns sit side-by-side.
+          Below the wrap breakpoint flex-wrap stacks them and the
+          divider naturally falls off-screen via flex-wrap behavior. */}
+      <div
+        aria-hidden
+        style={{
+          width: 1,
+          background: 'var(--border-color)',
+          alignSelf: 'stretch',
+          flex: '0 0 1px',
+        }}
+      />
+
+      {/* RIGHT: Production status / ship controls */}
+      <div style={{ flex: '1 1 320px', minWidth: 280 }}>
+        <div
+          style={{
+            fontSize: 11,
+            fontWeight: 600,
+            textTransform: 'uppercase',
+            letterSpacing: 0.5,
+            color: 'var(--text-muted)',
+            marginBottom: 12,
+          }}
+        >
+          Production Status
+        </div>
+        <ShipStatusBlock order={order} onChanged={onShipChanged} bare />
+      </div>
+    </div>
+  );
+}
+
+// ──────────────────────────────────────────────────────────
 // Process order (Phase 4.6)
 // ──────────────────────────────────────────────────────────
 //
@@ -2398,7 +3182,7 @@ function ImpositionItemRow({ order, lineItem }) {
 // feature is preserved server-side for the future multi-order
 // flow; this just keeps the UI honest about when it applies.
 
-function ProcessOrderBlock({ order, teamCount, isBundledHome, onProcessComplete }) {
+function ProcessOrderBlock({ order, teamCount, isBundledHome, onProcessComplete, bare }) {
   const [processing, setProcessing] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
@@ -2408,16 +3192,18 @@ function ProcessOrderBlock({ order, teamCount, isBundledHome, onProcessComplete 
     (order.shipping?.workflow === 'ship_to_managers' ||
       order.shipping?.workflow === 'ship_to_league');
 
+  // Phase 35: detect reprint state. Order has already been at least
+  // partially processed if its production status is Printing (40) or
+  // Shipped (39). When in either state, the Process button becomes
+  // a Reprint button and POSTs with reprint:true. Output filenames
+  // include _REPRINT[_N] so reprints don't clobber the originals.
+  const currentStatusId = order?.productionStatus?.id ?? null;
+  const isReprintMode = currentStatusId === 39 || currentStatusId === 40;
+
   async function handleProcess() {
-    if (
-      !window.confirm(
-        `Process order ${order.orderNumber || order.orderId}?\n\n` +
-          `This will download photos, run imposition, and write the .txt file ` +
-          `that triggers Darkroom. Make sure you're in TEST mode if this is a dry run.`
-      )
-    ) {
-      return;
-    }
+    // Phase 33: no confirm dialog for fresh Process.
+    // Phase 35 hotfix: also no confirm dialog for reprint — consistent
+    // with the rest of the page's no-confirm policy on routine actions.
 
     setProcessing(true);
     setError(null);
@@ -2425,14 +3211,9 @@ function ProcessOrderBlock({ order, teamCount, isBundledHome, onProcessComplete 
     try {
       const response = await api.post(
         `/api/sytist/process/order/${order.orderId}`,
-        // Phase 12: no generateDivider flag — single-order processing
-        // never produces dividers. Server defaults to false when absent.
-        {}
+        isReprintMode ? { reprint: true } : {}
       );
       setResult(response.result);
-      // Phase 13c: tell parent to refresh the Shipping card since
-      // Process now also auto-creates a ShipStation order. The card's
-      // linked-state UI replaces its "click Send" form on success.
       if (onProcessComplete) onProcessComplete();
     } catch (err) {
       setError(err.message);
@@ -2441,19 +3222,26 @@ function ProcessOrderBlock({ order, teamCount, isBundledHome, onProcessComplete 
     }
   }
 
-  return (
-    <div
-      style={{
-        marginBottom: 20,
-        padding: 16,
-        background: 'var(--bg-card)',
-        border: '1px solid var(--border-color)',
-        borderRadius: 8,
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 12,
-      }}
-    >
+  // Compute button label + descriptive subtitle based on reprint state.
+  const buttonLabel = processing
+    ? isReprintMode
+      ? 'Reprinting…'
+      : 'Processing…'
+    : isReprintMode
+      ? 'Reprint this order'
+      : 'Process this order';
+
+  const headerLabel = isReprintMode ? 'Reprint this order' : 'Process this order';
+
+  // Reprint button gets a different color so it stands out as the
+  // "less-routine" action and the operator pauses before clicking.
+  const buttonColor = isReprintMode ? '#d97706' : '#4a7fc1';
+
+  // Phase 29: when `bare` is true, render without the outer card
+  // wrapper so we can compose this block as a column inside a
+  // shared card (ProcessAndShipStatusRow). The body is identical.
+  const body = (
+    <>
       <div
         style={{
           display: 'flex',
@@ -2464,12 +3252,27 @@ function ProcessOrderBlock({ order, teamCount, isBundledHome, onProcessComplete 
         }}
       >
         <div>
-          <div style={{ fontSize: 14, fontWeight: 600 }}>Process this order</div>
+          <div style={{ fontSize: 14, fontWeight: 600 }}>{headerLabel}</div>
           <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
-            Downloads photos, runs imposition, writes slip + .txt to the configured
-            output path.{' '}
-            {isPerTeam && teamCount > 1 && (
-              <strong>{teamCount} sub-orders will be created (one per team).</strong>
+            {isReprintMode ? (
+              <>
+                Order is{' '}
+                <strong>
+                  {currentStatusId === 39 ? 'Shipped' : 'in Printing'}
+                </strong>
+                . A reprint writes <code>_REPRINT</code> files alongside the
+                originals. Sytist status and ShipStation are not touched.
+              </>
+            ) : (
+              <>
+                Downloads photos, runs imposition, writes slip + .txt to the
+                configured output path.{' '}
+                {isPerTeam && teamCount > 1 && (
+                  <strong>
+                    {teamCount} sub-orders will be created (one per team).
+                  </strong>
+                )}
+              </>
             )}
           </div>
         </div>
@@ -2479,8 +3282,8 @@ function ProcessOrderBlock({ order, teamCount, isBundledHome, onProcessComplete 
             onClick={handleProcess}
             disabled={processing}
             style={{
-              background: '#4a7fc1',
-              border: '1px solid #4a7fc1',
+              background: buttonColor,
+              border: `1px solid ${buttonColor}`,
               color: '#ffffff',
               padding: '8px 18px',
               borderRadius: 6,
@@ -2491,7 +3294,7 @@ function ProcessOrderBlock({ order, teamCount, isBundledHome, onProcessComplete 
               opacity: processing ? 0.6 : 1,
             }}
           >
-            {processing ? 'Processing…' : 'Process this order'}
+            {buttonLabel}
           </button>
         </div>
       </div>
@@ -2512,6 +3315,31 @@ function ProcessOrderBlock({ order, teamCount, isBundledHome, onProcessComplete 
       )}
 
       {result && <ProcessResultDisplay result={result} />}
+    </>
+  );
+
+  if (bare) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        {body}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      style={{
+        marginBottom: 20,
+        padding: 16,
+        background: 'var(--bg-card)',
+        border: '1px solid var(--border-color)',
+        borderRadius: 8,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 12,
+      }}
+    >
+      {body}
     </div>
   );
 }
@@ -2609,6 +3437,293 @@ function LogoWarningBanner({ galleryId }) {
 }
 
 // ──────────────────────────────────────────────────────────
+// ShipStatusBlock (Phase 28 — manual ship/unship)
+// ──────────────────────────────────────────────────────────
+//
+// Renders the order's current production-status with controls to
+// transition it to Shipped (or back to Printing as an override).
+// Works for ALL workflows including ship_to_managers and
+// ship_to_league where there's no ShipStation step to trigger the
+// shipped state automatically.
+//
+// Three visual states:
+//   1. Eligible to ship (status in shipEligibleFromStatusIds, default
+//      [40] = Printing) → "Mark Shipped" button (primary)
+//   2. Already shipped (status === shippedStatusId, default 39) →
+//      "Mark Back to Printing" ghost button (override)
+//   3. Anywhere else (Queue, etc.) → muted info card explaining why
+//      shipping isn't available yet
+
+function ShipStatusBlock({ order, onChanged, bare }) {
+  const [busy, setBusy] = useState(false);
+  const [confirmAction, setConfirmAction] = useState(null);
+  // confirmAction: null | 'ship' | 'unship'
+  const [error, setError] = useState(null);
+
+  const currentStatusId = order?.productionStatus?.id ?? null;
+  const currentStatusName = order?.productionStatus?.name || '';
+
+  // These constants mirror processing-settings.json defaults. If the
+  // operator has changed them server-side, the API will still validate
+  // — these are only used for UI hint text and which button to show.
+  const SHIPPED_STATUS_ID = 39;
+  const ELIGIBLE_FROM = [40];
+
+  const isShipped = currentStatusId === SHIPPED_STATUS_ID;
+  const isEligible = ELIGIBLE_FROM.includes(currentStatusId);
+
+  async function doShip(force) {
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await api.post(`/api/sytist/orders/${order.orderId}/ship`, {
+        force: !!force,
+      });
+      if (!r.ok) {
+        setError(r.error || 'Ship failed');
+        return;
+      }
+      setConfirmAction(null);
+      if (onChanged) onChanged();
+    } catch (err) {
+      // api.post throws on non-2xx; extract the server error message.
+      setError(err.message || 'Ship failed');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function doUnship() {
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await api.post(
+        `/api/sytist/orders/${order.orderId}/unship`,
+        {}
+      );
+      if (!r.ok) {
+        setError(r.error || 'Unship failed');
+        return;
+      }
+      setConfirmAction(null);
+      if (onChanged) onChanged();
+    } catch (err) {
+      setError(err.message || 'Unship failed');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Phase 29: dropped "(id 0)" suffix from the status display, and
+  // factored the body out so we can render either standalone (in a
+  // Card) or bare (as a column inside ProcessAndShipStatusRow).
+  const body = (
+    <>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 12,
+          flexWrap: 'wrap',
+        }}
+      >
+        <div>
+          <div style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 4 }}>
+            Current status
+          </div>
+          <div style={{ fontSize: 16, fontWeight: 600 }}>
+            {currentStatusName || `Status ${currentStatusId}`}
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          {isEligible && !isShipped && (
+            <button
+              type="button"
+              onClick={() => setConfirmAction('ship')}
+              disabled={busy}
+              style={primaryShipBtnStyle(busy)}
+            >
+              Mark Shipped
+            </button>
+          )}
+          {isShipped && (
+            <button
+              type="button"
+              onClick={() => setConfirmAction('unship')}
+              disabled={busy}
+              style={ghostBtnStyle(busy)}
+            >
+              ← Mark Back to Printing
+            </button>
+          )}
+          {!isEligible && !isShipped && (
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', maxWidth: 260, textAlign: 'right' }}>
+              Order must be in Printing status to ship.
+              Process the order first to advance it.
+            </div>
+          )}
+        </div>
+      </div>
+
+      {error && (
+        <div
+          style={{
+            marginTop: 12,
+            padding: '8px 12px',
+            background: 'rgba(220,53,69,0.1)',
+            border: '1px solid rgba(220,53,69,0.4)',
+            borderRadius: 6,
+            color: '#dc3545',
+            fontSize: 13,
+          }}
+        >
+          {error}
+        </div>
+      )}
+
+      {confirmAction && (
+        <ConfirmModal
+          title={
+            confirmAction === 'ship'
+              ? 'Mark order as shipped?'
+              : 'Reverse shipped status?'
+          }
+          message={
+            confirmAction === 'ship'
+              ? `Order ${order.orderId} will be marked as shipped (status → ${SHIPPED_STATUS_ID}). This is logged.`
+              : `Order ${order.orderId} will return to Printing (status → ${ELIGIBLE_FROM[0]}). This override is logged. Only use if the order was marked shipped by mistake.`
+          }
+          confirmLabel={
+            busy
+              ? '…'
+              : confirmAction === 'ship'
+                ? 'Yes, mark shipped'
+                : 'Yes, revert to Printing'
+          }
+          danger={confirmAction === 'unship'}
+          onConfirm={confirmAction === 'ship' ? () => doShip(false) : doUnship}
+          onCancel={() => setConfirmAction(null)}
+          busy={busy}
+        />
+      )}
+    </>
+  );
+
+  if (bare) return body;
+  return <Card title="Production Status">{body}</Card>;
+}
+
+function primaryShipBtnStyle(disabled) {
+  return {
+    padding: '10px 18px',
+    background: disabled ? 'rgba(76,175,80,0.4)' : '#4caf50',
+    color: '#fff',
+    border: 'none',
+    borderRadius: 6,
+    fontSize: 14,
+    fontWeight: 600,
+    cursor: disabled ? 'wait' : 'pointer',
+    fontFamily: 'inherit',
+  };
+}
+
+function ghostBtnStyle(disabled) {
+  return {
+    padding: '8px 14px',
+    background: 'transparent',
+    color: 'var(--text-muted)',
+    border: '1px solid var(--border-color)',
+    borderRadius: 6,
+    fontSize: 13,
+    cursor: disabled ? 'wait' : 'pointer',
+    fontFamily: 'inherit',
+  };
+}
+
+function ConfirmModal({ title, message, confirmLabel, danger, onConfirm, onCancel, busy }) {
+  // Close on Escape
+  useEffect(() => {
+    function onKey(e) {
+      if (e.key === 'Escape' && !busy) onCancel();
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [busy, onCancel]);
+
+  return (
+    <div
+      onClick={busy ? undefined : onCancel}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0,0,0,0.6)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        zIndex: 1000,
+        padding: 24,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: 'var(--bg-card)',
+          border: '1px solid var(--border-color)',
+          borderRadius: 8,
+          padding: 24,
+          width: '100%',
+          maxWidth: 480,
+        }}
+      >
+        <h3 style={{ margin: '0 0 8px', fontSize: 16, fontWeight: 600 }}>{title}</h3>
+        <div style={{ fontSize: 14, color: 'var(--text-secondary)', marginBottom: 20 }}>
+          {message}
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={busy}
+            style={{
+              padding: '8px 14px',
+              background: 'transparent',
+              color: 'var(--text-secondary)',
+              border: '1px solid var(--border-color)',
+              borderRadius: 6,
+              fontSize: 13,
+              cursor: busy ? 'wait' : 'pointer',
+              fontFamily: 'inherit',
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={busy}
+            style={{
+              padding: '8px 18px',
+              background: danger ? '#dc3545' : '#4caf50',
+              color: '#fff',
+              border: 'none',
+              borderRadius: 6,
+              fontSize: 14,
+              fontWeight: 600,
+              cursor: busy ? 'wait' : 'pointer',
+              fontFamily: 'inherit',
+            }}
+          >
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ──────────────────────────────────────────────────────────
 // ShippingBlock (Phase 13a — ShipStation integration)
 // ──────────────────────────────────────────────────────────
 //
@@ -2629,6 +3744,12 @@ function ShippingBlock({ order, refreshTrigger }) {
   const [error, setError] = useState(null);
   const [status, setStatus] = useState(null);
 
+  // Phase 29: collapsed by default. Operator clicks the chevron to
+  // expand and see the full Eligibility / form / linked panel. Reset
+  // on every navigation (state lives on the component, which
+  // unmounts when the user moves between orders).
+  const [expanded, setExpanded] = useState(false);
+
   // Form values for the "Send" action. Initialized from app-settings
   // defaults once, then operator can override per-send. Not stored
   // back to settings — that'd require explicit "Save defaults"
@@ -2647,6 +3768,11 @@ function ShippingBlock({ order, refreshTrigger }) {
   const [refreshing, setRefreshing] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [markingShipped, setMarkingShipped] = useState(false);
+
+  // Phase 33: opt-in push of current packaging to existing SS order.
+  // Separate from the regular Process flow which doesn't auto-push.
+  const [pushingPackaging, setPushingPackaging] = useState(false);
+  const [pushResult, setPushResult] = useState(null);
 
   // Mark-shipped form (collapsed by default)
   const [showShipForm, setShowShipForm] = useState(false);
@@ -2835,6 +3961,50 @@ function ShippingBlock({ order, refreshTrigger }) {
     }
   }
 
+  // Phase 33: opt-in push of current packaging to an already-linked
+  // SS order. Recomputes the packaging payload from the latest
+  // Sytist state and upserts to the existing SS order. Used when
+  // the operator changes weight/addons/etc. and needs SS to reflect
+  // it. Reprocessing the order does NOT do this by default — this
+  // button is the explicit opt-in.
+  async function handlePushPackaging() {
+    if (
+      !window.confirm(
+        `Push current packaging to ShipStation?\n\n` +
+          `This will overwrite the weight, dimensions, carrier, ` +
+          `service, and package on the SS side with what the ` +
+          `dashboard's packaging engine currently recommends.`
+      )
+    ) {
+      return;
+    }
+    setPushingPackaging(true);
+    setError(null);
+    setPushResult(null);
+    try {
+      const r = await api.post(
+        `/api/sytist/orders/${order.orderId}/push-packaging`,
+        {}
+      );
+      setPushResult({
+        ok: true,
+        message: `Pushed to SS#${r.orderId} — ${r.carrierCode}/${r.serviceCode}, ${r.packageCodeStored}, ${r.weightOz}oz${r.packageCodeDrift ? ' (⚠ SS reassigned package code)' : ''}`,
+      });
+      await refreshStatus();
+      // Phase 36: bump the Order Activity card too.
+      window.dispatchEvent(
+        new CustomEvent('sytist:activity-changed', {
+          detail: { orderId: order.orderId },
+        })
+      );
+    } catch (err) {
+      setError(err.message);
+      setPushResult({ ok: false, message: err.message });
+    } finally {
+      setPushingPackaging(false);
+    }
+  }
+
   // ─── render ────────────────────────────────────────────
 
   if (loading) {
@@ -2918,6 +4088,20 @@ function ShippingBlock({ order, refreshTrigger }) {
     );
   }
 
+  // Phase 29: collapsed-by-default. When `expanded` is false, render
+  // a single-line summary instead of the full eligibility/form/linked
+  // panel. The summary adapts to the four possible states (shipped /
+  // linked-not-shipped / eligible / not-eligible) and includes
+  // tracking info inline when the order is shipped.
+  if (!expanded) {
+    return (
+      <CollapsedShippingHeader
+        status={status}
+        onExpand={() => setExpanded(true)}
+      />
+    );
+  }
+
   // CASE: linked (already sent to ShipStation)
   if (status?.linked && status.link) {
     return (
@@ -2936,6 +4120,10 @@ function ShippingBlock({ order, refreshTrigger }) {
         onRefetch={handleRefetch}
         onDelete={handleDelete}
         onMarkShipped={handleMarkShipped}
+        onPushPackaging={handlePushPackaging}
+        pushingPackaging={pushingPackaging}
+        pushResult={pushResult}
+        onCollapse={() => setExpanded(false)}
       />
     );
   }
@@ -2948,15 +4136,26 @@ function ShippingBlock({ order, refreshTrigger }) {
     <div style={containerStyle}>
       <div style={headerRowStyle}>
         <div style={headerStyle}>Shipping</div>
-        <div
-          style={{
-            fontSize: 11,
-            color: 'var(--text-muted)',
-            textTransform: 'uppercase',
-            letterSpacing: 0.5,
-          }}
-        >
-          ShipStation
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+          <div
+            style={{
+              fontSize: 11,
+              color: 'var(--text-muted)',
+              textTransform: 'uppercase',
+              letterSpacing: 0.5,
+            }}
+          >
+            ShipStation
+          </div>
+          <button
+            type="button"
+            onClick={() => setExpanded(false)}
+            aria-label="Minimize"
+            title="Minimize"
+            style={collapseBtnStyle}
+          >
+            ▴
+          </button>
         </div>
       </div>
 
@@ -3128,6 +4327,10 @@ function LinkedShippingPanel({
   onRefetch,
   onDelete,
   onMarkShipped,
+  onPushPackaging,
+  pushingPackaging,
+  pushResult,
+  onCollapse,
 }) {
   const isShipped = link.ss_order_status === 'shipped';
 
@@ -3135,15 +4338,28 @@ function LinkedShippingPanel({
     <div style={containerStyle}>
       <div style={headerRowStyle}>
         <div style={headerStyle}>Shipping</div>
-        <div
-          style={{
-            fontSize: 11,
-            color: 'var(--text-muted)',
-            textTransform: 'uppercase',
-            letterSpacing: 0.5,
-          }}
-        >
-          ShipStation
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+          <div
+            style={{
+              fontSize: 11,
+              color: 'var(--text-muted)',
+              textTransform: 'uppercase',
+              letterSpacing: 0.5,
+            }}
+          >
+            ShipStation
+          </div>
+          {onCollapse && (
+            <button
+              type="button"
+              onClick={onCollapse}
+              aria-label="Minimize"
+              title="Minimize"
+              style={collapseBtnStyle}
+            >
+              ▴
+            </button>
+          )}
         </div>
       </div>
 
@@ -3202,6 +4418,15 @@ function LinkedShippingPanel({
         <SecondaryButton onClick={onRefetch} disabled={refreshing}>
           {refreshing ? 'Re-fetching…' : 'Re-fetch status'}
         </SecondaryButton>
+        {!isShipped && onPushPackaging && (
+          <SecondaryButton
+            onClick={onPushPackaging}
+            disabled={pushingPackaging}
+            title="Recompute packaging and push to ShipStation (overwrites SS-side weight/carrier/package)"
+          >
+            {pushingPackaging ? 'Pushing…' : 'Push packaging to ShipStation'}
+          </SecondaryButton>
+        )}
         {!isShipped && (
           <SecondaryButton
             onClick={() => setShowShipForm((v) => !v)}
@@ -3214,6 +4439,25 @@ function LinkedShippingPanel({
           {deleting ? 'Deleting…' : 'Delete SS order'}
         </SecondaryButton>
       </div>
+
+      {pushResult && (
+        <div
+          style={{
+            marginTop: 12,
+            padding: '8px 12px',
+            background: pushResult.ok
+              ? 'rgba(76,175,80,0.1)'
+              : 'rgba(220,53,69,0.1)',
+            border: `1px solid ${pushResult.ok ? 'rgba(76,175,80,0.4)' : 'rgba(220,53,69,0.4)'}`,
+            borderRadius: 6,
+            color: pushResult.ok ? '#4caf50' : '#dc3545',
+            fontSize: 12,
+          }}
+        >
+          {pushResult.ok ? '✓ ' : '⚠ '}
+          {pushResult.message}
+        </div>
+      )}
 
       {showShipForm && !isShipped && (
         <div
@@ -3358,6 +4602,188 @@ const shippingErrorBoxStyle = {
   color: '#dc3545',
   fontSize: 12,
 };
+
+// Phase 29: shared minimize / expand chevron button style used by
+// CollapsedShippingHeader and both expanded-view headers.
+const collapseBtnStyle = {
+  background: 'transparent',
+  border: '1px solid var(--border-color)',
+  color: 'var(--text-secondary)',
+  width: 28,
+  height: 22,
+  borderRadius: 4,
+  fontSize: 12,
+  cursor: 'pointer',
+  fontFamily: 'inherit',
+  padding: 0,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+};
+
+// ──────────────────────────────────────────────────────────
+// CollapsedShippingHeader (Phase 29)
+// ──────────────────────────────────────────────────────────
+//
+// One-line summary of the order's ShipStation state with an
+// expand chevron. Adapts to four sub-states:
+//
+//   1. Shipped (link.ss_order_status === 'shipped')
+//        "Shipping · ✓ Shipped · USPS · 9400…"
+//
+//   2. Linked but not yet shipped
+//        "Shipping · Sent to ShipStation"
+//
+//   3. Not linked, eligible
+//        "Shipping · Eligible"   (or "Eligible · 9x11 Flat Mailer · 4oz"
+//                                 if the engine returned a suggestion)
+//
+//   4. Not linked, not eligible
+//        "Shipping · Not eligible"
+
+function CollapsedShippingHeader({ status, onExpand }) {
+  // Determine state and summary text from the status payload.
+  const link = status?.link;
+  const isLinked = !!status?.linked && !!link;
+  const isShipped = isLinked && link.ss_order_status === 'shipped';
+  const eligibility = status?.eligibility || {};
+  const isEligible = !!eligibility.eligible;
+  const packaging = status?.packaging || null;
+
+  let badgeText;
+  let badgeColor;
+  let summary = null;
+  let trackingNode = null;
+
+  if (isShipped) {
+    badgeText = '✓ Shipped';
+    badgeColor = '#4caf50';
+    if (link.tracking_number) {
+      trackingNode = (
+        <>
+          {' '}
+          ·{' '}
+          <span style={{ color: 'var(--text-primary)' }}>
+            {(link.carrier_code || 'carrier').toUpperCase()}{' '}
+            <code style={{ fontFamily: 'var(--font-mono, monospace)' }}>
+              {link.tracking_number}
+            </code>
+          </span>
+        </>
+      );
+    }
+  } else if (isLinked) {
+    badgeText = 'Sent to ShipStation';
+    badgeColor = '#4caf50';
+    if (link.carrier_code && link.service_code) {
+      summary = `${link.carrier_code}/${link.service_code}`;
+    }
+  } else if (isEligible) {
+    badgeText = 'Eligible';
+    badgeColor = '#4caf50';
+    if (packaging && packaging.size_label) {
+      const bits = [];
+      bits.push(packaging.size_label);
+      if (packaging.total_weight_oz) {
+        bits.push(`${packaging.total_weight_oz}oz`);
+      }
+      if (packaging.carrier_code) {
+        bits.push(packaging.carrier_code);
+      }
+      summary = bits.join(' · ');
+    }
+  } else {
+    badgeText = 'Not eligible';
+    badgeColor = 'var(--text-muted)';
+    if (eligibility.reason) {
+      summary = eligibility.reason;
+    }
+  }
+
+  return (
+    <div
+      style={{
+        ...containerStyle,
+        padding: '10px 16px',
+        cursor: 'pointer',
+      }}
+      onClick={onExpand}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onExpand();
+        }
+      }}
+    >
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          gap: 12,
+          flexWrap: 'wrap',
+        }}
+      >
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            flex: 1,
+            minWidth: 0,
+            fontSize: 13,
+          }}
+        >
+          <span style={{ ...headerStyle, fontSize: 14 }}>Shipping</span>
+          <span style={{ color: 'var(--text-muted)' }}>·</span>
+          <strong style={{ color: badgeColor }}>{badgeText}</strong>
+          {summary && (
+            <>
+              <span style={{ color: 'var(--text-muted)' }}>·</span>
+              <span
+                style={{
+                  color: 'var(--text-secondary)',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {summary}
+              </span>
+            </>
+          )}
+          {trackingNode}
+        </div>
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+          <div
+            style={{
+              fontSize: 11,
+              color: 'var(--text-muted)',
+              textTransform: 'uppercase',
+              letterSpacing: 0.5,
+            }}
+          >
+            ShipStation
+          </div>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onExpand();
+            }}
+            aria-label="Expand"
+            title="Expand"
+            style={collapseBtnStyle}
+          >
+            ▾
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function ProcessResultDisplay({ result }) {
   const allOk = result.subOrders.every((s) => s.success);

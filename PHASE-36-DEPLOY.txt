@@ -1,0 +1,268 @@
+Phase 36 — Sytist ms_notes integration
+
+═══════════════════════════════════════════════════════
+SUMMARY
+═══════════════════════════════════════════════════════
+
+This phase plugs the dashboard into Sytist's existing `ms_notes`
+activity log. Two things happen:
+
+1. WRITES: Every meaningful dashboard action (process, reprint,
+   ship, unship, push packaging) appends a row to ms_notes so the
+   action shows up in Sytist's native order detail page next to
+   Sytist's own log entries.
+
+2. READS: A new "Order activity" card on our order detail page
+   shows the full ms_notes history — Sytist's entries AND ours —
+   and lets operators add manual notes that ALSO appear in
+   Sytist's UI.
+
+The integration is non-invasive: we only INSERT new rows (and
+soft-delete by UPDATEing note_delete=1 + note_edited fields).
+Never UPDATE or DELETE other columns. Sytist's own behavior is
+unaffected.
+
+═══════════════════════════════════════════════════════
+WHAT GETS WRITTEN TO ms_notes — and WHEN
+═══════════════════════════════════════════════════════
+
+All system events use these flags:  note_admin=1, note_is_note=0,
+                                    note_log=1, note_data=''
+Manual operator notes use:           note_admin=1, note_is_note=1,
+                                     note_log=0, note_data=''
+
+note_who is always set to the dashboard user's display_name
+(falls back to "dashboard" if no auth context — e.g. the
+scheduler running unattended).
+
+The body of each event starts with "[Dashboard] " so it's
+visually distinguishable from Sytist-native entries in Sytist's
+own UI.
+
+──────────────────────────────────────────────────────
+1. PROCESS ORDER (fresh — not a reprint)
+──────────────────────────────────────────────────────
+When:   After processOrder() completes successfully on a
+        non-reprint run.
+Body:   "[Dashboard] Order processed (N items) — status → 40"
+        - N is the line item count
+        - "— status → 40" only included when autoStatusUpdate
+          flipped the Sytist status (target=40 by default)
+
+──────────────────────────────────────────────────────
+2. REPRINT WHOLE ORDER
+──────────────────────────────────────────────────────
+When:   After a successful reprint with reprint:true and no
+        lineItemFilter.
+Body:   "[Dashboard] Order reprinted as REPRINT_N"
+        - N is the reprint sequence number computed by
+          _nextReprintNumber()
+        - If a reason was supplied: " — Reason: <reason>"
+
+──────────────────────────────────────────────────────
+3. REPRINT SINGLE ITEM
+──────────────────────────────────────────────────────
+When:   After a successful per-item reprint (lineItemFilter set).
+Body:   "[Dashboard] Item \"4 Mini Magnets\" reprinted as REPRINT_2"
+        - Product name comes from lineItem.productName for the
+          cart_id in the filter
+        - Multiple items handled (comma-joined names) but the
+          per-item button always sends exactly one cartId
+
+──────────────────────────────────────────────────────
+4. MARK SHIPPED (manual)
+──────────────────────────────────────────────────────
+When:   Operator clicks "Mark Shipped" on the order detail page.
+Body:   "[Dashboard] Order Has been changed to Shipped"
+        + inline shipping context when available:
+            " — Tracking: 9400123, Carrier: USPS, Cost: $4.50"
+        - Empty fields (no tracking, no cost) are skipped
+        - Mirrors Sytist's own wording for status changes
+
+──────────────────────────────────────────────────────
+5. MARK SHIPPED (auto via scheduler)
+──────────────────────────────────────────────────────
+When:   Phase 32 scheduler detects a ShipStation shipment and
+        flips the order's Sytist status to 39.
+Body:   "[Dashboard] Order Has been changed to Shipped
+         (auto-detected from ShipStation) — Tracking: ..., Carrier: ..., Cost: ..."
+        - note_who = "sytist-dashboard" since there's no human
+          user attached to scheduler events
+
+──────────────────────────────────────────────────────
+6. MARK BACK TO PRINTING (unship)
+──────────────────────────────────────────────────────
+When:   Operator unships an order from the dashboard.
+Body:   "[Dashboard] Order Has been changed to Printing"
+        + if a reason was supplied: " — Reason: <reason>"
+
+──────────────────────────────────────────────────────
+7. PUSH PACKAGING TO SHIPSTATION
+──────────────────────────────────────────────────────
+When:   Operator clicks "Push packaging to ShipStation" on the
+        Shipping card.
+Body:   "[Dashboard] Packaging pushed to ShipStation — 4oz,
+         large_envelope_or_flat, stamps_com/usps_first_class"
+        - Includes the weight, package code stored by SS, and
+          the carrier/service pair sent
+        - If SS reassigned the package code on its end:
+            "(⚠ SS reassigned package code)" appended
+
+──────────────────────────────────────────────────────
+8. MANUAL OPERATOR NOTE
+──────────────────────────────────────────────────────
+When:   Operator types text into the Order Activity card and
+        clicks "Add note".
+Body:   Whatever the operator typed (trimmed).
+Flags:  is_note=1, log=0 (so Sytist's UI treats it as a real
+        "Note" rather than a log event).
+
+═══════════════════════════════════════════════════════
+WHAT GETS READ FROM ms_notes
+═══════════════════════════════════════════════════════
+
+The new "Order activity" card on the order detail page fetches:
+
+  GET /api/sytist/orders/:orderId/notes
+
+which returns all non-deleted rows where note_table='ms_orders'
+AND note_table_id=:orderId, newest first, limited to 200. Each
+row is reshaped for the UI:
+
+  { id, date, body, who, ip, type: 'note'|'log', admin, deleted }
+
+`type` is derived from note_is_note: =1 → 'note' (manual),
+otherwise → 'log' (system event).
+
+The card auto-refreshes via a `sytist:activity-changed`
+CustomEvent dispatched by:
+  - The Process / Reprint buttons (after success)
+  - The per-item Reprint buttons (LineItemRow + ImpositionItemRow)
+  - Ship / Unship buttons (via the existing onShipChanged callback)
+  - Push packaging button
+
+So operators see new notes appear without reloading the page.
+
+═══════════════════════════════════════════════════════
+SOFT DELETES
+═══════════════════════════════════════════════════════
+
+DELETE /api/sytist/orders/:orderId/notes/:noteId
+
+Sets note_delete=1, note_edited=NOW(), note_edited_who=<user>.
+Authorization rules enforced at the route layer:
+
+  - Admins can delete any manual note
+  - Non-admins can delete only notes where note_who === their
+    display_name
+  - Nobody can delete log entries (type='log') — those are the
+    audit trail
+
+The "Delete" button appears on every manual note in the UI.
+The server returns 403 if the user isn't authorized; the client
+shows that as an alert.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED (5 files):
+
+  server/services/sytistDbService.js
+    + 3 new methods on the class: insertNote(), listNotes(),
+      softDeleteNote()
+    + In-line comments documenting the flag conventions we
+      inferred from sampled Sytist rows
+
+  server/services/orderStatusService.js
+    + shipOrder() signature extended with userDisplayName / userIp
+    + unshipOrder() signature extended likewise
+    + batchShipOrders() forwards the new fields
+    + Both ship and unship success paths now also INSERT into
+      ms_notes (non-fatal — a notes failure doesn't undo the action)
+
+  server/services/processingService.js
+    + processOrder() reads userDisplayName / userIp / reason from
+      options
+    + Adds a try-block at end of processOrder() that writes one
+      ms_notes row per successful run (different wording for
+      fresh process vs full reprint vs per-item reprint)
+
+  server/routes/sytist.js
+    + New helper: userContextFromReq(req) — pulls display_name +
+      ip off the auth context (one source of truth)
+    + Threaded context into: process/order/:orderId,
+      process/order/:orderId/reprint-item/:cartId,
+      orders/:orderId/ship, orders/batch-ship,
+      orders/:orderId/unship
+    + Push-packaging endpoint also writes an ms_notes row on
+      success
+    + NEW endpoints:
+        GET    /orders/:orderId/notes
+        POST   /orders/:orderId/notes        (manual note)
+        DELETE /orders/:orderId/notes/:noteId (soft delete)
+
+  client/src/pages/OrderDetailPage.js
+    + New <OrderActivityCard> component rendered after the
+      <NotesBlocks> on the order detail page
+    + Listens for a 'sytist:activity-changed' CustomEvent on
+      window so deeply-nested action buttons can trigger a
+      refresh without prop drilling
+    + Process/Reprint/Push buttons now dispatch that event
+    + ProcessAndShipStatusRow's callbacks now ALSO bump activity
+      refresh state for ship/unship/full-Process refreshes
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-36.tar.gz --strip-components=1
+
+5 files extracted. nodemon picks up the server-side changes.
+Hard-refresh the browser for the client changes.
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+  1. Open any order in the dashboard. You should see a new
+     "Order activity" card between the customer notes and the
+     output paths block. It loads with the existing Sytist-side
+     notes for that order.
+
+  2. Type a quick note ("test from dashboard") and click
+     Add note. It should:
+     - Appear immediately at the top of the list with a Note
+       badge and your display name
+     - Show up in Sytist's UI on the same order
+
+  3. Click Process / Reprint / Mark Shipped / Push Packaging.
+     A new Log-badge entry should appear without you having to
+     reload — prefixed with [Dashboard].
+
+  4. Verify in Sytist:
+       SELECT note_id, note_date, note_who, note_admin,
+              note_is_note, note_log, LEFT(note_note, 80)
+         FROM ms_notes
+         WHERE note_table = 'ms_orders'
+           AND note_table_id = <your order>
+         ORDER BY note_id DESC LIMIT 10;
+     You should see entries that match what the UI shows.
+
+  5. Delete a manual note you wrote. It should disappear from
+     the list (server soft-deletes via note_delete=1).
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD server/services/sytistDbService.js \
+                     server/services/orderStatusService.js \
+                     server/services/processingService.js \
+                     server/routes/sytist.js \
+                     client/src/pages/OrderDetailPage.js
+
+Any rows already written to ms_notes by Phase 36 will remain
+(they're real Sytist records now). You can delete them via
+Sytist's own UI if you want a clean slate.

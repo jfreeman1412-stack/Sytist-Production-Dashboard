@@ -4,6 +4,26 @@
       "externalId": "6",
       "layoutId": "MM-General",
       "chainToImposition": false
+    },
+    {
+      "externalId": "16",
+      "layoutId": "Button",
+      "chainToImposition": true
+    },
+    {
+      "externalId": "12",
+      "layoutId": "wallet",
+      "chainToImposition": true
+    },
+    {
+      "externalId": "15",
+      "layoutId": "Magnet",
+      "chainToImposition": true
+    },
+    {
+      "externalId": "27",
+      "layoutId": "Magnet",
+      "chainToImposition": true
     }
   ]
 }

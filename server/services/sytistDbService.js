@@ -201,25 +201,80 @@ function _expandPackageLineItems(lineItems, packageContentsMap) {
   if (!packageContentsMap) return lineItems;
   const out = [];
   for (const li of lineItems) {
-    if (!li.flags?.package) {
+    // Phase 39: Sytist's cart_package column turns out to be unreliable
+    // — it's typically 0 even on rows that ARE packages (verified
+    // across the dataset). So we no longer trust flags.package as
+    // the trigger. Instead, the dashboard's Settings → Packages
+    // config is the source of truth: if a line item's SKU has
+    // entries in packageContentsMap, treat it as a package and
+    // expand it.
+    //
+    // Trade-off: if an SKU is configured as a package but is later
+    // sold standalone (an unusual case), this would still expand.
+    // Operators control Settings → Packages, so the risk is low and
+    // self-correctable. The previous behavior — trusting Sytist's
+    // flag — silently failed to expand real packages, which is
+    // strictly worse than this trade-off.
+    const sytistFlaggedAsPackage = !!li.flags?.package;
+    const sku = String(li.sku || '');
+    const contents = sku ? packageContentsMap[sku] : null;
+    const configuredAsPackage = !!(contents && contents.length > 0);
+
+    if (!configuredAsPackage) {
+      // Not a package by dashboard config. Pass through unchanged.
+      // (Sytist's flag is no longer consulted; see comment above.)
       out.push(li);
       continue;
     }
-    const contents = packageContentsMap[String(li.sku)];
-    if (!contents || contents.length === 0) {
-      // Package SKU not configured — leave as-is. Operator sees the
-      // gap in the Settings UI.
-      out.push(li);
-      continue;
+
+    // Phase 39: log when we expand based on dashboard config alone
+    // (Sytist's flag was missing). Makes the silent-failure case
+    // observable: an admin scanning logs sees these and can verify
+    // that Sytist's data really is what we think.
+    if (!sytistFlaggedAsPackage) {
+      console.warn(
+        `[SytistDB] cart ${li.cartId} sku=${sku} (${li.productName || 'unnamed'}): ` +
+          `Sytist's cart_package=0 but SKU is configured as a package in dashboard ` +
+          `settings. Expanding using dashboard config (${contents.length} constituents).`
+      );
     }
+
     // Emit header: keep the original row but mark it.
+    // Phase 39: also set flags.package = true (forces the Package
+    // chip on the UI even when Sytist didn't flag it), and
+    // packageExpansionSource so the UI can surface a banner about
+    // config-driven expansion.
     out.push({
       ...li,
-      flags: { ...li.flags, isPackageHeader: true },
+      flags: {
+        ...li.flags,
+        package: true,
+        isPackageHeader: true,
+        packageExpansionSource: sytistFlaggedAsPackage
+          ? 'sytist_flag'
+          : 'dashboard_config',
+      },
     });
     // Emit synthetic constituents inheriting the parent's photo,
     // gallery, sub-gallery. cartId is a string so it never collides
     // with real numeric cart IDs.
+    //
+    // Phase 42 diagnostic: log the parent's green-screen state so we
+    // can see if it propagates correctly to constituents. If the
+    // parent has flags.greenScreen=true but its backgroundPhoto
+    // resolved to null (e.g. ms_photos row missing for cart_photo_bg),
+    // constituents inherit a broken state and Step 1.4 will skip them
+    // silently. This log lets us catch that case at the source.
+    if (li.flags?.greenScreen || li.backgroundPhoto) {
+      console.log(
+        `[SytistDB] Package cart ${li.cartId} sku=${li.sku} expansion: ` +
+          `parent greenScreen=${!!li.flags?.greenScreen} ` +
+          `parent backgroundPhoto=${li.backgroundPhoto ? 'present' : 'NULL'} ` +
+          `parent bgFullUrl=${li.backgroundPhoto?.fullUrl ? 'set' : 'missing'} ` +
+          `(propagating to ${contents.length} constituent${contents.length === 1 ? '' : 's'})`
+      );
+    }
+
     const packageQty = Math.max(1, li.qty || 1);
     for (const item of contents) {
       const itemQty = (item.qty || 1) * packageQty;
@@ -256,10 +311,16 @@ function _expandPackageLineItems(lineItems, packageContentsMap) {
           isPackageItem: true,
           packageParentCartId: li.cartId,
           packageParentSku: li.sku,
-          // Digital category drives the download flag; this lets
-          // the existing SKIP_FLAGS-based filtering in processing
-          // and slip work correctly for bundled digital items.
-          download: isDigital ? true : !!li.flags?.download,
+          // Phase 43 hotfix 1: download is determined ONLY by the
+          // constituent's own SKU category, NOT inherited from the
+          // parent package. The parent package may include a download
+          // (e.g. Silver Package gives the customer one digital
+          // download bonus) but that doesn't make the physical print
+          // constituents (Memory Mate, 8x10, etc.) downloads too.
+          // Inheriting would cause the packaging engine to skip the
+          // whole order as "no shippable items" and the UI to show
+          // misleading "Includes Download" badges on every line.
+          download: isDigital,
         },
         options: [], // constituents have no per-line options
         thumbPath: li.thumbPath,
@@ -385,7 +446,10 @@ function _expandAddonLineItems(lineItems, addonMap, productCategoriesBySku) {
           isAddonItem: true,
           addonParentCartId: li.cartId,
           addonOptId: String(opt.optId),
-          download: isDigital ? true : !!li.flags?.download,
+          // Phase 43 hotfix 1: same fix as package constituents —
+          // download is determined by the addon's own SKU category,
+          // not inherited from the parent product.
+          download: isDigital,
         },
         options: [], // synthetic items don't carry options
         thumbPath: li.thumbPath,
@@ -536,6 +600,31 @@ class SytistDbService {
       description: r.status_descr || '',
       showOrder: r.status_show_order,
     }));
+  }
+
+  /**
+   * Phase 38 follow-up: lightweight status_id → status_name lookup.
+   * Used by ms_notes writers so audit entries can show "Printing
+   * and Production" instead of just "40". Returns the friendly
+   * name, or a fallback string ('Status N') if the lookup fails
+   * or returns no row. Never throws — used in non-fatal note paths.
+   */
+  async getStatusName(statusId) {
+    const id = parseInt(statusId, 10);
+    if (Number.isNaN(id)) return String(statusId);
+    if (id === 0) return STATUS_OPEN_NAME;
+    try {
+      const pool = this.getPool();
+      const [[row]] = await pool.query(
+        'SELECT status_name FROM ms_order_status WHERE status_id = ? LIMIT 1',
+        [id]
+      );
+      if (row && row.status_name) return row.status_name;
+      return `Status ${id}`;
+    } catch (err) {
+      console.warn(`[SytistDB] getStatusName(${id}) failed: ${err.message}`);
+      return `Status ${id}`;
+    }
   }
 
   async getGalleryHierarchy({ monthsBack = 18 } = {}) {
@@ -1610,7 +1699,7 @@ class SytistDbService {
    *   - Order erased (soft-deleted)
    *   - Invalid statusId (not 0 and not in ms_order_status)
    */
-  async updateOrderStatus(orderId, statusId) {
+  async updateOrderStatus(orderId, statusId, shippingFields = null) {
     const id = parseInt(orderId, 10);
     if (Number.isNaN(id) || id <= 0) {
       throw new Error('Invalid order ID');
@@ -1664,8 +1753,48 @@ class SytistDbService {
 
     // 3. The actual write. Single row, by primary key, no triggers we control.
     //
-    // Logging here so the action shows up in the dev console — useful while
-    // we're verifying behavior. Can quiet this down in phase 12.
+    // Phase 30: when `shippingFields` is provided, write the shipping
+    // columns alongside order_open_status in a single UPDATE. When it's
+    // null (existing callers like the PUT /orders/:id/status endpoint),
+    // just write order_open_status as before. The expanded write is
+    // opt-in so callers that aren't shipping-related don't accidentally
+    // clobber shipping state.
+    if (shippingFields) {
+      console.log(
+        `[SytistDB] updateOrderStatus (with shipping): order ${id}: ${previousStatusId} (${previousStatusName}) → ${newStatusId} (${newStatusName}), tracking=${shippingFields.trackingNumber || ''}, carrier=${shippingFields.carrier || ''}, cost=${shippingFields.shipCost}`
+      );
+
+      const [result] = await pool.query(
+        `UPDATE ms_orders SET
+           order_open_status   = ?,
+           order_shipped_date  = ?,
+           order_shipped_track = ?,
+           order_shipped_by    = ?,
+           order_shipped_by_id = ?,
+           order_ship_cost     = ?
+         WHERE order_id = ?`,
+        [
+          newStatusId,
+          shippingFields.shippedDate || '0000-00-00',
+          shippingFields.trackingNumber || '',
+          shippingFields.carrier || '',
+          parseInt(shippingFields.shippedById, 10) || 0,
+          parseFloat(shippingFields.shipCost) || 0,
+          id,
+        ]
+      );
+
+      return {
+        orderId: id,
+        previousStatus: { id: previousStatusId, name: previousStatusName },
+        newStatus: { id: newStatusId, name: newStatusName },
+        shippingFields,
+        affectedRows: result.affectedRows,
+      };
+    }
+
+    // Legacy single-column path. Used by the PUT /orders/:id/status
+    // endpoint which doesn't know about shipping at all.
     console.log(
       `[SytistDB] updateOrderStatus: order ${id}: ${previousStatusId} (${previousStatusName}) → ${newStatusId} (${newStatusName})`
     );
@@ -2007,6 +2136,378 @@ class SytistDbService {
       );
       return { addonMap: null };
     }
+  }
+
+  /**
+   * Phase 20: global order search.
+   *
+   * Matches any of: order_id (the Sytist order number — there is
+   * no separate order_number column), customer first/last name,
+   * email, phone. Returns up to 10 results.
+   *
+   * Scope is the same as the orders list: paid + non-erased.
+   *
+   * @param {string} query  raw user input
+   * @returns {Promise<Array<{
+   *   orderId: number,
+   *   orderNumber: string,
+   *   orderDate: string,
+   *   customerName: string,
+   *   email: string,
+   *   phone: string,
+   *   total: number,
+   *   productionStatusId: number,
+   *   productionStatusName: string,
+   * }>>}
+   */
+  async searchOrders(query) {
+    const q = String(query || '').trim();
+    if (!q) return [];
+
+    const pool = this.getPool();
+
+    // Build WHERE clause. All matches are ORed together but the
+    // base "paid + non-erased" filter is always applied.
+    //
+    // Order ID: try EXACT match first (most common case — operator
+    // types 110643 and wants exactly that). order_id is an INT, so
+    // we cast it to CHAR for LIKE matching.
+    //
+    // Customer name: match against CONCAT(first, ' ', last) so
+    // typing "Jessica Foss" returns Jessica Foss; "Foss" returns
+    // anything with last name containing Foss; "Jess" matches
+    // first name.
+    //
+    // Email / phone: LIKE %q%.
+    //
+    // Old MySQL on the droplet handles CONCAT in WHERE fine; the
+    // pattern matches what other queries here do.
+    const isOrderNumberLike = /^[0-9]{3,8}$/.test(q);
+    const likeQ = `%${q}%`;
+
+    // Strip non-digit chars for phone matching so "(763) 639-9351"
+    // and "7636399351" both match.
+    const phoneDigits = q.replace(/[^0-9]/g, '');
+    const phoneLike = phoneDigits.length >= 4 ? `%${phoneDigits}%` : null;
+
+    const orClauses = [];
+    const orParams = [];
+
+    if (isOrderNumberLike) {
+      // Exact order_id match — highest priority via ORDER BY below.
+      orClauses.push('o.order_id = ?');
+      orParams.push(parseInt(q, 10));
+    }
+    // Partial order_id match (always — covers typing partials).
+    // CAST to CHAR so LIKE works against the integer column.
+    orClauses.push('CAST(o.order_id AS CHAR) LIKE ?');
+    orParams.push(likeQ);
+
+    // Customer name (concat of first + last).
+    orClauses.push(
+      "CONCAT_WS(' ', o.order_first_name, o.order_last_name) LIKE ?"
+    );
+    orParams.push(likeQ);
+
+    // Email.
+    orClauses.push('o.order_email LIKE ?');
+    orParams.push(likeQ);
+
+    // Phone (raw and stripped).
+    orClauses.push('o.order_phone LIKE ?');
+    orParams.push(likeQ);
+    if (phoneLike) {
+      orClauses.push("REPLACE(REPLACE(REPLACE(REPLACE(o.order_phone, '-', ''), ' ', ''), '(', ''), ')', '') LIKE ?");
+      orParams.push(phoneLike);
+    }
+
+    const sql = `
+      SELECT
+        o.order_id,
+        o.order_date,
+        o.order_first_name,
+        o.order_last_name,
+        o.order_email,
+        o.order_phone,
+        o.order_total,
+        o.order_open_status,
+        st.status_name AS productionStatusName,
+        ${isOrderNumberLike ? '(o.order_id = ?) AS exact_match,' : '0 AS exact_match,'}
+        (CAST(o.order_id AS CHAR) LIKE ?) AS partial_order_match
+      FROM ms_orders o
+      LEFT JOIN ms_order_status st ON st.status_id = o.order_open_status
+      WHERE o.order_payment_status = 'Completed'
+        AND o.order_erased = 0
+        AND (${orClauses.join(' OR ')})
+      ORDER BY exact_match DESC, partial_order_match DESC, o.order_date DESC
+      LIMIT 10
+    `;
+
+    // Params order: ranking ORs first (for the SELECT expressions),
+    // then the WHERE-clause params.
+    const params = [];
+    if (isOrderNumberLike) params.push(parseInt(q, 10)); // exact_match select expr
+    params.push(likeQ); // partial_order_match select expr
+    params.push(...orParams);
+
+    const [rows] = await pool.query(sql, params);
+
+    return rows.map((r) => ({
+      orderId: r.order_id,
+      // orderNumber is the same as orderId for Sytist — keep the
+      // field name for the client UI which renders it as "#{number}".
+      orderNumber: String(r.order_id),
+      orderDate:
+        typeof r.order_date === 'string'
+          ? r.order_date.split(' ')[0]
+          : '',
+      customerName: [r.order_first_name, r.order_last_name]
+        .filter(Boolean)
+        .join(' ')
+        .trim(),
+      email: r.order_email || '',
+      phone: r.order_phone || '',
+      total: parseFloat(r.order_total) || 0,
+      productionStatusId: r.order_open_status,
+      productionStatusName:
+        r.productionStatusName || (r.order_open_status === 0 ? 'Queue' : ''),
+    }));
+  }
+
+  // ─── Phase 36: ms_notes — order activity log ──────────────
+  //
+  // Sytist has a polymorphic ms_notes table that backs the "Notes"
+  // section on its order detail page. Every order action Sytist
+  // itself does (status changes, emails, invoices, etc.) writes a
+  // row here. We extend the dashboard's Sytist write allow-list to
+  // include INSERT INTO ms_notes (append-only) so our actions also
+  // show up in Sytist's UI, alongside Sytist's own notes.
+  //
+  // Schema reminder (Sytist's columns are NOT NULL with defaults):
+  //   note_id           int PK auto_increment
+  //   note_date         datetime          (we set NOW())
+  //   note_table        varchar(100)      ('ms_orders' for orders)
+  //   note_table_id     int               (order_id)
+  //   note_note         text              (the human-readable body)
+  //   note_delete       int               (0 = active, 1 = soft-deleted)
+  //   note_who          varchar(100)      (Sytist user display name)
+  //   note_edited       datetime          (we write '0000-00-00 00:00:00')
+  //   note_edited_who   varchar(100)      ('')
+  //   note_ip           varchar(200)      (client IP if available, else '')
+  //   note_admin        int               (1 = staff/dashboard, 0 = customer)
+  //   note_is_note      int               (1 = manual operator note,
+  //                                        0 = system log event)
+  //   note_log          int               (1 = log event, 0 = manual note)
+  //   note_data         text              (we leave empty per project policy)
+  //
+  // Flag conventions (matches what Sytist itself uses, inferred from
+  // sampled rows):
+  //   - System/automated events:  admin=1, is_note=0, log=1, data=''
+  //   - Manual operator notes:    admin=1, is_note=1, log=0, data=''
+  //   - Customer-triggered:       admin=0, is_note=0, log=1  (we don't emit these)
+  //
+  // Failure handling: every method is best-effort. The caller's
+  // primary action MUST NOT be blocked by an ms_notes failure —
+  // errors are logged and swallowed inside the orchestrating
+  // services (orderStatusService, processingService, etc.). At this
+  // layer we just throw so the wrapper can decide.
+
+  /**
+   * Insert a row into ms_notes. Used both for system log events
+   * (default flags) and manual operator notes (flags inverted via
+   * the isManual option).
+   *
+   * @param {object} opts
+   * @param {string|number} opts.orderId   Sytist order_id (or any int PK)
+   * @param {string} opts.noteText         What appears in note_note
+   * @param {string} opts.who              Display name (e.g. "Joey")
+   * @param {string} [opts.ip='']          Client IP
+   * @param {boolean} [opts.isManual=false] true → operator-typed note;
+   *                                        false → system log event
+   * @param {string} [opts.table='ms_orders']
+   * @returns {Promise<{ noteId: number }>}
+   */
+  async insertNote({
+    orderId,
+    noteText,
+    who,
+    ip = '',
+    isManual = false,
+    table = 'ms_orders',
+  }) {
+    const id = parseInt(orderId, 10);
+    if (Number.isNaN(id) || id <= 0) {
+      throw new Error('insertNote requires a valid orderId');
+    }
+    if (!noteText || typeof noteText !== 'string') {
+      throw new Error('insertNote requires noteText');
+    }
+
+    // Flag triple per the convention discovered from Sytist's own
+    // rows: log events have is_note=0 / log=1, manual notes have
+    // is_note=1 / log=0. Both are admin=1 (visible to staff only,
+    // not customer-facing).
+    const note_admin = 1;
+    const note_is_note = isManual ? 1 : 0;
+    const note_log = isManual ? 0 : 1;
+
+    const pool = this.getPool();
+    // Phase 36 fix (hotfix 2): the Sytist schema declares some
+    // columns NOT NULL with no usable default for INSERT under
+    // MySQL strict mode. We MUST list those columns and provide
+    // explicit values:
+    //   - note_data        TEXT NOT NULL, no default → pass ''
+    //   - note_delete      INT NOT NULL → pass 0
+    //   - note_edited_who  VARCHAR NOT NULL, no default → pass ''
+    //
+    // But note_edited (datetime) is different — strict mode rejects
+    // the literal '0000-00-00 00:00:00' even though that's the
+    // column's own DEFAULT. We omit note_edited from the INSERT and
+    // let MySQL apply the default; the default IS the zero-date but
+    // applied implicitly it passes the NO_ZERO_DATE check (this is
+    // an old MySQL quirk).
+    const [result] = await pool.query(
+      `INSERT INTO ms_notes
+         (note_date, note_table, note_table_id, note_note, note_delete,
+          note_who, note_edited_who, note_ip,
+          note_admin, note_is_note, note_log, note_data)
+       VALUES (NOW(), ?, ?, ?, 0,
+               ?, '', ?,
+               ?, ?, ?, '')`,
+      [
+        String(table).slice(0, 100),
+        id,
+        String(noteText).slice(0, 65535), // text column
+        String(who || 'sytist-dashboard').slice(0, 100),
+        String(ip || '').slice(0, 200),
+        note_admin,
+        note_is_note,
+        note_log,
+      ]
+    );
+
+    return { noteId: result.insertId };
+  }
+
+  /**
+   * Phase 36 hotfix 3: find the operator who last did a Sytist Dashboard
+   * action on this order. Used by the scheduler so its auto-detected
+   * Shipped notes can be attributed to the operator who originally
+   * processed the order, rather than the generic 'sytist-dashboard'
+   * fallback.
+   *
+   * Search criteria:
+   *   - note_table = 'ms_orders' AND note_table_id = orderId
+   *   - note_delete = 0
+   *   - note_note starts with 'Sytist Dashboard:' (our prefix)
+   *   - note_who != 'sytist-dashboard' (skip any prior scheduler events)
+   *   - Most recent first
+   *
+   * Returns the display name string, or null if no prior dashboard
+   * activity exists for this order.
+   *
+   * Single LIMIT 1 query so it's cheap even on busy servers.
+   */
+  async findOriginalOperator(orderId) {
+    const id = parseInt(orderId, 10);
+    if (Number.isNaN(id) || id <= 0) return null;
+
+    try {
+      const pool = this.getPool();
+      const [rows] = await pool.query(
+        `SELECT note_who
+           FROM ms_notes
+           WHERE note_table = 'ms_orders'
+             AND note_table_id = ?
+             AND note_delete = 0
+             AND note_note LIKE 'Sytist Dashboard:%'
+             AND note_who != 'sytist-dashboard'
+             AND note_who != ''
+           ORDER BY note_date DESC, note_id DESC
+           LIMIT 1`,
+        [id]
+      );
+      if (rows && rows.length > 0 && rows[0].note_who) {
+        return String(rows[0].note_who);
+      }
+      return null;
+    } catch (err) {
+      // Don't propagate — the scheduler should still write a note
+      // (just with the fallback who) even if this lookup fails.
+      console.warn(
+        `[SytistDB] findOriginalOperator(${id}) failed: ${err.message}`
+      );
+      return null;
+    }
+  }
+
+  /**
+   * List ms_notes rows for an order, newest first. By default
+   * excludes soft-deleted rows (note_delete=1).
+   *
+   * Returns rows shaped for the UI:
+   *   { id, date, body, who, type, deleted, ip }
+   * where type is 'note' (manual) or 'log' (system event).
+   */
+  async listNotes(orderId, { includeDeleted = false, limit = 200 } = {}) {
+    const id = parseInt(orderId, 10);
+    if (Number.isNaN(id) || id <= 0) {
+      throw new Error('listNotes requires a valid orderId');
+    }
+
+    const pool = this.getPool();
+    const sql = `
+      SELECT note_id, note_date, note_note, note_who, note_ip,
+             note_admin, note_is_note, note_log, note_delete
+      FROM ms_notes
+      WHERE note_table = 'ms_orders'
+        AND note_table_id = ?
+        ${includeDeleted ? '' : 'AND note_delete = 0'}
+      ORDER BY note_date DESC, note_id DESC
+      LIMIT ?
+    `;
+    const [rows] = await pool.query(sql, [id, parseInt(limit, 10) || 200]);
+
+    return rows.map((r) => ({
+      id: r.note_id,
+      date: r.note_date,
+      body: r.note_note || '',
+      who: r.note_who || '',
+      ip: r.note_ip || '',
+      // is_note=1 means manual operator note; otherwise it's a system log entry
+      type: r.note_is_note === 1 ? 'note' : 'log',
+      admin: r.note_admin === 1,
+      deleted: r.note_delete === 1,
+    }));
+  }
+
+  /**
+   * Soft-delete a note. Sets note_delete=1 + note_edited / _who so
+   * we have provenance on who removed it. We don't hard-delete
+   * because Sytist's UI may expect rows to stick around (and an
+   * audit trail of "Joey removed a note" is more useful than a
+   * silent disappearance).
+   *
+   * Only the row's own author OR an admin should be allowed to do
+   * this — that authorization decision lives at the route layer,
+   * not here.
+   */
+  async softDeleteNote(noteId, { editedWho = '' } = {}) {
+    const id = parseInt(noteId, 10);
+    if (Number.isNaN(id) || id <= 0) {
+      throw new Error('softDeleteNote requires a valid noteId');
+    }
+    const pool = this.getPool();
+    const [result] = await pool.query(
+      `UPDATE ms_notes
+         SET note_delete = 1,
+             note_edited = NOW(),
+             note_edited_who = ?
+       WHERE note_id = ?
+         AND note_delete = 0`,
+      [String(editedWho || '').slice(0, 100), id]
+    );
+    return { affectedRows: result.affectedRows };
   }
 
   async close() {

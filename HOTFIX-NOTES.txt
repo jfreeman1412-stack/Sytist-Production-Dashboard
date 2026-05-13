@@ -1,0 +1,151 @@
+Phase 44 hotfix 2 — Remove scheduler auto-cleanup of composed thumbnails
+═══════════════════════════════════════════════════════
+
+THE BUG
+─────────────────────────────────────────────
+
+After Phase 44 deployed, the dashboard order detail page
+and packing slip preview showed no composite thumbnails
+even after processing an order. The cache was empty
+despite ShipStation receiving composites correctly.
+
+Root cause traced via server log:
+
+  [Processing] Order 110823: ...
+  [s3Sytist] Published composed thumbnail for order 110823
+    cart 482479 → https://...
+  [PackingSlip] Wrote ...
+  [SS] 110823: createOrder OK → SS#525622922
+  [Scheduler] Order 110823 marked shipped: stamps_com (no tracking)
+  [Scheduler] Order 110823 synced to Sytist: status 40 → 39
+  [s3Sytist] Cleaned up 1 composed thumbnail(s) for order 110823
+  [Scheduler] Order 110823: cleaned up 1 composed thumbnail(s)
+  [Scheduler] Order 110823: cleared 1 composed thumbnail cache row(s)
+
+The scheduler detected the order as shipped in SS within
+the same 5-minute poll cycle as its creation, and ran
+cleanup — wiping both the S3 object AND the cache row
+before the operator could view the order detail page.
+
+Why orders show as shipped immediately is a separate
+unresolved question (worth investigating: SS workflow
+settings, auto-ship rules, phantom shipments). But the
+cleanup race is the actual user-visible bug.
+
+THE FIX
+─────────────────────────────────────────────
+
+Remove both cleanup blocks from schedulerService.js.
+Cache rows persist forever. S3 objects accumulate
+indefinitely.
+
+Why this is fine:
+
+  - Cache rows: SQLite row with small text fields.
+    Storage cost: negligible. Even at thousands of
+    orders/month for years, the DB stays well under
+    100 MB.
+
+  - S3 objects: ~50KB JPEG per thumbnail at $0.023/GB/month
+    in S3 Standard. That's ~$0.001/year per thumbnail.
+    100 orders/month × 5 thumbnails each × 5 years =
+    30,000 thumbnails ≈ 1.5 GB ≈ $0.40/month total.
+    Trivial.
+
+  - Race condition: eliminated. The composite thumbnail
+    persists indefinitely regardless of how quickly SS
+    marks the order shipped.
+
+  - Operator experience: order detail and slip preview
+    always show composites for any processed order.
+
+If S3 cost ever matters: add a separate sweep job (a
+nightly "DELETE FROM composed_thumbnails WHERE order_id
+shipped > 30 days ago" + S3 list-and-delete) decoupled
+from the poll cycle. Not done here.
+
+WHAT'S IN THIS TARBALL
+─────────────────────────────────────────────
+
+MODIFIED (1 file):
+
+  server/services/schedulerService.js
+    - Removed try block that called
+      composedThumbnailService.cleanup(orderId)
+    - Removed try block that called
+      composedThumbnailCacheService.deleteByOrder(orderId)
+    + Comment block explaining the rationale
+
+DEPLOY
+─────────────────────────────────────────────
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-44-hotfix2.tar.gz --strip-components=1
+
+Ctrl+C and `npm run dev` (or let nodemon restart).
+
+VERIFY
+─────────────────────────────────────────────
+
+  1. Process or reprint an order with a Memory Mate
+     (or other composite item).
+
+  2. Watch the server log. You should see:
+       [s3Sytist] Published composed thumbnail for ...
+
+     You should NOT see any of:
+       [s3Sytist] Cleaned up ...
+       [Scheduler] Order N: cleaned up ...
+       [Scheduler] Order N: cleared N composed thumbnail cache row(s)
+
+  3. Wait for the scheduler poll cycle to run (5 min).
+     Even after the scheduler marks the order shipped,
+     no cleanup messages should appear.
+
+  4. Verify cache has the row:
+     node -e "const db = require('better-sqlite3')(
+       './server/config/sytist-dashboard.db');
+       console.log(db.prepare('SELECT * FROM composed_thumbnails ORDER BY created_at DESC LIMIT 5').all());"
+
+  5. Open the order detail page in the dashboard.
+     Composite line items should show the composite
+     thumbnail.
+
+  6. View the slip preview. Composite items should
+     show the composite thumbnail.
+
+  7. (Optional) Click the published S3 URL from the log.
+     Should display the composite image even days later.
+
+ROLLBACK
+─────────────────────────────────────────────
+
+  git checkout HEAD server/services/schedulerService.js
+
+Cache rows that accumulated while this hotfix was
+active remain. They're harmless.
+
+UNRESOLVED (worth investigating later)
+─────────────────────────────────────────────
+
+Why does ShipStation show orders as "shipped" within
+seconds of creation, without a tracking number? You said
+you haven't been manually marking them. Possibilities:
+
+  - SS account has an auto-fulfill / auto-ship workflow
+  - A "mark as shipped without label" rule fires on
+    certain order types
+  - Phantom shipment records from earlier deletes still
+    matching our scheduler's orderNumber lookup
+
+Running the diagnostic curl in the previous turn would
+reveal whether there are multiple SS orders per
+orderNumber, what their statuses are, and what shipDate
+they show. That answer would tell us whether to fix the
+SS account configuration or update our scheduler to
+filter more strictly.
+
+This is a separate bug from the cache cleanup race.
+This hotfix fixes the visible symptom (no composites in
+UI/preview). The deeper "why is it shipped" question
+can be tackled separately.

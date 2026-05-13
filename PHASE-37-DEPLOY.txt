@@ -1,0 +1,111 @@
+Phase 37 — Photo download links + full doc refresh
+
+═══════════════════════════════════════════════════════
+WHAT THIS DELIVERS
+═══════════════════════════════════════════════════════
+
+Two unrelated deliverables in one phase:
+
+1. UX: photo + background filenames on the line item card are
+   now clickable download links. Opens the source image in a
+   new tab; browser saves it where downloads usually land.
+
+2. Docs refresh: README, SPEC, OperatorManual, AdminManual all
+   updated from their Phase 16 baseline to current state.
+   New CHANGELOG.md gives a phase-by-phase summary.
+
+The code change is one file (OrderDetailPage.js); the docs
+ship as separate files in the docs/ subfolder of the tarball.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+CODE (1 file):
+  client/src/pages/OrderDetailPage.js
+    - LineItemRow: photo filename becomes <a download> link
+    - LineItemRow: background filename (for green-screen items)
+      also becomes a labeled <a download> link
+    - Both open target="_blank"
+
+DOCS (5 files in docs/):
+  docs/README.md          Replaces existing README.md
+  docs/CHANGELOG.md       NEW — phase 17–37 chronological summary
+  docs/SPEC.md            Replaces existing SPEC.md
+                          (preserves original sections 1–20,
+                           appends new sections 21–38)
+  docs/OperatorManual.md  Replaces existing OperatorManual.md
+                          (full rewrite to current state)
+  docs/AdminManual.md     Replaces existing AdminManual.md
+                          (preserves Phase 16 baseline as
+                           sections 1–29; appends new
+                           sections 30–37 with override)
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+Code change:
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-37.tar.gz \
+            --strip-components=1
+
+That extracts:
+  client/src/pages/OrderDetailPage.js       (replaces existing)
+  docs/README.md                            (NEW location)
+  docs/CHANGELOG.md                         (NEW)
+  docs/SPEC.md                              (NEW location)
+  docs/OperatorManual.md                    (NEW location)
+  docs/AdminManual.md                       (NEW location)
+
+After extract:
+
+  - Hard refresh browser (Ctrl+Shift+R) for the photo link UX
+  - To install the new docs in the project root (replacing the
+    old ones), copy them up one level:
+
+      copy docs\README.md README.md
+      copy docs\CHANGELOG.md CHANGELOG.md
+      copy docs\SPEC.md SPEC.md
+      copy docs\OperatorManual.md OperatorManual.md
+      copy docs\AdminManual.md AdminManual.md
+
+    Then commit. The docs/ folder can be deleted, or kept as a
+    staging dir for future doc updates — your call.
+
+═══════════════════════════════════════════════════════
+VERIFY
+═══════════════════════════════════════════════════════
+
+UX:
+  1. Open any order detail page
+  2. Find any line item
+  3. The photo filename (e.g. "Rookies-Eye_West-005.png")
+     should be underlined / colored as a link
+  4. Click it → image opens in new tab and downloads
+  5. For green-screen items, a "Background: <filename>" link
+     also appears; same behavior
+
+Docs:
+  - README.md mentions Phase 37 and the new ms_notes
+    integration
+  - CHANGELOG.md exists with sections for phases 17 through 37
+  - SPEC.md has new sections 21–38
+  - OperatorManual.md has reprint workflow, activity log, and
+    photo download sections
+  - AdminManual.md has sections 30–37 with all the phase
+    17+ admin info
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD client/src/pages/OrderDetailPage.js
+  git checkout HEAD README.md SPEC.md OperatorManual.md AdminManual.md
+
+  # (CHANGELOG.md didn't exist before, just delete it)
+  del CHANGELOG.md
+
+The photo download links revert to plain text. Docs revert to
+Phase 16 baseline. Nothing else is affected.

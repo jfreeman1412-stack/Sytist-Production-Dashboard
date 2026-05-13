@@ -1,0 +1,182 @@
+Phase 28 — Order status transitions (Mark Shipped / Mark Back to Printing)
+
+═══════════════════════════════════════════════════════
+WHAT THIS DOES
+═══════════════════════════════════════════════════════
+
+Adds the ability to flip an order's production status to "Shipped"
+(status_id 39) and reverse it back to "Printing" (status_id 40) if
+needed. Two trigger surfaces:
+
+  1. PER-ORDER on the order detail page — a new "Production Status"
+     card with a "Mark Shipped" button when the order is in
+     Printing, or a "Mark Back to Printing" override when it's
+     currently Shipped.
+
+  2. BULK on the orders list — a new "Mark Shipped" button in the
+     selection action bar. Multi-select rows, click the button,
+     confirm, done.
+
+Every transition is logged in a new SQLite table for audit and
+future "order history" features.
+
+This is the foundation for Phases 30/31 (auto-detect ship via
+ShipStation polling, and a barcode scan-out page).
+
+═══════════════════════════════════════════════════════
+HOW IT WORKS
+═══════════════════════════════════════════════════════
+
+ELIGIBILITY:
+- Only orders currently in status 40 (Printing) can be marked
+  Shipped via the normal path. Orders in Queue, Shipped, etc. are
+  refused (or skipped in the bulk case).
+- The override path (Mark Back to Printing) has NO eligibility
+  check — it's the escape hatch for mistakes.
+
+SETTINGS (server/config/processing-settings.json):
+  shippedStatusId: 39          — what "Shipped" maps to
+  shipEligibleFromStatusIds: [40]   — which statuses qualify
+
+SERVER ENDPOINTS:
+  POST /api/sytist/orders/:orderId/ship       (admin + operator)
+  POST /api/sytist/orders/batch-ship          (admin + operator)
+  POST /api/sytist/orders/:orderId/unship     (admin only)
+
+AUDIT (new table):
+  order_status_audit
+    id, ts, order_id, from_status, to_status,
+    source, user_id, notes
+
+  Auto-created on first ship/unship; idempotent.
+  Sources logged so far: 'manual', 'bulk', 'manual_override'
+  (Phase 30 will add 'shipstation_auto', Phase 31 will add 'scan')
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+NEW:
+  server/services/orderStatusService.js
+    - loadSettings, ensureAuditTable (lazy-init), shipOrder,
+      unshipOrder, batchShipOrders, getRecentAudit, logAudit
+
+MODIFIED:
+  server/config/processing-settings.json
+    + shippedStatusId: 39
+    + shipEligibleFromStatusIds: [40]
+
+  server/routes/sytist.js
+    + 3 endpoints inserted right after the existing
+      /orders/:orderId/status PUT endpoint:
+        POST /orders/:orderId/ship
+        POST /orders/batch-ship
+        POST /orders/:orderId/unship
+    + require('../services/orderStatusService') near the new block
+
+  client/src/pages/OrderDetailPage.js
+    + reloadOrder extracted as a useCallback (was inline in
+      useEffect) so child components can request a refetch
+    + <ShipStatusBlock> placed between ProcessOrderBlock and
+      ShippingBlock — visible for ALL workflows
+    + ShipStatusBlock component definition + helper styles
+      (primaryShipBtnStyle, ghostBtnStyle) + a ConfirmModal
+
+  client/src/pages/OrdersListPage.js
+    + State: shipModalOpen, shipping, shipResult, reloadCounter
+    + Handlers: openShipModal, startBatchShip, dismissShipResult
+    + SelectionActionBar extended with onShipSelected prop +
+      green "Mark Shipped (N)" button between "Process selected"
+      and "Process all filtered"
+    + reloadCounter wired into the orders-load useEffect deps
+      so a successful batch-ship refreshes the list automatically
+    + New components: BatchShipModal, BatchShipResultBanner
+      (the latter is a dismissible toast in the bottom-right
+      that shows shipped/skipped counts and a per-order breakdown)
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-28.tar.gz --strip-components=1
+
+You should see 5 file lines:
+  x server/config/processing-settings.json
+  x server/routes/sytist.js
+  x server/services/orderStatusService.js
+  x client/src/pages/OrderDetailPage.js
+  x client/src/pages/OrdersListPage.js
+
+Both nodemon and webpack pick them up. Hard refresh the browser.
+
+If your processing-settings.json has any local additions, eyeball
+the new version before/after deploy and re-add anything that got
+clobbered. The shipped here adds shippedStatusId and
+shipEligibleFromStatusIds; everything else is whatever was there
+in the upload you sent me.
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+PER-ORDER:
+  1. Open an order detail page for an order currently in Printing.
+     Look for a new "Production Status" card between ProcessOrder
+     and Shipping — it shows the status name and id, plus a green
+     "Mark Shipped" button.
+  2. Click "Mark Shipped" → confirmation modal → confirm. The
+     order's status badge in the header should update on reload.
+  3. With a now-shipped order, the card shows a ghost
+     "← Mark Back to Printing" button. Click it → confirm with
+     the danger-styled button → status reverts.
+  4. For an order NOT in Printing (e.g. still in Queue), the card
+     shows a muted message saying it must be in Printing first.
+
+BULK:
+  1. Open the orders list, filter by Production Status = Printing.
+  2. Select 2-3 orders with checkboxes.
+  3. A green "Mark Shipped (3)" button appears in the action bar.
+  4. Click it → confirmation modal → confirm.
+  5. After it runs, the list refreshes (rows that got shipped
+     disappear from the Printing filter), and a toast appears
+     bottom-right: "Shipped 3 · Skipped 0".
+  6. To test the eligibility check: select a mix including some
+     orders in Queue. The toast should say "Shipped 2 · Skipped 1"
+     and "Show skipped details" reveals which order(s) and why
+     ("not in Printing (status 0)").
+
+AUDIT (optional manual check):
+  Once you've done a few ship/unship actions, you can inspect:
+    sqlite3 server/config/sytist-dashboard.db
+    SELECT * FROM order_status_audit ORDER BY ts DESC LIMIT 10;
+  Each row should show order_id, from→to status, source, and ts.
+
+═══════════════════════════════════════════════════════
+WHAT'S NOT INCLUDED (FUTURE PHASES)
+═══════════════════════════════════════════════════════
+
+  Phase 30 — Auto-detect Shipped via ShipStation polling. For
+    ship-to-home orders, when ShipStation has a shipDate on the
+    order, flip the status automatically.
+
+  Phase 31 — Barcode scan-out page. /ship-out route with a
+    big auto-focused input. Scan the order barcode on the packing
+    slip, status flips, running list of "shipped this session"
+    builds up.
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD server/config/processing-settings.json
+  git checkout HEAD server/routes/sytist.js
+  git checkout HEAD client/src/pages/OrderDetailPage.js
+  git checkout HEAD client/src/pages/OrdersListPage.js
+  rm server/services/orderStatusService.js
+
+The order_status_audit table can be left in place — it's harmless
+and would just be empty going forward. To remove:
+  sqlite3 server/config/sytist-dashboard.db "DROP TABLE order_status_audit;"
+
+Hard refresh.

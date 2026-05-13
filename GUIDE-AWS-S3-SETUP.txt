@@ -1,0 +1,280 @@
+Getting AWS S3 credentials for Phase 42
+═══════════════════════════════════════════════════════
+
+This guide walks you through getting AWS credentials so the
+dashboard can upload composed green-screen thumbnails to S3.
+Total time: about 15 minutes if you don't have an AWS
+account yet, 5 minutes if you do.
+
+You only have to do this once. After it's set up, the
+dashboard handles everything automatically.
+
+THREE PATHS — PICK ONE
+─────────────────────────────────────────────
+
+A. Sytist's existing bucket (if Sytist gave you write
+   credentials to their bucket)
+B. Your own AWS account, new bucket
+C. Your own AWS account, existing bucket
+
+Path A is rare. Path B is the standard recommendation for
+most setups. Path C if you already have an AWS bucket
+you'd like to reuse.
+
+═══════════════════════════════════════════════════════
+PATH A — SYTIST'S BUCKET
+═══════════════════════════════════════════════════════
+
+If Sytist support gave you:
+  - An AWS Access Key ID
+  - An AWS Secret Access Key
+  - A bucket name
+  - A region (probably us-east-1)
+
+You're done. Skip to "FILLING IN THE DASHBOARD" below.
+
+Note: also ask Sytist whether the bucket is configured to
+allow public-read ACLs on uploaded objects, and what key
+prefix they want us to use (so we don't collide with their
+own files).
+
+═══════════════════════════════════════════════════════
+PATH B — NEW BUCKET IN YOUR OWN AWS ACCOUNT
+═══════════════════════════════════════════════════════
+
+Step 1: Sign up for AWS (if you don't already have an
+account)
+
+  Go to https://aws.amazon.com/
+  Click "Create an AWS Account" (top right)
+  Requires a credit card, but S3 use for this is minimal
+  (~$0.50/month for a few thousand thumbnails).
+
+Step 2: Create the S3 bucket
+
+  Log in to the AWS Console.
+  Search for "S3" in the top search bar; click it.
+  Click "Create bucket".
+
+  Bucket name: pick something like
+    sportsline-photography-composed
+  (must be globally unique across all of AWS; if taken,
+  add a suffix like "-2026")
+
+  Region: us-east-1 is fine for general use. Pick a region
+  close to your operating location for lowest latency.
+
+  Object Ownership: ACLs enabled — Object writer
+    (we need ACLs so we can set public-read on upload)
+
+  Block Public Access settings for this bucket:
+    UNCHECK "Block all public access"
+    UNCHECK the four sub-options too
+    Confirm by ticking the "I acknowledge..." checkbox
+    that appears
+
+  All other defaults are fine.
+  Click "Create bucket".
+
+Step 3: Set a bucket policy (allow public reads)
+
+  Click into the bucket you just created.
+  Click the "Permissions" tab.
+  Scroll to "Bucket policy". Click "Edit".
+
+  Paste this JSON (REPLACE bucket-name with your actual
+  bucket name):
+
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "PublicReadComposedThumbnails",
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::bucket-name/sytist-dashboard-composed/*"
+      }
+    ]
+  }
+
+  Click "Save changes". You should see a yellow
+  "Publicly accessible" badge on the bucket — that's
+  EXPECTED for our use case.
+
+Step 4: Create an IAM user for the dashboard
+
+  In the AWS console search bar, search "IAM"; click it.
+
+  Left sidebar: Users → Create user.
+
+  User name: sytist-dashboard
+  Click Next.
+
+  "Set permissions" → choose "Attach policies directly".
+  Don't pick any existing policy. Click Next.
+  Click "Create user".
+
+Step 5: Attach an inline policy (least-privilege)
+
+  Click into the newly-created user.
+  Permissions tab → Add permissions → Create inline policy.
+  Click the "JSON" tab.
+
+  Paste this (REPLACE bucket-name with yours):
+
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": [
+          "s3:PutObject",
+          "s3:PutObjectAcl",
+          "s3:DeleteObject"
+        ],
+        "Resource": "arn:aws:s3:::bucket-name/sytist-dashboard-composed/*"
+      },
+      {
+        "Effect": "Allow",
+        "Action": [
+          "s3:ListBucket"
+        ],
+        "Resource": "arn:aws:s3:::bucket-name",
+        "Condition": {
+          "StringLike": {
+            "s3:prefix": "sytist-dashboard-composed/*"
+          }
+        }
+      }
+    ]
+  }
+
+  Click "Next".
+  Policy name: sytist-dashboard-s3-policy
+  Click "Create policy".
+
+Step 6: Generate access keys
+
+  Click into the user (sytist-dashboard).
+  "Security credentials" tab.
+  Scroll to "Access keys".
+  Click "Create access key".
+
+  Use case: "Application running outside AWS". Click Next.
+  Description tag: optional. Click "Create access key".
+
+  YOU WILL SEE TWO VALUES:
+    Access key:        AKIA...           (≈20 chars)
+    Secret access key: ...                (≈40 chars)
+
+  *** IMPORTANT *** You will NEVER be shown the secret
+  access key again after you close this page. Copy both
+  values somewhere safe NOW. If you lose them, you'll
+  have to delete and re-create the key pair.
+
+Done. Skip to "FILLING IN THE DASHBOARD".
+
+═══════════════════════════════════════════════════════
+PATH C — EXISTING BUCKET
+═══════════════════════════════════════════════════════
+
+Use steps 3, 4, 5, 6 from Path B against your existing
+bucket. You'll need to add the public-read bucket policy
+and ensure Block Public Access is OFF for the keys we'll
+write. Use a unique prefix (sytist-dashboard-composed/)
+so we don't conflict with existing objects.
+
+═══════════════════════════════════════════════════════
+FILLING IN THE DASHBOARD
+═══════════════════════════════════════════════════════
+
+  1. Open the dashboard. Settings → API Keys.
+
+  2. Scroll to the "AWS S3 (composed green-screen
+     thumbnails)" section.
+
+  3. Fill in:
+     - AWS Access Key ID:       AKIA...
+     - AWS Secret Access Key:   (your 40-char secret)
+     - AWS Region:              us-east-1 (or whatever
+                                you picked)
+     - S3 Bucket Name:          (your bucket)
+     - S3 Key Prefix:           sytist-dashboard-composed/
+     - S3 Public URL Base:      (leave empty unless you
+                                set up CloudFront)
+     - Composed Thumbnail Backend: change from 'skip' to
+                                's3-sytist'
+
+  4. Click Save.
+
+  5. RESTART the server. Stop with Ctrl+C in the dev
+     terminal, then run `npm run dev` again.
+
+  6. Process a green-screen order. In the server log,
+     watch for:
+       [s3Sytist] Published composed thumbnail for order N
+         cart C → https://bucket.s3.region.amazonaws.com/
+                   sytist-dashboard-composed/N/C.jpg
+
+  7. Open that URL in a browser tab. You should see the
+     composed thumbnail image. If you see "Access Denied",
+     the bucket policy isn't set up correctly — go back
+     to Path B Step 3.
+
+  8. Open the order in ShipStation. The green-screen line
+     items should now show the composed thumbnail.
+
+═══════════════════════════════════════════════════════
+TROUBLESHOOTING
+═══════════════════════════════════════════════════════
+
+"[s3Sytist] @aws-sdk/client-s3 not available"
+  → Run `npm install` in the server directory.
+
+"[s3Sytist] AWS credentials not set in Settings → API Keys"
+  → Fill in Access Key ID + Secret in the dashboard
+    Settings, then RESTART the server (env vars are
+    only re-read on startup).
+
+"AccessDenied" when fetching the S3 URL in a browser
+  → Bucket policy isn't allowing public reads. Re-check
+    Path B Step 3, and ensure Block Public Access is
+    fully OFF on the bucket.
+
+"AccessDenied" in the dashboard log when uploading
+  → IAM policy missing permissions. Re-check Path B
+    Step 5 — the policy must include PutObject,
+    PutObjectAcl, DeleteObject, and ListBucket.
+
+"InvalidAccessKeyId"
+  → Typo in the dashboard's Access Key ID field, OR the
+    key was deactivated/deleted in AWS. Re-generate keys
+    in IAM (Path B Step 6).
+
+ShipStation shows a placeholder image instead of the
+thumbnail despite the URL working in a browser
+  → ShipStation's cache. Wait a few minutes. If it
+    persists, the issue might be HTTPS vs HTTP — make
+    sure the URL is https://.
+
+═══════════════════════════════════════════════════════
+COST ESTIMATE
+═══════════════════════════════════════════════════════
+
+For a typical photography business processing ~500
+green-screen orders/month, each with 1-4 line items:
+
+  Storage:     ~1000 objects × 50KB each = ~50MB
+               At $0.023/GB/mo → ~$0.001/mo
+  PUT requests: ~1000/mo × $0.005/1000 → ~$0.005/mo
+  GET requests (from ShipStation viewing thumbnails):
+                ~5000/mo × $0.0004/1000 → ~$0.002/mo
+  DELETE requests (cleanup at ship time):
+                ~1000/mo, free
+
+  Total: well under $0.05/month at typical volumes.
+
+The free tier covers 5GB of S3 storage and 20k GET +
+2k PUT requests per month for the first 12 months, so
+realistically you'll pay nothing for the first year.

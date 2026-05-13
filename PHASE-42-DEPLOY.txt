@@ -1,0 +1,218 @@
+Phase 42 — Composed green-screen thumbnails in ShipStation
+═══════════════════════════════════════════════════════
+
+WHAT THIS DELIVERS
+─────────────────────────────────────────────
+
+ShipStation's order detail page shows a thumbnail for each
+line item. Phase 41 hooked that up using Sytist's thumbUrl.
+For non-green-screen items, that works fine. For green-screen
+items, thumbUrl is a transparent PNG (subject keyed out) —
+ShipStation renders it on a gray background, which is
+misleading because the printed product will have the
+customer's chosen background composited in.
+
+Phase 42 fixes that case. When green-screen items are
+composed during Process, the dashboard also generates a
+small thumbnail of the composed result and (when configured)
+uploads it to S3. ShipStation gets the S3 URL as that item's
+imageUrl, so the thumbnail shown matches the product.
+
+A pluggable abstraction lets the storage backend swap later
+without code changes. Today: 'skip' (default, no-op) or
+'s3-sytist' (uploads to S3). Future: 'dashboard' (serve from
+the dashboard itself when it's hosted publicly).
+
+DEFAULT BEHAVIOR AFTER DEPLOY
+─────────────────────────────────────────────
+
+Composed Thumbnail Backend = 'skip' (no S3 traffic, no
+storage cost, no changes to the existing ShipStation
+behavior for green-screen items). Non-green-screen items
+continue to use thumbUrl as before.
+
+The S3 backend is fully implemented and waiting for
+credentials. To turn it on, see "ENABLING S3" below.
+
+WHAT'S IN THIS TARBALL
+─────────────────────────────────────────────
+
+NEW FILES (3):
+
+  server/services/composedThumbnailService.js
+    - publish() / cleanup() / status()
+    - Backend registry with fall-back to 'skip' when a
+      backend's prerequisites are missing
+    - Non-fatal error handling
+
+  server/services/thumbnailBackends/skip.js
+    - Default no-op backend
+
+  server/services/thumbnailBackends/s3Sytist.js
+    - AWS S3 backend
+    - Object key: {keyPrefix}{orderId}/{cartId}.jpg
+      Deterministic — re-processing overwrites cleanly
+    - Sets ContentType=image/jpeg, ACL=public-read
+    - cleanup() lists by order prefix and bulk-deletes
+
+MODIFIED FILES (5):
+
+  server/config/appSettings.js
+    - Added 'awsSecretAccessKey' to SECRET_FIELDS for
+      masking
+    - Added 7 new field definitions under section 'aws_s3':
+      * AWS Access Key ID
+      * AWS Secret Access Key (masked)
+      * AWS Region (default: us-east-1)
+      * S3 Bucket Name
+      * S3 Key Prefix (default: sytist-dashboard-composed/)
+      * S3 Public URL Base (optional, for CDN)
+      * Composed Thumbnail Backend (default: skip)
+
+  server/services/processingService.js
+    - Step 1.4 now resizes the composed buffer to 500px max
+      and calls composedThumbnailService.publish()
+    - On success, sets li.composedImageUrl
+    - Failures are non-fatal (warning only)
+
+  server/services/shipstationService.js
+    - imageUrl resolution now prefers li.composedImageUrl
+      first, falls back to Sytist's thumbUrl chain
+
+  server/services/schedulerService.js
+    - After successful Sytist sync to shipped status, calls
+      composedThumbnailService.cleanup(orderId) to remove
+      stored composed thumbnails (storage hygiene)
+
+  server/package.json
+    - Added @aws-sdk/client-s3 dependency
+
+  client/src/pages/settings/ApiKeysPage.js
+    - Added 'aws_s3' to sectionOrder and sectionTitles so
+      the new settings show up in the UI
+
+DEPLOY
+─────────────────────────────────────────────
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-42.tar.gz --strip-components=1
+
+After extract, INSTALL THE NEW DEPENDENCY:
+
+  cd server
+  npm install
+  cd ..
+
+nodemon will restart. Hard-refresh the browser.
+
+VERIFY (default 'skip' mode)
+─────────────────────────────────────────────
+
+  1. Open Settings → API Keys. You should see a new section
+     "AWS S3 (composed green-screen thumbnails)" with 7
+     empty fields. Composed Thumbnail Backend should
+     default to 'skip'.
+
+  2. Process a green-screen order. Server log should NOT
+     show any S3 calls or warnings.
+
+  3. The ShipStation order should look identical to what
+     Phase 41 produced — non-green-screen items have
+     thumbnails, green-screen items have no imageUrl set
+     (which is the current behavior).
+
+ENABLING S3 (later, when you have credentials)
+─────────────────────────────────────────────
+
+  1. In Settings → API Keys, fill in:
+     - AWS Access Key ID (your IAM user's public key)
+     - AWS Secret Access Key (your IAM user's private key)
+     - AWS Region (e.g. us-east-1)
+     - S3 Bucket Name (the bucket you want to upload to)
+     - S3 Key Prefix (default 'sytist-dashboard-composed/'
+       is fine; change if you want a different folder)
+     - Composed Thumbnail Backend: change from 'skip' to
+       's3-sytist'
+
+  2. Save. Server applies the env vars without restart.
+
+  3. RESTART the server. (The AWS SDK client constructs at
+     module load; a save-without-restart picks up the env
+     vars but not the SDK client. Restart is the safe
+     path.)
+
+  4. Process a green-screen order. Server log should show:
+       [s3Sytist] Published composed thumbnail for order N
+         cart C → https://...
+
+  5. Open the order in ShipStation. The green-screen line
+     items should now have a thumbnail showing the composed
+     image (subject + background).
+
+S3 BUCKET REQUIREMENTS
+─────────────────────────────────────────────
+
+The bucket must allow public-read objects so ShipStation can
+fetch them. This means EITHER:
+
+  (a) The bucket policy explicitly grants public-read on
+      objects under the configured prefix, OR
+
+  (b) The bucket's "Block Public Access" setting allows
+      public ACLs. (Modern AWS accounts have this turned
+      ON by default and silently REJECT public-read ACLs.
+      You may need to turn off "Block public access to
+      buckets and objects granted through new access
+      control lists (ACLs)" specifically.)
+
+If thumbnails fail to display in ShipStation despite the
+upload succeeding, the public-read part is the most likely
+culprit. Open the URL in an incognito browser tab — if you
+get an Access Denied XML response, the bucket isn't serving
+the object publicly.
+
+IAM PERMISSIONS NEEDED
+─────────────────────────────────────────────
+
+The IAM user for the access key needs (minimum):
+
+  s3:PutObject       (publish)
+  s3:PutObjectAcl    (set public-read ACL on upload)
+  s3:DeleteObject    (cleanup)
+  s3:ListBucket      (cleanup list-and-delete)
+
+Scope these to the bucket and prefix you configured. The
+included aws-iam-policy.json file (next file in this
+section, see GUIDE-AWS-S3-SETUP.txt) gives a template.
+
+FAILURE HANDLING
+─────────────────────────────────────────────
+
+  - publish() throws → caught in composedThumbnailService,
+    returns null → no imageUrl set on the line item →
+    ShipStation shows a placeholder for that item only.
+  - cleanup() throws → caught in schedulerService, logs a
+    warning, doesn't undo the ship sync.
+  - AWS SDK not installed → backend reports
+    isConfigured()=false → falls back to 'skip'.
+  - Bad credentials → publish() throws → falls into the
+    error handler above.
+
+In ALL failure modes the Process pipeline continues
+without interruption.
+
+ROLLBACK
+─────────────────────────────────────────────
+
+  git checkout HEAD server/config/appSettings.js
+  git checkout HEAD server/services/processingService.js
+  git checkout HEAD server/services/shipstationService.js
+  git checkout HEAD server/services/schedulerService.js
+  git checkout HEAD server/package.json
+  git checkout HEAD client/src/pages/settings/ApiKeysPage.js
+  rm server/services/composedThumbnailService.js
+  rm -rf server/services/thumbnailBackends
+
+Restart server. If you were running 's3-sytist' and have
+objects in S3, they remain but are no longer referenced.
+You can delete them manually via the AWS console.

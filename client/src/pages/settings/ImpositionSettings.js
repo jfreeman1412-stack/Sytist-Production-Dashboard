@@ -12,6 +12,7 @@ import {
   TokenList,
   settingsStyles,
 } from '../../components/SettingsForm';
+import ImpositionLayoutEditor from './ImpositionLayoutEditor';
 
 /**
  * Imposition settings — two tabs: Layouts and Mappings.
@@ -207,6 +208,29 @@ function LayoutsTab({ onStatus }) {
     }
   }
 
+  // Phase 27: editor-driven save. Receives a fully-shaped layout
+  // payload from ImpositionLayoutEditor (no JSON parsing needed).
+  async function handleSaveLayout(payload) {
+    setSaving(true);
+    setEditingError(null);
+    try {
+      if (editingLayout === 'new') {
+        await api.post('/api/sytist/imposition/layouts', payload);
+        onStatus({ kind: 'success', message: `Layout "${payload.name}" added` });
+      } else {
+        const id = payload.id || editingLayout.id;
+        await api.put(`/api/sytist/imposition/layouts/${id}`, payload);
+        onStatus({ kind: 'success', message: `Layout "${payload.name}" updated` });
+      }
+      closeModal();
+      await load();
+    } catch (err) {
+      setEditingError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
   async function handleDelete(layout) {
     if (
       !window.confirm(
@@ -305,27 +329,19 @@ function LayoutsTab({ onStatus }) {
               : `Edit layout: ${editingLayout.name}`
           }
           onClose={closeModal}
+          wide
         >
-          <FormRow
-            label="Layout JSON"
-            hint="Required: name, cols, rows, itemWidth, itemHeight, sheetWidth, sheetHeight, dpi. Optional: colGap, rowGap, centerOnSheet, marginLeft, marginTop, textOverlays. ID is generated if omitted."
-          >
-            <TextArea
-              value={editingJson}
-              onChange={setEditingJson}
-              rows={20}
-              monospace
-            />
-          </FormRow>
-          {editingError && <StatusBanner kind="error" message={editingError} />}
-          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-            <Button variant="ghost" onClick={closeModal}>
-              Cancel
-            </Button>
-            <Button variant="primary" onClick={handleSaveModal} disabled={saving}>
-              {saving ? 'Saving…' : 'Save'}
-            </Button>
-          </div>
+          <ImpositionLayoutEditor
+            initialLayout={
+              editingLayout === 'new'
+                ? null
+                : editingLayout
+            }
+            onSave={handleSaveLayout}
+            onCancel={closeModal}
+            saving={saving}
+            error={editingError}
+          />
         </Modal>
       )}
     </Section>
@@ -564,7 +580,7 @@ function TokensTab() {
 
 // ─── Modal ─────────────────────────────────────────────────
 
-function Modal({ title, onClose, children }) {
+function Modal({ title, onClose, children, wide }) {
   // Close on escape
   useEffect(() => {
     function onKey(e) {
@@ -596,7 +612,9 @@ function Modal({ title, onClose, children }) {
           borderRadius: 8,
           padding: 24,
           width: '100%',
-          maxWidth: 800,
+          // Phase 27: wider modal for the imposition WYSIWYG editor
+          // (form fields + live SVG preview side by side need room).
+          maxWidth: wide ? 1200 : 800,
           maxHeight: '90vh',
           overflow: 'auto',
         }}

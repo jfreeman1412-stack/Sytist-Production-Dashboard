@@ -686,6 +686,26 @@ export default function LayoutDesignerPage() {
     return out;
   }, [graphicsLibrary, graphicsBust, layoutId]);
 
+  // Phase 26: responsive canvas sizing. The ref + state + effect
+  // MUST be declared before any early returns below, otherwise
+  // React's hooks rules are violated (different hook count between
+  // first render — when loading=true — and later renders).
+  const leftColRef = useRef(null);
+  const [leftColWidth, setLeftColWidth] = useState(1100);
+  useEffect(() => {
+    if (!leftColRef.current) return undefined;
+    const el = leftColRef.current;
+    function measure() {
+      const w = el.getBoundingClientRect().width;
+      if (w > 0) setLeftColWidth(w);
+    }
+    measure();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   if (loading) {
     return (
       <div>
@@ -707,16 +727,23 @@ export default function LayoutDesignerPage() {
   const variantDef = layout.variants?.[variant];
   const slots = variantDef?.slots || [];
 
-  // Canvas dimensions: keep the longer side at the target.
-  // Phase 9f: bumped from 504 → 700. Operators design at slot-level
-  // detail and need to see the canvas clearly. The grid below also
-  // gets adjusted to give the canvas more room.
-  const TARGET_LONG_SIDE = 700;
+  // Phase 26: canvas dimensions derived from leftColWidth (measured
+  // above by ResizeObserver). Canvas height bumped 50% vs natural
+  // aspect fit so there's more vertical room for bleed area work.
   const aspect = layout.sheetWidth / layout.sheetHeight;
+  // Canvas width: use the full left column. Then bump height by 50%
+  // compared to natural aspect fit so the canvas is taller — operator
+  // requested ~50% more vertical room for bleed work.
+  const HEIGHT_BUMP = 1.5;
+  // Width target = column width (minus small padding for the wrapper).
+  // Height target derived from aspect; then we apply HEIGHT_BUMP and
+  // also recompute width if the bumped height would exceed something
+  // reasonable.
+  const baseLong = Math.max(900, leftColWidth - 24);
   const canvasWidth =
-    aspect >= 1 ? TARGET_LONG_SIDE : TARGET_LONG_SIDE * aspect;
+    aspect >= 1 ? baseLong : baseLong * aspect;
   const canvasHeight =
-    aspect >= 1 ? TARGET_LONG_SIDE / aspect : TARGET_LONG_SIDE;
+    (aspect >= 1 ? baseLong / aspect : baseLong) * HEIGHT_BUMP;
 
   return (
     <div>
@@ -781,12 +808,17 @@ export default function LayoutDesignerPage() {
       <div
         style={{
           display: 'grid',
-          gridTemplateColumns: `${canvasWidth + 80}px 1fr`,
+          // Phase 26: 7:3 ratio so right column is ~30% of the row.
+          // Designer fills the full left column. Preview controls
+          // (CanvasFooterToolbar) moved from below the canvas to
+          // the right column under Layers.
+          gridTemplateColumns: '7fr 3fr',
           gap: 16,
         }}
       >
-        {/* LEFT: variant tabs + canvas + toolbar */}
-        <div>
+        {/* LEFT: variant tabs + canvas (Phase 26: preview toolbar
+            moved to the right column). */}
+        <div ref={leftColRef}>
           <VariantTabs
             layout={layout}
             current={variant}
@@ -812,36 +844,9 @@ export default function LayoutDesignerPage() {
             hiddenSlots={hiddenSlots}
             lockedSlots={lockedSlots}
           />
-          <CanvasFooterToolbar
-            snapEnabled={snapEnabled}
-            onSnapToggle={() => setSnapEnabled((v) => !v)}
-            previewMode={previewMode}
-            onPreviewModeChange={setPreviewMode}
-            previewOrderId={previewOrderId}
-            previewCartId={previewCartId}
-            onPreviewOrderIdChange={(v) => {
-              // When the typed order ID changes, drop any previously
-              // loaded line items — they were for the old order.
-              setPreviewOrderId(v);
-              if (String(v) !== loadedOrderId) {
-                setOrderLineItems(null);
-                setOrderError(null);
-                setPreviewCartId('');
-              }
-            }}
-            onPreviewCartIdChange={setPreviewCartId}
-            previewLoading={previewLoading}
-            previewError={previewError}
-            // Phase 10a: line-item picker
-            orderLineItems={orderLineItems}
-            orderLoading={orderLoading}
-            orderError={orderError}
-            loadedOrderId={loadedOrderId}
-            onLoadOrder={() => loadOrderLineItems(previewOrderId)}
-          />
         </div>
 
-        {/* RIGHT: layers panel + layout meta editor */}
+        {/* RIGHT: layers panel + layout meta + preview controls */}
         <div>
           <LayoutMetaEditor
             layout={layout}
@@ -880,6 +885,33 @@ export default function LayoutDesignerPage() {
             lockedSlots={lockedSlots}
             onToggleHidden={toggleSlotHidden}
             onToggleLocked={toggleSlotLocked}
+          />
+          <CanvasFooterToolbar
+            snapEnabled={snapEnabled}
+            onSnapToggle={() => setSnapEnabled((v) => !v)}
+            previewMode={previewMode}
+            onPreviewModeChange={setPreviewMode}
+            previewOrderId={previewOrderId}
+            previewCartId={previewCartId}
+            onPreviewOrderIdChange={(v) => {
+              // When the typed order ID changes, drop any previously
+              // loaded line items — they were for the old order.
+              setPreviewOrderId(v);
+              if (String(v) !== loadedOrderId) {
+                setOrderLineItems(null);
+                setOrderError(null);
+                setPreviewCartId('');
+              }
+            }}
+            onPreviewCartIdChange={setPreviewCartId}
+            previewLoading={previewLoading}
+            previewError={previewError}
+            // Phase 10a: line-item picker
+            orderLineItems={orderLineItems}
+            orderLoading={orderLoading}
+            orderError={orderError}
+            loadedOrderId={loadedOrderId}
+            onLoadOrder={() => loadOrderLineItems(previewOrderId)}
           />
         </div>
       </div>
@@ -1057,12 +1089,35 @@ function CanvasFooterToolbar({
             }}
           >
             <div style={{ flex: 1 }}>
-              <FormRow label="Order ID" hint="Enter an order, then click Load">
-                <TextInput
+              <FormRow label="Order ID" hint="Enter an order, then click Load (or press Enter)">
+                <input
+                  type="text"
                   value={previewOrderId}
-                  onChange={onPreviewOrderIdChange}
+                  onChange={(e) => onPreviewOrderIdChange(e.target.value)}
+                  onKeyDown={(e) => {
+                    // Phase 23: Enter loads the order. Useful for
+                    // barcode scanners that auto-send a CR at end of
+                    // input, and for the operator who wants to keep
+                    // hands on the keyboard.
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      if (previewOrderId && !orderLoading) {
+                        onLoadOrder();
+                      }
+                    }
+                  }}
                   placeholder="e.g. 110855"
-                  monospace
+                  style={{
+                    width: '100%',
+                    padding: '8px 10px',
+                    fontSize: 13,
+                    fontFamily: 'var(--font-mono, monospace)',
+                    background: 'var(--bg-input)',
+                    border: '1px solid var(--border-color)',
+                    borderRadius: 4,
+                    color: 'var(--text-primary)',
+                    boxSizing: 'border-box',
+                  }}
                 />
               </FormRow>
             </div>
@@ -1284,7 +1339,7 @@ function SlotEditorBody({
     // an empty string when the user clears a field; if we stored that,
     // downstream code (drag math, .toFixed displays, SVG attributes)
     // would break. For numeric fields, an empty input means "0".
-    const numericFields = new Set(['x', 'y', 'w', 'h', 'fontSize']);
+    const numericFields = new Set(['x', 'y', 'w', 'h', 'fontSize', 'rotation']);
     let v = value;
     if (numericFields.has(field)) {
       const n = Number(v);
@@ -1473,6 +1528,16 @@ function SlotEditorBody({
                 />
                 Shrink to fit
               </label>
+            </FormRow>
+            <FormRow
+              label="Rotation (°)"
+              hint="0 = horizontal · 90 = sideways up · 180 = upside down · -90 / 270 = sideways down"
+            >
+              <NumberInput
+                value={slot.rotation ?? 0}
+                onChange={(v) => update('rotation', v)}
+                step="1"
+              />
             </FormRow>
           </div>
         </>

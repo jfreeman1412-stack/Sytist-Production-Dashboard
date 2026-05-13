@@ -1,0 +1,202 @@
+Phase 43 — Composed thumbnail cache + Push Packaging resilience
+═══════════════════════════════════════════════════════
+
+WHAT THIS DELIVERS
+─────────────────────────────────────────────
+
+Five related fixes, all related to making the
+"Send to ShipStation" button on the order detail card
+work as well as the regular Process flow.
+
+  1. NEW SQLite cache for composed thumbnail URLs.
+     Process Step 1.4 writes them; Push Packaging reads
+     them.
+
+  2. Push Packaging hydrates composedImageUrl on each
+     line item from cache, so the SS payload sends the
+     composed thumbnail URL (not the raw keyed-out PNG).
+
+  3. orderDate ISO 8601 conversion. Sytist's MySQL
+     returns DATETIME as "YYYY-MM-DD HH:MM:SS" (with
+     space) which ShipStation rejects with a confusing
+     404. Now converted via new Date(...).toISOString().
+
+  4. Push Packaging pre-checks via listOrders before
+     attempting an UPDATE. If the linked SS order no
+     longer exists (operator deleted it), automatically
+     switches to fresh-create instead of trying to
+     update a tombstoned record.
+
+  5. Belt-and-suspenders: if the UPDATE call returns
+     404 anyway (race condition between pre-check and
+     push), auto-retry as fresh create.
+
+PLUS: keeps the Phase 42 hotfix 1 diagnostic logs in
+processingService and sytistDbService — so we'll
+finally get the per-cart greenscreen state in the log
+when you next reprint an order.
+
+WHY THE CACHE IS NECESSARY
+─────────────────────────────────────────────
+
+composedThumbnailService.publish() returns a URL after
+uploading a composed JPEG to S3 (or wherever). Today
+that URL is mutated onto the line item as
+li.composedImageUrl for the duration of one
+processOrder call.
+
+But the "Send to ShipStation" button on the order
+detail card is a different route handler:
+  - Reads order state fresh from Sytist
+  - Builds SS payload
+  - Does NOT run Step 1.4 (no compose, no upload)
+
+Without a cache, this button never sees previously
+uploaded thumbnail URLs and always falls back to the
+keyed-out PNG.
+
+The cache stores the URL keyed by (orderId, cartId)
+during Process, so Push Packaging can hydrate before
+building the payload.
+
+WHAT'S IN THIS TARBALL
+─────────────────────────────────────────────
+
+NEW FILES (1):
+
+  server/services/composedThumbnailCacheService.js
+    - SQLite-backed (orderId, cartId) → URL map
+    - upsert(), listByOrder(), getUrl(), deleteByOrder()
+    - Uses same sytist-dashboard.db as other services
+    - Auto-creates table on first init
+
+MODIFIED FILES (5):
+
+  server/services/processingService.js
+    + Imports composedThumbnailCacheService
+    + Step 1.4: after publish(), upsert() the URL into
+      the cache (non-fatal on failure)
+    + Keeps the Phase 42 hotfix 1 diagnostic log
+
+  server/services/shipstationService.js
+    + orderDate conversion via new Date(...).toISOString()
+      with try/catch fallback to current time on parse
+      failure
+    + Logs a warning if the input couldn't be parsed
+
+  server/services/schedulerService.js
+    + After successful Sytist sync to shipped, ALSO
+      clears the SQLite cache rows (in addition to the
+      Phase 42 S3 cleanup)
+
+  server/routes/sytist.js
+    + push-packaging route: hydrate li.composedImageUrl
+      from cache before buildOrderFromSytist
+    + push-packaging route: listOrders pre-check by
+      orderNumber; if not found, switch to fresh-create
+      mode without orderId
+    + push-packaging route: if SS returns 404 on UPDATE
+      anyway, auto-retry as fresh create
+    + Adds 'pathTaken' to response: 'update' |
+      'fresh_create' | 'fresh_create_after_404'
+
+  server/services/sytistDbService.js
+    + Keeps the Phase 42 hotfix 1 diagnostic log at
+      package expansion time
+
+DEPLOY
+─────────────────────────────────────────────
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-43.tar.gz --strip-components=1
+
+No npm install needed. nodemon picks up the changes.
+
+The new SQLite table (composed_thumbnails) is created
+automatically on first Process after deploy.
+
+VERIFY
+─────────────────────────────────────────────
+
+  Test 1 (orderDate fix + listOrders pre-check):
+    1. The current state has order 110747 with a stale
+       link pointing at SS#525497750 (which you deleted).
+    2. Click "Send to ShipStation" on the ShipStation
+       card.
+    3. Expected log lines:
+
+       [push-packaging:110747] pre-check: SS#525497750
+         not found via listOrders (operator likely deleted
+         it). Will create fresh.
+       [push-packaging:110747] pushing payload — weight=
+         142grams, ... → fresh create (link was stale)
+       [push-packaging:110747] createOrder OK (fresh_create)
+         → SS#XXXXXXXXX packageCode=...
+
+    4. The order should land in ShipStation as a brand
+       new order, no 404.
+
+  Test 2 (composed thumbnail flow — only if you also
+  resolve the green-screen compose issue):
+    1. Find an order where Step 1.4 DOES fire and
+       publishes thumbnails (look for the [s3Sytist]
+       Published log line during Process).
+    2. After Process, run this query to verify the
+       cache was populated:
+
+       (use a SQLite browser on
+        server/config/sytist-dashboard.db)
+       SELECT * FROM composed_thumbnails WHERE order_id = 'NNNNN';
+
+    3. Click "Send to ShipStation" on that order's
+       detail card.
+    4. Expected log lines:
+
+       [push-packaging:NNNNN] hydrated composedImageUrl
+         on M line item(s) from cache
+       [push-packaging:NNNNN] pushing payload ...
+
+    5. Inspect the payload in the log. The 'imageUrl'
+       field on green-screen items should be the S3
+       URL, not the raw Sytist thumbUrl.
+
+  Test 3 (regular Process flow still works):
+    1. Process any order normally. Verify no change in
+       behavior beyond the new cache rows showing up.
+
+ROLLBACK
+─────────────────────────────────────────────
+
+  git checkout HEAD server/services/processingService.js
+  git checkout HEAD server/services/shipstationService.js
+  git checkout HEAD server/services/schedulerService.js
+  git checkout HEAD server/routes/sytist.js
+  git checkout HEAD server/services/sytistDbService.js
+  rm server/services/composedThumbnailCacheService.js
+
+The composed_thumbnails SQLite table remains but is
+inert. Drop it later with:
+  DROP TABLE composed_thumbnails;
+
+NOTES ON THE GREEN-SCREEN COMPOSE ISSUE
+─────────────────────────────────────────────
+
+We still have an open question from the earlier session:
+why didn't Step 1.4 fire on order 110747 the first time
+it was processed (the 3 green-screen items got NO
+composed thumbnails uploaded). The diagnostic logs from
+Phase 42 hotfix 1 are kept in this bundle — when you
+reprint order 110747, the log will show:
+
+  [SytistDB] Package cart 482071 sku=3 expansion:
+    parent greenScreen=... parent backgroundPhoto=...
+    parent bgFullUrl=... (propagating to 2 constituents)
+
+  [Processing] Order 110747 cart 482071-pkg-27 sku=27:
+    greenScreen=... backgroundPhoto=... bgFullUrl=...
+    shouldComposite=...
+
+Send me those log lines when you have them and I'll
+build the right fix. Most likely Case A (backgroundPhoto
+is NULL because the ms_photos row for cart_photo_bg
+isn't being found).

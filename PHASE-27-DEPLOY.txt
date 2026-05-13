@@ -1,0 +1,117 @@
+Phase 27 — Imposition WYSIWYG editor (ported from PhotoDay dashboard)
+
+═══════════════════════════════════════════════════════
+WHAT THIS DOES
+═══════════════════════════════════════════════════════
+
+Replaces the JSON-textarea modal in Settings → Imposition with a
+proper form-driven editor and live SVG preview, ported from the
+older PhotoDay dashboard at sportsline-dashboard/.
+
+The editor has:
+  - Form fields for all geometry: name, cols, rows, item dims,
+    sheet dims, DPI, col/row gaps, center-on-sheet toggle, left
+    and top margin
+  - Text-overlays sub-editor — repeating cards with text content,
+    position (X/Y), optional W/H, font size, rotation, color,
+    auto-size, center-align
+  - Variable insertion buttons that pull from
+    /api/sytist/imposition/text-variables (same endpoint Sytist
+    already exposed)
+  - Live SVG preview on the right showing:
+      - sheet (white)
+      - grid cells (blue)
+      - gap regions (red, faint)
+      - left/top margins (green, faint)
+      - extra space beyond grid (orange, faint)
+      - text overlay anchors (color-coded dashed boxes)
+      - ruler ticks along top and left edges
+  - "Live" — every edit re-renders the preview immediately
+
+Schema is unchanged. JSON payload sent to the server is identical
+to what the old JSON textarea produced. Old imposition layouts
+load and edit correctly. Backward-compat: layouts that use the
+legacy single `gap` field get migrated to colGap/rowGap on first
+load.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+NEW:
+  client/src/pages/settings/ImpositionLayoutEditor.js (~1000 LOC)
+    The editor component. Exports the default React component
+    plus inline helper components (TextOverlaysEditor,
+    LayoutPreviewSvg). All styling uses Sytist's primitives from
+    SettingsForm.js — no className-based CSS.
+
+MODIFIED:
+  client/src/pages/settings/ImpositionSettings.js
+    - Imports new ImpositionLayoutEditor
+    - Modal body changed from JSON textarea to <ImpositionLayoutEditor>
+    - Added handleSaveLayout (editor-driven save handler)
+    - Modal component gains `wide` prop (maxWidth 1200 vs 800)
+      so form + preview fit side-by-side
+    - Old handleSaveModal function left as dead code (harmless,
+      no longer wired to anything)
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-27.tar.gz --strip-components=1
+
+You should see 2 file lines:
+  x client/src/pages/settings/ImpositionLayoutEditor.js  (NEW)
+  x client/src/pages/settings/ImpositionSettings.js      (UPDATED)
+
+Webpack picks them up. Hard refresh Settings → Imposition.
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+  1. Open Settings → Imposition → click "New" or Edit on a row.
+  2. The modal should now show a form with all geometry fields on
+     the left, text-overlays editor below them, and a live SVG
+     preview on the right.
+  3. Change Columns from 4 → 6. The preview updates immediately
+     showing 6 cells across.
+  4. Add a text overlay. The overlay's dashed anchor box should
+     appear in the preview at the X/Y position you set.
+  5. Click "Center on sheet". The left/top margin fields disable
+     and auto-fill with computed centering values. The green
+     margin shading in the preview moves to match.
+  6. Click "Update Layout" or "Create Layout". Should save and
+     close the modal. The table refreshes with the updated values.
+
+  Open an existing layout — its values should populate every form
+  field correctly, including text overlays.
+
+═══════════════════════════════════════════════════════
+KNOWN LIMITATIONS
+═══════════════════════════════════════════════════════
+
+  - No drag-on-canvas for text overlays. You enter X/Y via inputs.
+    The PhotoDay editor was also numeric-input-only for overlays —
+    just with a visual preview to confirm positions. Same pattern
+    here.
+  - The preview is a simplified visualization, not a pixel-perfect
+    render. The actual rendered output uses impositionService on
+    the server side which knows about colors, fonts, etc.
+  - No "Raw JSON" escape hatch in the new editor. If you need to
+    edit a field that the editor doesn't expose, the API still
+    accepts the full JSON shape — you can POST/PUT directly. (Or
+    I can add a Raw JSON expandable section in a follow-up if
+    that's useful.)
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD client/src/pages/settings/ImpositionSettings.js
+  # Remove the new file:
+  rm client/src/pages/settings/ImpositionLayoutEditor.js
+
+Hard refresh.

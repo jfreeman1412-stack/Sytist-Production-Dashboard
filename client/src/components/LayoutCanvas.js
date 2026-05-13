@@ -74,7 +74,7 @@ export default function LayoutCanvas({
   // scales that slot proportionally around the cursor position.
   // Used by the override editor for fast adjustments. Off by default
   // — the layout designer doesn't want surprise scaling on scroll.
-  enableWheelScale = false,
+  enableWheelScale = true,
   // Phase 11d: live photo overlays. When supplied, playerPhoto and
   // playerBackground slots render the actual image inline at their
   // current position/size — instantly tracking drag/resize. Lets the
@@ -114,12 +114,25 @@ export default function LayoutCanvas({
   // Compute the on-screen → inches conversion factor. Re-derived on
   // every mousemove because the SVG might be in a flexbox that changes
   // size. Use getBoundingClientRect for accurate live values.
+  //
+  // Phase 23: the SVG's viewBox now includes bleed-area padding on
+  // every side (see BLEED_VIEWBOX_PADDING_IN below). The
+  // pixel-to-inch ratio is based on the FULL viewBox size, not
+  // just the canvas, because rect.width covers the entire SVG.
+  function bleedPaddingForLayout() {
+    // Phase 24: bumped 0.3 → 0.6 so the bleed area is roughly equal
+    // in size to the canvas itself on the smaller dimension. Gives
+    // generous room to extend slots past the canvas without the
+    // bleed area feeling cramped.
+    return Math.min(layout.sheetWidth, layout.sheetHeight) * 0.6;
+  }
   function getInchesPerPixel() {
     if (!svgRef.current) return { x: 0, y: 0 };
     const rect = svgRef.current.getBoundingClientRect();
+    const pad = bleedPaddingForLayout();
     return {
-      x: layout.sheetWidth / rect.width,
-      y: layout.sheetHeight / rect.height,
+      x: (layout.sheetWidth + pad * 2) / rect.width,
+      y: (layout.sheetHeight + pad * 2) / rect.height,
       rect,
     };
   }
@@ -130,36 +143,44 @@ export default function LayoutCanvas({
     return Math.round(value / snapStep) * snapStep;
   }
 
-  // Constrain a slot's position to fit within the sheet. Only applied
-  // for drag (resize already handles its own clamping based on the
-  // handle direction).
+  // Phase 21: bleed support — slots can extend past the canvas in any
+  // direction. The canvas defines the trim area; anything outside
+  // simply doesn't render in the final output (sharp's compositing
+  // naturally clips).
+  //
+  // Drag and resize now only enforce a generous outer bound (10× the
+  // canvas size in each direction) so a misclick + drag can't send a
+  // slot off into infinity and become unreachable. Otherwise positions
+  // and sizes are free.
+  //
+  // Minimum size still enforced (0.1") so slots can't disappear.
   function constrainPosition(slot) {
+    const maxOut = Math.max(layout.sheetWidth, layout.sheetHeight) * 10;
     return {
       ...slot,
-      x: clamp(slot.x, 0, layout.sheetWidth - slot.w),
-      y: clamp(slot.y, 0, layout.sheetHeight - slot.h),
+      x: clamp(slot.x, -maxOut, layout.sheetWidth + maxOut),
+      y: clamp(slot.y, -maxOut, layout.sheetHeight + maxOut),
     };
   }
 
-  // Constrain after a resize. Width/height must be positive; resulting
-  // box must stay inside the sheet.
+  // Constrain after a resize. Width/height must be positive but can
+  // now exceed the canvas — anything outside the trim just won't
+  // render in the final output. Position similarly unconstrained
+  // beyond the generous outer bound.
   function constrainSize(slot) {
     const minDim = 0.1; // 0.1 inch minimum so slots can't disappear
+    const maxOut = Math.max(layout.sheetWidth, layout.sheetHeight) * 10;
     let { x, y, w, h } = slot;
 
-    // Clamp position into sheet
-    x = clamp(x, 0, layout.sheetWidth);
-    y = clamp(y, 0, layout.sheetHeight);
+    // Clamp position to generous outer bound only.
+    x = clamp(x, -maxOut, layout.sheetWidth + maxOut);
+    y = clamp(y, -maxOut, layout.sheetHeight + maxOut);
 
-    // Clamp size to a positive minimum
+    // Clamp size to a positive minimum and a generous maximum.
     if (w < minDim) w = minDim;
     if (h < minDim) h = minDim;
-
-    // If x + w exceeds the sheet, pull w back (not x — the operator's
-    // intent during a resize is anchored to whichever edge they're not
-    // dragging)
-    if (x + w > layout.sheetWidth) w = layout.sheetWidth - x;
-    if (y + h > layout.sheetHeight) h = layout.sheetHeight - y;
+    if (w > maxOut) w = maxOut;
+    if (h > maxOut) h = maxOut;
 
     return { ...slot, x, y, w, h };
   }
@@ -317,6 +338,19 @@ export default function LayoutCanvas({
   const sheetH = layout.sheetHeight;
   const slots = variantDef?.slots || [];
 
+  // Phase 23: bleed-area padding inside the SVG viewBox. Expand the
+  // viewBox by 30% of the smaller canvas dimension on every side so
+  // slots can extend past the canvas without overlapping surrounding
+  // UI. Mouse events keep working because everything renders inside
+  // the SVG element (rather than overflowing via CSS).
+  //
+  // Tradeoff: the visible canvas is now smaller — roughly 60-70% of
+  // the wrapper depending on aspect ratio — because the SVG fits a
+  // larger viewBox into the same pixel space. The dark wrapper
+  // background becomes the visible bleed-area frame around the
+  // (orange dashed) trim line.
+  const BLEED_VIEWBOX_PADDING_IN = bleedPaddingForLayout();
+
   function handleBackgroundClick(e) {
     if (e.target === e.currentTarget) {
       onSlotSelect && onSlotSelect(null);
@@ -382,7 +416,7 @@ export default function LayoutCanvas({
         ref={svgRef}
         width="100%"
         height="100%"
-        viewBox={`0 0 ${sheetW} ${sheetH}`}
+        viewBox={`${-BLEED_VIEWBOX_PADDING_IN} ${-BLEED_VIEWBOX_PADDING_IN} ${sheetW + BLEED_VIEWBOX_PADDING_IN * 2} ${sheetH + BLEED_VIEWBOX_PADDING_IN * 2}`}
         preserveAspectRatio="xMidYMid meet"
         onMouseDown={(e) => {
           // Background click → deselect (only if no drag is in progress)
@@ -470,6 +504,25 @@ export default function LayoutCanvas({
             />
           );
         })}
+
+        {/* Phase 21: trim-line indicator. Drawn after all slot content
+            so it stays visible on top of slots that bleed past the
+            canvas edge. The dashed orange stroke marks the canvas
+            (trim) boundary so the operator can see at a glance what
+            part of a bleed slot will actually print. The rect at line
+            ~407 still draws the white canvas background; this is just
+            an overlay outline on top. */}
+        <rect
+          x="0"
+          y="0"
+          width={sheetW}
+          height={sheetH}
+          fill="none"
+          stroke="#ff9800"
+          strokeWidth={Math.min(sheetW, sheetH) * 0.005}
+          strokeDasharray={`${Math.min(sheetW, sheetH) * 0.04} ${Math.min(sheetW, sheetH) * 0.025}`}
+          pointerEvents="none"
+        />
 
         {/* Resize handles for the selected slot — drawn after slots so
             they overlay on top. Don't render handles for locked slots. */}
@@ -809,6 +862,19 @@ function SlotText({ slot, sampleTokens, x, y, w, h }) {
   // Floor at 6px-equivalent in inches
   inchFontSize = Math.max(inchFontSize, 6 / dpi);
 
+  // Phase 22: text rotation. The rotation pivot is the slot's
+  // CENTER, not the text anchor point, so rotation always feels
+  // intuitive regardless of alignment. The text element stays inside
+  // the slot's bounding box in unrotated space (so hit testing on the
+  // bounding rect still works); only the visual rendering rotates.
+  const rotation = Number(slot.rotation) || 0;
+  const pivotX = x + w / 2;
+  const pivotY = y + h / 2;
+  const transform =
+    rotation !== 0
+      ? `rotate(${rotation} ${pivotX} ${pivotY})`
+      : undefined;
+
   return (
     <text
       x={textX} y={y + h / 2}
@@ -817,6 +883,7 @@ function SlotText({ slot, sampleTokens, x, y, w, h }) {
       fontFamily={slot.fontFamily || 'Arial, sans-serif'}
       fontWeight={weight}
       fill={slot.color || '#000000'}
+      transform={transform}
       pointerEvents="none"
     >
       {resolvedText || '(empty text)'}

@@ -1,0 +1,162 @@
+Phase 34 — Green-screen compositing for the Process flow
+            (imposition + packing slip)
+
+═══════════════════════════════════════════════════════
+THE BUG THIS FIXES
+═══════════════════════════════════════════════════════
+
+Sytist line items with cart_photo_bg > 0 are flagged as
+green-screen, meaning the customer chose a background image for
+their transparent (keyed) photo. The dashboard's
+greenscreenService composites the subject onto the background.
+
+BEFORE Phase 34:
+  - The MANUAL preview endpoints in routes/sytist.js called
+    greenscreenService correctly.
+  - The MANUAL save endpoint for a single line item called it
+    correctly.
+  - But the FULL "Process this order" flow did NOT.
+
+So when the operator processed an order with green-screen items:
+  - Memory Mate (uses a composite layout with playerBackground
+    slot) → got its background via the composite engine ✓
+  - Mini Magnets / wallets / plain prints (uses impositionService
+    directly) → printed with NO background, just the keyed
+    transparent subject on white ✗
+  - Packing slip thumbnails → also no background, showed raw
+    keyed photos ✗
+
+AFTER Phase 34:
+  - New "Step 1.4" in processOrder composites green-screen line
+    items right after photo download.
+  - The composed file is written to disk as <photo>_composed.jpg
+    and downloaded.path is updated to point at it.
+  - Imposition reads this composed file → printed sheets now
+    have the background.
+  - Packing slip receives a composedByCartId map of disk paths
+    → its thumbnails use the composed file instead of fetching
+    thumbUrl → slip matches the actual print.
+  - Composite-mapped line items (Memory Mate) are SKIPPED in
+    Step 1.4 because they have their own playerBackground slot
+    in the composite engine. No double-compositing.
+
+═══════════════════════════════════════════════════════
+ARCHITECTURE
+═══════════════════════════════════════════════════════
+
+The compose step runs ONCE per cartId, after Step 1 (download)
+and before Step 1.5 (composite engine). It produces a single
+composed JPG on disk:
+
+  Z:\Photo Day\__Open Orders\Sytist_Orders\
+    110685_481629_JV_Baseball-0016.png       ← original transparent
+    110685_481629_JV_Baseball-0016_composed.jpg  ← Phase 34 output
+
+Downstream code (imposition, packing slip) reads from the
+composed file. Sharing one composed file across imposition +
+packing slip avoids duplicate work and guarantees they show the
+same thing.
+
+Failure mode: if compose fails (network, bad URL, etc.), the
+original file is left in place and a warning is logged. The
+order still processes — better a missing background than a
+missing item. The warning surfaces in the processing result UI
+as type='greenscreen_compose_error'.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED (2 files):
+
+  server/services/processingService.js
+    - Added greenscreenService require
+    - New "Step 1.4: green-screen compositing" loop between
+      Step 1 (download) and Step 1.5 (composite engine)
+    - Skips line items with composite mappings (composite engine
+      handles their backgrounds)
+    - Writes composed JPGs as <orig>_composed.jpg, updates
+      downloaded.path to point at the composed file
+    - Builds composedByCartId map and passes it to packingSlipService
+
+  server/services/packingSlipService.js
+    - buildSlipBuffer accepts a new composedByCartId option
+    - Thumbnail block prefers the composed file from disk when
+      one exists for this cartId; falls back to thumbUrl fetch
+      otherwise
+    - New warning type: thumb_composed_read_error
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-34.tar.gz --strip-components=1
+
+You should see 2 file lines:
+  x server/services/processingService.js
+  x server/services/packingSlipService.js
+
+nodemon picks them up. No client changes. No browser refresh needed.
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+Process an order that has at least one green-screen line item
+(cart_photo_bg > 0 in ms_cart). Look for:
+
+  1. Server log
+     For each green-screen line item you should see one line:
+       [Processing] Order N cart X: green-screen composed →
+       Z:\Photo Day\__Open Orders\Sytist_Orders\..._composed.jpg
+
+  2. File system
+     In Z:\Photo Day\__Open Orders\Sytist_Orders\ there should be:
+       - The original .png (transparent subject)
+       - A new _composed.jpg next to it (subject on background)
+
+  3. Imposition output (the printable sheet)
+     Open the imposed PNG. Subjects now appear on backgrounds.
+
+  4. Packing slip
+     Open the _packing_slip.jpg. Item thumbnails now show the
+     subject ON the background, not the raw keyed photo.
+
+  5. Memory Mate (or any composite-mapped item)
+     Unchanged. Continues to render via the composite engine.
+
+═══════════════════════════════════════════════════════
+KNOWN LIMITATIONS / FUTURE WORK
+═══════════════════════════════════════════════════════
+
+  - The composed file replaces the original in downloaded.path.
+    If any downstream code expected the raw transparent PNG
+    (other than the composite engine, which we explicitly skip),
+    it'll see the composed file. We checked the major paths
+    (imposition, .txt writer, packing slip) and they all just
+    need a printable image — the composed file is correct.
+
+  - If you switch backgrounds on an already-processed order and
+    reprocess, the composed file gets overwritten with the new
+    background. Atomic via .tmp+rename so there's no
+    half-written state.
+
+  - The composeWithBackground output is JPEG quality 92,
+    flattened onto the resized background. This matches the
+    preview path. If you want PNG for the composed output
+    (slightly larger, lossless), change `outputFormat: 'jpeg'`
+    to `'png'` in processingService.js Step 1.4.
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD server/services/processingService.js \
+                     server/services/packingSlipService.js
+
+Restart server. Process reverts to no-green-screen-in-imposition
+behavior (the bug you reported).
+
+The _composed.jpg files left on disk are harmless leftovers —
+delete them manually if cleanup matters.

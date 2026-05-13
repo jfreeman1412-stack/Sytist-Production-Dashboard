@@ -1,0 +1,161 @@
+Phase 18 — Path date fix + specialty routing rework
+
+═══════════════════════════════════════════════════════
+PROBLEMS FIXED
+═══════════════════════════════════════════════════════
+
+1. The {date} token in path templates resolved to order date, not
+   today's date. Result: orders processed today but placed days ago
+   landed in historical folders (e.g. 2026-05-06, 2026-05-07) when
+   today is 2026-05-12. Operator wants today's work in today's folder.
+
+2. Specialty items were routed to a separate basePath
+   (Z:\Sytist\__Open Orders\Specialty) and a specialty-only .txt
+   was written there. The .txt would fail with "Images for order
+   not stable after 30101ms" when waiting for the specialty image
+   to settle. And the structure made it harder for the operator
+   because an order's output was split across two trees.
+
+═══════════════════════════════════════════════════════
+WHAT THIS PHASE CHANGES
+═══════════════════════════════════════════════════════
+
+pathsService.js:
+  - {date}        → today's date (processing date), YYYY-MM-DD
+  - {order_date}  → NEW. The order's placed date, YYYY-MM-DD.
+                    Use this if you ever want order-date routing.
+  - knownTokens list updated for the Settings UI dropdown
+  - Top-of-file docstring updated to explain both tokens
+
+processingService.js:
+  - Specialty items now route to:
+      <downloadDir>/Specialty/<subfolder>-<orderId>/
+    instead of:
+      <specialtyBase>/<subfolder>/
+    All of an order's output (regular + specialty) lives under
+    the same downloadDir/{date}/{sort segments...} tree.
+  - The specialty .txt write block is GONE. Darkroom never sees
+    specialty items. The lab operator handles them by hand using
+    the packing slip (which still lists them with their highlight
+    color).
+  - Regular .txt still EXCLUDES specialty items (this was already
+    the case; nothing changed there).
+  - specialty-products.json's basePath field is no longer read.
+    The config still has it; it's safe to leave or remove.
+  - subResult.specialtyTxtPath still exists in the result shape
+    but is always null (backward-compatible with any caller).
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  server/services/pathsService.js
+  server/services/processingService.js
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-18.tar.gz --strip-components=1
+
+You should see exactly 2 file lines:
+  x server/services/pathsService.js
+  x server/services/processingService.js
+
+Nodemon picks up the changes. No client changes needed.
+
+═══════════════════════════════════════════════════════
+BEFORE COMMITTING — SAFETY CHECK
+═══════════════════════════════════════════════════════
+
+Both files are overwrites of files with current edits. After
+extracting:
+
+  git diff HEAD server/services/pathsService.js
+  git diff HEAD server/services/processingService.js
+
+Expected diffs:
+
+pathsService.js — should show:
+  - {date} renamed to look up _extractTodayDate (not _extractDate)
+  - New _extractOrderDate function
+  - {order_date} added to two knownTokens arrays
+  - Comment block at top updated
+
+processingService.js — should show:
+  - Specialty routing block rewritten (lines ~830-875)
+  - Specialty .txt write block REMOVED (was ~lines 1397-1437)
+  - Dead specialtyLineItems filter removed
+  - Comment updates
+
+If you see other unexpected changes, stop and tell me.
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+1. Quick smoke check on {date}:
+
+   Open Settings → Paths. The live resolved preview should now
+   show today's date (e.g. 2026-05-12) instead of the order's
+   date.
+
+2. Re-process order 110643 (the one that hit specialty_txt_failed):
+   - Should process clean, no warning about specialty_txt_failed
+   - Output folder should be 2026-05-12/... (today)
+   - Inside that folder, look for Specialty/ subfolder
+   - Inside Specialty/, look for "Acrylic Ornament 3.5x5-110643/"
+   - Inside THAT, look for the downloaded specialty image
+   - The order's regular .txt should NOT mention the specialty SKU
+   - The packing slip SHOULD show the specialty item with its
+     yellow highlight color
+
+3. Re-process a non-specialty order:
+   - Should land in 2026-05-12/... (today, not order date)
+   - No Specialty/ subfolder created
+   - Everything else identical to before
+
+4. Process a green-screen order:
+   - Phase 17 still works — background composited under subject
+   - Lands in 2026-05-12/... (today)
+
+═══════════════════════════════════════════════════════
+EDGE CASES
+═══════════════════════════════════════════════════════
+
+  - Specialty item with no configured subfolder: falls back to
+    the SKU number, e.g. "Specialty/26-110643/"
+  - Subfolder name with special characters (e.g. slashes,
+    quotes): sanitized to underscores before being used as a
+    folder name
+  - Orders with no orderNumber AND no orderId: falls back to
+    just "<subfolder>" (no -orderId suffix). Shouldn't happen
+    in practice.
+  - Empty orderDate from MySQL: {order_date} falls back to today
+    (preserving the old fallback behavior of _extractDate)
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD server/services/pathsService.js
+  git checkout HEAD server/services/processingService.js
+
+That returns you to pre-Phase-18 behavior.
+
+═══════════════════════════════════════════════════════
+NOTES
+═══════════════════════════════════════════════════════
+
+  - Existing orders processed BEFORE this phase are still in
+    their old folders (2026-05-06, 2026-05-07). Re-processing
+    them will create today's folder with fresh copies. The old
+    folders can be cleaned up by hand.
+  - If you have a saved path-overrides.json template that
+    specifically used {date} expecting order-date behavior, you
+    may want to change it to {order_date} so your templates
+    keep working the way you intended.
+  - specialty-products.json's basePath field is dead code now.
+    No harm in leaving it; safe to remove if you want it clean.

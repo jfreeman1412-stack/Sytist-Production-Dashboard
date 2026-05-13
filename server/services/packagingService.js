@@ -361,12 +361,48 @@ class PackagingService {
     const config = await this.getConfig();
     const items = order.lineItems || [];
 
-    // Ignore digital-only items for sizing/routing decisions.
-    // (They still appear in the SS payload's items[] with weight 0
-    // via _buildItemWeights below.)
+    // Phase 38: filter out items that should NOT influence packaging.
+    //
+    // The original filter (Phase 13) kept items with unknown SKUs at
+    // a fallback weight of 1oz, which meant any uncategorized SKU
+    // (digital downloads, gift certificates, unmapped products) got
+    // treated as physical and could push a digital-only order into
+    // a "Medium Box" bundle. The fix: be conservative — only items
+    // we KNOW are physical influence packaging.
+    //
+    // Five filter cases, in order of cheapness:
+    //
+    //   1. Missing/empty SKU                    → skip
+    //   2. Digital download flag                → skip
+    //      (lineItem.flags.download = true, set by sytistDbService
+    //      from Sytist's cart_download column AND from digital
+    //      package constituents)
+    //   3. Package header row                   → KEEP for routing
+    //      (forcePackage rules look at it; weight loop zero-weights
+    //      it to avoid double-counting against exploded constituents)
+    //   4. Known SKU with category 'digital'    → skip
+    //   5. Unknown SKU (not in productWeights)  → skip
+    //
+    // Anything that survives all 5 is a known physical SKU OR a
+    // package header. Both legitimately influence packaging.
     const physicalItems = items.filter((item) => {
-      const pw = config.productWeights[String(item.sku)];
-      return !pw || pw.category !== 'digital';
+      const sku = String(item.sku || '').trim();
+
+      // 1. Missing SKU
+      if (!sku) return false;
+
+      // 2. Digital download flag
+      if (item.flags?.download) return false;
+
+      // 3. Package header — keep for forcePackage routing
+      if (item.flags?.isPackageHeader) return true;
+
+      // 4 + 5. Look up in config
+      const pw = config.productWeights[sku];
+      if (!pw) return false;                    // unknown SKU
+      if (pw.category === 'digital') return false; // known digital
+
+      return true;
     });
 
     if (physicalItems.length === 0) {

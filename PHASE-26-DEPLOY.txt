@@ -1,0 +1,121 @@
+Phase 26 — Designer reflow: full-width canvas, preview controls
+            to the right column, bigger text
+
+═══════════════════════════════════════════════════════
+WHAT CHANGED
+═══════════════════════════════════════════════════════
+
+LAYOUT RESHUFFLE in the composite layout designer:
+
+  BEFORE:
+    ┌────────────────────────────┬────────┐
+    │ Variant tabs               │ Layout │
+    │ ┌──────────────────────┐   │ Props  │
+    │ │   DESIGNER CANVAS    │   │ Graph. │
+    │ └──────────────────────┘   │ Layers │
+    │ Preview controls + picker  │        │
+    └────────────────────────────┴────────┘
+
+  AFTER:
+    ┌──────────────────────────────────┬──────────────┐
+    │ Variant tabs                     │ Layout Props │
+    │ ┌──────────────────────────────┐ │ Graphics     │
+    │ │                              │ │ Layers       │
+    │ │   DESIGNER CANVAS            │ │ Preview      │
+    │ │   (full width, +50% height)  │ │ controls +   │
+    │ │                              │ │ line item    │
+    │ └──────────────────────────────┘ │ picker       │
+    └──────────────────────────────────┴──────────────┘
+
+Three changes:
+
+  1. DESIGNER FILLS LEFT COLUMN
+     - Canvas size now responds to the actual rendered width of
+       the left column (was: fixed 950px).
+     - ResizeObserver watches the column; canvas dimensions
+       recompute on resize. On a 27" monitor you get a big canvas.
+     - Fallback width 1100px if measurement isn't ready yet (avoids
+       a comically small initial paint).
+     - Height bumped by 50% vs natural aspect fit so the canvas
+       has more vertical room for bleed work.
+
+  2. PREVIEW CONTROLS MOVED RIGHT
+     - CanvasFooterToolbar (snap toggle, preview mode, Order ID,
+       line items picker, error messages) now lives in the right
+       column UNDER the Layers panel.
+     - Nothing below the canvas anymore.
+     - Right column grid changed from 3:1 to 7:3 (~30% wide).
+
+  3. TEXT BUMPED AGAIN in SettingsForm.js (affects ALL settings
+     pages):
+        FormRow label:       13 → 15
+        FormRow hint:        12 → 14
+        baseInputStyle:      14 → 16   (TextInput, NumberInput, Select, TextArea)
+        Button:              13 → 15
+        Section h2:          14 → 16
+        Section description: 12 → 14
+        PageHeader subtitle: 13 → 15
+        StatusBanner:        13 → 15
+        settingsStyles.table:13 → 15
+        settingsStyles.th:   11 → 13
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED:
+  client/src/pages/settings/LayoutDesignerPage.js
+    - leftColRef + ResizeObserver for responsive canvas sizing
+    - Canvas height: +50% (HEIGHT_BUMP = 1.5)
+    - Grid: 3fr 1fr → 7fr 3fr
+    - CanvasFooterToolbar moved from left column to right column
+
+  client/src/components/SettingsForm.js
+    - All font sizes bumped per the list above
+
+  client/src/components/LayoutCanvas.js
+    - Unchanged from Phase 24 (responsive sizing happens via
+      width/height props from parent — no LayoutCanvas changes
+      needed)
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-26.tar.gz --strip-components=1
+
+You should see 2 file lines (LayoutCanvas.js is in the tarball
+unchanged so it doesn't matter if it overwrites):
+  x client/src/components/SettingsForm.js
+  x client/src/pages/settings/LayoutDesignerPage.js
+
+Webpack picks up the changes. Hard refresh the designer.
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+  1. Open Settings → Composite Layouts → into a layout.
+  2. The canvas should now span essentially the full left side
+     of the page. On a wider monitor it grows wider.
+  3. The right column shows: Layout Properties, Graphics Library,
+     Layers, then Preview controls (snap, preview mode, Order ID,
+     line item picker).
+  4. Nothing below the canvas.
+  5. Resize the browser window — the canvas should grow/shrink
+     to fill the available column width.
+  6. All settings text (labels, inputs, hints, buttons) is
+     noticeably larger.
+
+  Test on other settings pages too (Paths, Add-ons, Packages) —
+  text should be uniformly bigger there as well.
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD client/src/components/SettingsForm.js
+  git checkout HEAD client/src/pages/settings/LayoutDesignerPage.js
+
+Hard refresh.

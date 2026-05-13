@@ -82,7 +82,7 @@ export default function OverrideEditorPage() {
   });
 
   // ─── Action state ──────────────────────────────────────
-  const [actionLoading, setActionLoading] = useState(null); // 'overwrite' | 'reprint' | 'remove' | null
+  const [actionLoading, setActionLoading] = useState(null); // 'overwrite' | 'reprint' | 'remove' | 'save' | null
   const [actionResult, setActionResult] = useState(null);
   const [actionError, setActionError] = useState(null);
 
@@ -464,6 +464,34 @@ export default function OverrideEditorPage() {
     }
   }
 
+  // Phase 40: save the override WITHOUT triggering an immediate render.
+  // Used when staging multiple tweaks: open editor → fix → Save → close
+  // → fix another item → Save → ... → Process or Reprint the whole
+  // order. The pipeline's composite-render loop picks up saved
+  // overrides on the cart_ids that have them and uses the original
+  // template for those that don't.
+  async function saveOverrideOnly() {
+    if (!layout) return;
+    setActionLoading('save');
+    setActionError(null);
+    setActionResult(null);
+    try {
+      await api.post(
+        `/api/sytist/overrides/${encodeURIComponent(orderId)}/${encodeURIComponent(cartId)}`,
+        {
+          layoutId: layout.id,
+          variant,
+          layoutSnapshot: layout,
+        }
+      );
+      setActionResult({ mode: 'save' });
+    } catch (err) {
+      setActionError(err.message);
+    } finally {
+      setActionLoading(null);
+    }
+  }
+
   async function removeOverride() {
     if (
       !window.confirm(
@@ -609,6 +637,12 @@ export default function OverrideEditorPage() {
         </StatusBanner>
       )}
 
+      {actionResult && actionResult.mode === 'save' && (
+        <StatusBanner kind="success">
+          Override saved. Composite will be re-rendered with these
+          changes the next time you Process or Reprint this order.
+        </StatusBanner>
+      )}
       {actionResult && actionResult.mode === 'overwrite' && (
         <StatusBanner kind="success">
           Override applied. Composite re-rendered:{' '}
@@ -804,6 +838,40 @@ export default function OverrideEditorPage() {
                 gap: 8,
               }}
             >
+              {/* Phase 40: Save (no render) — stage the override for
+                  later batch processing. Use when tweaking multiple
+                  items in one order and you want them ALL to apply
+                  when you click Process or Reprint on the order. */}
+              <button
+                onClick={saveOverrideOnly}
+                disabled={!!actionLoading}
+                style={primaryBtnStyle(actionLoading === 'save')}
+              >
+                {actionLoading === 'save' ? 'Saving…' : 'Save (no render)'}
+              </button>
+              <div
+                style={{
+                  fontSize: 11,
+                  color: 'var(--text-muted)',
+                  marginTop: -4,
+                  marginBottom: 8,
+                  lineHeight: 1.4,
+                }}
+              >
+                Stages this override for later. When you Process or
+                Reprint the order, the composite for this item will be
+                rendered using the override layout. Use to tweak
+                multiple items before printing.
+              </div>
+
+              <hr
+                style={{
+                  border: 'none',
+                  borderTop: '1px solid var(--border-color)',
+                  margin: '4px 0',
+                }}
+              />
+
               <button
                 onClick={() => applyOverride('overwrite')}
                 disabled={!!actionLoading}

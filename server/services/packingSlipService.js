@@ -70,6 +70,7 @@ const QRCode = require('qrcode');
 
 const pathsService = require('./pathsService');
 const specialtyService = require('./specialtyService');
+const greenscreenService = require('./greenscreenService');
 
 // 5" × 8" at 300 DPI
 const SLIP_WIDTH = 1500;
@@ -171,6 +172,13 @@ class PackingSlipService {
    *   filenameSuffix — appended to the filename before .jpg (e.g. "_preview").
    *                    Used by the preview/save endpoint to avoid clobbering
    *                    the production slip if it ever exists.
+   *   composedByCartId — Phase 34: map of cartId → absolute disk path for
+   *                    line items whose photo was green-screen-composited
+   *                    upstream (processingService Step 1.4). When the slip
+   *                    encounters a cartId in this map, it reads the
+   *                    composed file from disk instead of fetching thumbUrl.
+   *                    This makes slip thumbnails match what actually
+   *                    prints for green-screen items.
    *
    * Returns:
    *   {
@@ -193,6 +201,13 @@ class PackingSlipService {
       sortSegments = [],
       teamScope = null,
       filenameSuffix = '',
+      composedByCartId = {},
+      // Phase 44: per-cartId map of composite engine output file
+      // paths. When set for a cart_id, the slip uses that file as
+      // the thumbnail source — shows the actual rendered product
+      // (Memory Mate, Photo Button, etc.) rather than the raw
+      // customer photo. Takes priority over composedByCartId.
+      compositePathsByCartId = {},
     } = options;
 
     const config = await this.getSlipConfig();
@@ -239,6 +254,8 @@ class PackingSlipService {
       config,
       teamScope,
       warnings,
+      composedByCartId,
+      compositePathsByCartId,
     });
 
     return {
@@ -284,7 +301,14 @@ class PackingSlipService {
    * deterministic.
    */
   async _composeSlip(order, ctx) {
-    const { printedItems, config, teamScope, warnings } = ctx;
+    const {
+      printedItems,
+      config,
+      teamScope,
+      warnings,
+      composedByCartId = {},
+      compositePathsByCartId = {},
+    } = ctx;
     const itemCount = printedItems.length;
 
     // ─── Sizing math ─────────────────────────────────────
@@ -611,9 +635,118 @@ class PackingSlipService {
       }
 
       // Thumbnail
+      // Phase 44 + 34 (revised): four-tier strategy.
+      //
+      //   Tier 0 — Composite engine output (Phase 44). For line items
+      //   with a composite layout mapping (Memory Mate, Photo Button,
+      //   etc.), processOrder writes the rendered composite to disk
+      //   and passes its path here via compositePathsByCartId. This is
+      //   what actually prints, so the slip thumbnail should match.
+      //
+      //   Tier 1 — Pre-composed green-screen disk file. processingService
+      //   Step 1.4 writes a <photo>_composed.jpg for each green-screen
+      //   line item (without a composite layout) and passes its path
+      //   here via composedByCartId.
+      //
+      //   Tier 2 — On-demand compose. For preview endpoints (no Process
+      //   has run yet) we still want the slip thumbnail to show the
+      //   chosen background. Fetch the subject thumb URL and background
+      //   URL, composite via greenscreenService, resize.
+      //
+      //   Tier 3 — Plain thumb fetch. Non-green-screen line items, or
+      //   green-screen with no background URL configured: fetch thumbUrl
+      //   and use as-is. Same as pre-Phase-34 behavior.
+      const compositePath = compositePathsByCartId[li.cartId];
+      const composedPath = composedByCartId[li.cartId];
       const thumbUrl = li.photo?.thumbUrl || null;
       let thumbBuffer = null;
-      if (thumbUrl) {
+
+      // Tier 0: composite engine output file from Phase 44.
+      if (compositePath) {
+        try {
+          const fileBuf = await fsp.readFile(compositePath);
+          thumbBuffer = await sharp(fileBuf)
+            .resize(thumbSize, thumbSize, { fit: 'inside' })
+            .png()
+            .toBuffer();
+        } catch (err) {
+          warnings.push({
+            type: 'thumb_composite_read_error',
+            cartId: li.cartId,
+            message: err.message,
+            path: compositePath,
+          });
+          // Fall through to tier 1/2/3 below.
+        }
+      }
+
+      // Tier 1: pre-composed green-screen file from processOrder.
+      if (!thumbBuffer && composedPath) {
+        try {
+          const fileBuf = await fsp.readFile(composedPath);
+          thumbBuffer = await sharp(fileBuf)
+            .resize(thumbSize, thumbSize, { fit: 'inside' })
+            .png()
+            .toBuffer();
+        } catch (err) {
+          warnings.push({
+            type: 'thumb_composed_read_error',
+            cartId: li.cartId,
+            message: err.message,
+            path: composedPath,
+          });
+          // Fall through to tier 2/3 below.
+        }
+      }
+
+      // Tier 2: on-demand compose for green-screen items.
+      // shouldComposite() requires both flags.greenScreen and a
+      // backgroundPhoto.fullUrl, so we know we have what we need.
+      // Subject source is photo.fullUrl, not thumbUrl, because
+      // thumbUrl is heavily compressed (small JPEG) and may have
+      // lost the transparency we need for keyed-out subjects.
+      if (
+        !thumbBuffer &&
+        greenscreenService.shouldComposite(li) &&
+        li.photo?.fullUrl
+      ) {
+        try {
+          const subjectResp = await fetch(li.photo.fullUrl);
+          if (!subjectResp.ok) {
+            throw new Error(`Subject fetch HTTP ${subjectResp.status}`);
+          }
+          const subjectBuffer = Buffer.from(await subjectResp.arrayBuffer());
+          const { buffer: composedBuffer, warnings: gsWarnings } =
+            await greenscreenService.composeWithBackground(
+              subjectBuffer,
+              li.backgroundPhoto.fullUrl,
+              { outputFormat: 'jpeg', jpegQuality: 85 }
+            );
+          if (gsWarnings && gsWarnings.length > 0) {
+            for (const w of gsWarnings) {
+              warnings.push({
+                type: 'thumb_greenscreen_' + w.type,
+                cartId: li.cartId,
+                message: w.message,
+              });
+            }
+          }
+          thumbBuffer = await sharp(composedBuffer)
+            .resize(thumbSize, thumbSize, { fit: 'inside' })
+            .png()
+            .toBuffer();
+        } catch (err) {
+          warnings.push({
+            type: 'thumb_greenscreen_error',
+            cartId: li.cartId,
+            message: err.message,
+          });
+          // Fall through to tier 3.
+        }
+      }
+
+      // Tier 3: plain thumbUrl fetch.
+      if (!thumbBuffer && thumbUrl) {
         try {
           const resp = await fetch(thumbUrl);
           if (resp.ok) {
@@ -638,7 +771,7 @@ class PackingSlipService {
             url: thumbUrl,
           });
         }
-      } else {
+      } else if (!thumbBuffer && !thumbUrl) {
         warnings.push({
           type: 'no_thumb_url',
           cartId: li.cartId,

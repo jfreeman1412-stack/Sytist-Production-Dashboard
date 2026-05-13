@@ -1,0 +1,184 @@
+Phase 44 — Composite thumbnails on packing slip, ShipStation, and dashboard UI
+═══════════════════════════════════════════════════════
+
+WHAT THIS DELIVERS
+─────────────────────────────────────────────
+
+The composite engine renders products like Memory Mate,
+Photo Button, etc. — taking the customer's subject photo
+and applying a template (graphics, team photo, logo, text,
+chosen background, etc.) to produce the final printable
+composite. Before Phase 44, that composite output was
+used for printing/imposition but invisible to the operator
+and the packer:
+
+  - Packing slip showed the raw customer photo (not what
+    actually prints)
+  - ShipStation showed the same raw photo (potentially
+    keyed-out PNG for green-screen items)
+  - Dashboard order detail showed the raw photo
+
+Phase 44 surfaces the composite output in all three places:
+
+  - PACKING SLIP: when a line item has a composite, its
+    slip thumbnail shows the rendered composite (4-tier
+    resolver, with composite output as Tier 0)
+
+  - SHIPSTATION: composite outputs are published to S3
+    (same backend as green-screen composed thumbnails)
+    and their URLs feed the line item imageUrl field
+
+  - DASHBOARD ORDER DETAIL: each line item card fetches
+    the cached composite/composed thumbnail URL from a
+    new endpoint and shows it when present, falling back
+    to the raw photo otherwise
+
+The data flow: processOrder writes composites to disk
+→ publishes to S3 + cache → packing slip uses the
+local file → ShipStation reads the cache → UI reads
+the cache. One source of truth, three destinations.
+
+WHAT'S IN THIS TARBALL
+─────────────────────────────────────────────
+
+MODIFIED (4 files):
+
+  server/services/processingService.js
+    + Composite engine output (line 1577) now also
+      publishes a 500px thumbnail via composedThumbnailService
+    + Caches the URL in composed_thumbnails SQLite table
+    + Builds compositePathsByCartId map from
+      subResult.composites and passes to packing slip
+    + Non-fatal — publish/cache failures don't block
+      processing
+
+  server/services/packingSlipService.js
+    + New compositePathsByCartId option in
+      buildSlipBuffer() and _composeSlip()
+    + New Tier 0 in the thumbnail resolver: composite
+      engine output file. Takes priority over Tier 1
+      (green-screen composed), Tier 2 (on-demand compose),
+      Tier 3 (plain thumbUrl).
+
+  server/routes/sytist.js
+    + New GET /api/sytist/orders/:orderId/composed-thumbnails
+      endpoint. Returns
+        { ok: true, thumbnails: { [cart_id]: public_url } }
+      Reads from composedThumbnailCacheService.listByOrder.
+      Non-fatal: returns empty thumbnails map on cache
+      read errors so the UI gracefully falls back.
+
+  client/src/pages/OrderDetailPage.js
+    + LineItemsBlock fetches the thumbnails map once per
+      order load via the new endpoint
+    + LineItemList passes per-cartId URL down to LineItemRow
+    + LineItemRow uses composedThumbnailUrl as primary
+      thumbnail when present (single img, no bg+player
+      stacking). Click opens full-size in new tab.
+    + Falls back to existing bg+player render when no
+      cached URL exists (preserves green-screen preview
+      for items never processed)
+
+DEPLOY
+─────────────────────────────────────────────
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-44.tar.gz --strip-components=1
+
+No npm install. nodemon picks up server changes.
+Hard-refresh browser (Ctrl+Shift+R) for client changes.
+
+VERIFY
+─────────────────────────────────────────────
+
+  Test 1 — composite items end-to-end:
+
+    1. Find an order with a Memory Mate or other composite-
+       layout product.
+    2. Process or reprint the order.
+    3. Server log should show:
+       [Processing] Order N cart C: composite render OK
+       [s3Sytist] Published composed thumbnail for order N
+         cart C → https://...
+    4. Check the cache:
+       node -e "const db = require('better-sqlite3')(
+         './server/config/sytist-dashboard.db');
+         console.log(db.prepare(
+           'SELECT * FROM composed_thumbnails WHERE order_id = ?'
+         ).all('NNNNN'));"
+       Should show rows for each composite item.
+    5. Open the order in ShipStation. Memory Mate items
+       should show the RENDERED composite (subject + layout
+       artwork) as the thumbnail.
+    6. Open the order detail page in the dashboard.
+       Memory Mate line items should show the rendered
+       composite as their card thumbnail (not the raw
+       subject photo).
+    7. Open the generated packing slip (.jpg). Memory Mate
+       row thumbnails should be the rendered composite.
+
+  Test 2 — green-screen items still work:
+
+    1. Find a green-screen-only order (no composite layout —
+       e.g. an 8x10 print with a chosen background).
+    2. Process it.
+    3. Slip / SS / UI should all show the composed (subject
+       + background) thumbnail — same as Phase 42 behavior.
+
+  Test 3 — plain items still work:
+
+    1. Find a non-green-screen, non-composite item.
+    2. Process it.
+    3. Slip / SS / UI should show the raw customer photo
+       thumbnail — same as pre-Phase-44 behavior.
+
+  Test 4 — order without prior processing:
+
+    1. Look at an order that was processed in a session
+       BEFORE Phase 44 deployed (so the cache is empty).
+    2. Open its detail page. The line item cards should
+       show the existing bg + player stacking for green-
+       screen items (no regression).
+    3. After re-processing, the cache populates and the
+       UI updates on next page load.
+
+CACHE LIFECYCLE
+─────────────────────────────────────────────
+
+  - WRITTEN during processOrder Step 1.4 (green-screen
+    compose) AND the composite-engine render block
+  - READ by the dashboard UI (every line items load),
+    the push-packaging route, and the SS /create route
+  - CLEARED by the scheduler when an order's Sytist
+    status flips to Shipped (39)
+
+If you want to clear a stale cache row manually:
+  node -e "const db = require('better-sqlite3')(
+    './server/config/sytist-dashboard.db');
+    db.prepare('DELETE FROM composed_thumbnails WHERE order_id = ?')
+      .run('NNNNN');
+    console.log('cleared');"
+
+ROLLBACK
+─────────────────────────────────────────────
+
+  git checkout HEAD server/services/processingService.js
+  git checkout HEAD server/services/packingSlipService.js
+  git checkout HEAD server/routes/sytist.js
+  git checkout HEAD client/src/pages/OrderDetailPage.js
+
+Existing cache rows remain but are inert.
+
+NOT INCLUDED (potential follow-ups)
+─────────────────────────────────────────────
+
+  - On-demand composite preview (rendering before Process
+    has run). Currently the UI only shows composite
+    thumbnails for orders that have been processed.
+    Adding preview would require calling composite engine
+    from a new endpoint, which is significant work.
+  - Lazy-loading thumbnails (current implementation loads
+    all imageUrls eagerly). Fine for typical orders;
+    might matter at high item counts.
+  - Cache invalidation when layouts or settings change.
+    Currently we only invalidate at ship time.

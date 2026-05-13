@@ -1,0 +1,196 @@
+Phase 33 — Four-item bundle:
+            1. Remove "Process order?" popup
+            2. Reverse Phase 31 auto-push during SS adoption
+            3. Manual "Push packaging to ShipStation" button + endpoint
+            4. Extensive [SS]-tagged logging in processingService
+
+═══════════════════════════════════════════════════════
+ITEM 1 — POPUP REMOVAL
+═══════════════════════════════════════════════════════
+
+The window.confirm prompt that fired on every "Process this
+order" click is gone. The button is prominent enough that the
+confirm was just friction.
+
+Other confirm prompts on the page are intentionally KEPT:
+  - "Send order N to ShipStation?" (Send button)
+  - "Delete this order from ShipStation?" (Delete button)
+  - "Push current packaging to ShipStation?" (NEW Phase 33 button)
+These are less-frequent destructive or external-side-effect
+actions where confirmation is worth the friction.
+
+═══════════════════════════════════════════════════════
+ITEM 2 — REVERSE PHASE 31 AUTO-PUSH
+═══════════════════════════════════════════════════════
+
+Phase 31 pushed packaging to existing SS orders during the
+adopt-existing path. Per operator preference ("reprocessing
+should not be sent to ShipStation unless the user selects to"),
+this is now reversed.
+
+NEW behavior in _tryCreateShipStation when processing finds an
+order ALREADY exists in SS (no local link yet, but SS has a
+match by orderNumber):
+
+  - Create the local link row pointing to the existing SS order
+  - DO NOT call createOrder to push packaging
+  - Return reason='adopted_existing' message="...(skipped auto-push)"
+
+The link row's carrier/service/package metadata uses whatever
+the existing SS order has, falling back to the freshly-computed
+payload values if SS didn't echo them.
+
+If the operator wants to push packaging to that adopted SS
+order, they use the new manual button (Item 3 below).
+
+═══════════════════════════════════════════════════════
+ITEM 3 — MANUAL "PUSH PACKAGING TO SHIPSTATION"
+═══════════════════════════════════════════════════════
+
+NEW endpoint:
+  POST /api/sytist/orders/:orderId/push-packaging
+  - Requires existing link
+  - Builds fresh payload from current Sytist state
+  - Calls shipstationService.createOrder({...payload, orderId: link.ss_order_id})
+  - Updates local link row's carrier/service/package codes to
+    reflect what was pushed
+  - Returns the SS response details
+
+NEW button in the order detail page:
+  Inside the LinkedShippingPanel (visible when order is linked
+  to a SS order, but not yet shipped). Sits in the button row
+  next to "Re-fetch status" and "Mark shipped". Click → confirm
+  modal → calls the endpoint → success/error banner appears
+  under the button row.
+
+UI label: "Push packaging to ShipStation"
+Tooltip:  "Recompute packaging and push to ShipStation
+           (overwrites SS-side weight/carrier/package)"
+
+═══════════════════════════════════════════════════════
+ITEM 4 — EXTENSIVE LOGGING
+═══════════════════════════════════════════════════════
+
+All [SS]-tagged log lines now appear in the server console
+during ShipStation flow. Every decision point logs which path
+was taken and why. Sample for a typical fresh-create:
+
+  [SS] 110684: _tryCreateShipStation entered
+  [SS] 110684: payload built — weight=4oz, dims=8x6x0.25in,
+       carrier=stamps_com/usps_first_class_mail, package=large_envelope
+  [SS] 110684: calling listOrders to check for phantom
+  [SS] 110684: listOrders returned 0 match(es)
+  [SS] 110684: PATH=fresh_create — calling createOrder
+  [SS] 110684: createOrder OK → SS#525371639 ss_status=awaiting_shipment
+       packageCode=large_envelope carrier=stamps_com/usps_first_class_mail weight=4
+  [SS] 110684: link row created for fresh SS#525371639
+
+For an adopt-existing case (Item 2 path):
+
+  [SS] 110684: _tryCreateShipStation entered
+  [SS] 110684: payload built — weight=4oz, ...
+  [SS] 110684: calling listOrders to check for phantom
+  [SS] 110684: listOrders returned 1 match(es)
+  [SS] 110684: PATH=adopt_existing — SS#525371639 already has this
+       orderNumber, adopting WITHOUT pushing packaging (Phase 33 default)
+  [SS] 110684: link row created for adopted SS#525371639
+
+For the already-linked skip:
+
+  [SS] 110684: _tryCreateShipStation entered
+  [SS] 110684: PATH=already_linked, SS#525371639 ss_status=awaiting_shipment —
+       skipping create. Use "Push packaging to ShipStation" button
+       to opt-in re-push.
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED (3 files):
+
+  server/services/processingService.js
+    - Items 2 + 4
+
+  server/routes/sytist.js
+    - Item 3 (new POST /orders/:orderId/push-packaging endpoint)
+
+  client/src/pages/OrderDetailPage.js
+    - Item 1 (removed window.confirm)
+    - Item 3 (button, state, handler, props wiring)
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-33.tar.gz --strip-components=1
+
+You should see 3 file lines:
+  x server/services/processingService.js
+  x server/routes/sytist.js
+  x client/src/pages/OrderDetailPage.js
+
+nodemon picks up the server files. Hard refresh (Ctrl+Shift+R)
+for the client.
+
+═══════════════════════════════════════════════════════
+VERIFY AFTER DEPLOY
+═══════════════════════════════════════════════════════
+
+  1. Process popup gone
+     Click "Process this order". Should run immediately, no
+     confirmation dialog.
+
+  2. Adopt-existing no longer auto-pushes
+     Pick an order that's adopted (or simulate one by deleting
+     the local link row from sqlite then reprocessing). Server
+     log should show:
+       [SS] N: PATH=adopt_existing — SS#X already has this orderNumber,
+            adopting WITHOUT pushing packaging
+     SS order should retain its existing fields (no overwrite).
+
+  3. Manual push works
+     Open an order linked to a SS order that has incomplete
+     packaging info. Expand the Shipping card. Click "Push
+     packaging to ShipStation". Confirm the dialog. Should see:
+       - Loading spinner: "Pushing…"
+       - Success banner: "✓ Pushed to SS#X — carrier/service, package, Noz"
+       - SS order now has the recommended packaging
+
+  4. Logging is loud
+     Reprocess any order. Server log should include the
+     [SS]-tagged lines for the flow. Specifically the PATH=
+     line tells us exactly which branch executed.
+
+═══════════════════════════════════════════════════════
+ABOUT ORDER 110684 (NOT YET DIAGNOSED)
+═══════════════════════════════════════════════════════
+
+You reported 110684 didn't send packaging to ShipStation, and
+you confirmed it wasn't previously in SS. After Phase 33 deploy,
+reprocessing 110684 should show clearly in the log which path
+fires. Likely possibilities:
+
+  a) The local link table has a phantom row for 110684 from a
+     prior dev/test run. Log will show "PATH=already_linked".
+     Fix: sqlite3 delete that row, reprocess.
+
+  b) The order's data has something odd that makes the SS
+     lookup find a match (orderNumber collision?). Log will show
+     "PATH=adopt_existing" with the SS# it found.
+
+  c) An exception is being thrown somewhere we haven't traced.
+     Log will show clearly where it stopped.
+
+Once you have the log from a reprocess after deploy, paste it
+in and we can pinpoint the issue immediately.
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD client/src/pages/OrderDetailPage.js \
+                     server/routes/sytist.js \
+                     server/services/processingService.js
+
+Restart server. Browser hard refresh.

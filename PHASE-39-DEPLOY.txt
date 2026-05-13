@@ -1,0 +1,154 @@
+Phase 39 — Dashboard-driven package expansion
+
+═══════════════════════════════════════════════════════
+WHAT WAS WRONG
+═══════════════════════════════════════════════════════
+
+Order 110714 contained a Bronze Package (SKU 3) but processed
+as a single 5x8 print instead of expanding into its constituent
+items (4-3.5x5 Prints + 8 Wallets).
+
+Root cause: Sytist's ms_cart.cart_package column is unreliable.
+For this Bronze Package row, cart_package = 0 — the same value
+used for plain (non-package) items. We confirmed this is a
+pattern across the dataset, not a one-off.
+
+The dashboard previously trusted flags.package (derived from
+cart_package > 0) as the trigger to expand a package. Since
+that flag is wrong, the expansion was skipped, and the package
+header row got treated as a single regular print at the default
+5x8 size.
+
+═══════════════════════════════════════════════════════
+THE FIX
+═══════════════════════════════════════════════════════
+
+Dashboard's Settings → Packages config is now the source of
+truth for package detection. A line item is treated as a
+package when its SKU has constituents configured there. The
+unreliable flags.package signal is no longer consulted as the
+trigger (though it's still surfaced in the line item shape for
+informational purposes).
+
+Pseudo-logic change in _expandPackageLineItems:
+
+  BEFORE:
+    if (!li.flags.package) skip;
+    look up packageContentsMap[sku]
+    if not found: pass through
+
+  AFTER:
+    look up packageContentsMap[sku]
+    if not found: pass through (not a package)
+    if found: expand
+    (also log a warning when Sytist's flag was missing —
+     so admins see the fallback firing)
+
+═══════════════════════════════════════════════════════
+WHAT'S IN THIS TARBALL
+═══════════════════════════════════════════════════════
+
+MODIFIED (2 files):
+
+  server/services/sytistDbService.js
+    + _expandPackageLineItems trigger logic updated
+    + Adds flags.packageExpansionSource on the header row:
+        'sytist_flag'      — Sytist's flag was set (good)
+        'dashboard_config' — Sytist's flag was missing,
+                              expansion driven by config
+    + Logs a warning when expansion fires via dashboard_config
+
+  client/src/pages/OrderDetailPage.js
+    + New yellow banner on order detail page when any line
+      item has flags.packageExpansionSource ===
+      'dashboard_config'. Tells the operator "we expanded this
+      package via dashboard settings; verify constituents
+      before processing."
+    + Existing "Package" flag chip will now also appear on
+      these expanded rows (since flags.package gets set to
+      true on the header during expansion).
+
+═══════════════════════════════════════════════════════
+DEPLOY
+═══════════════════════════════════════════════════════
+
+  cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+  tar -xzvf F:\Downloads\sytist-dashboard-phase-39.tar.gz \
+            --strip-components=1
+
+Two files. nodemon picks up the server change.
+Hard-refresh browser for the client banner.
+
+═══════════════════════════════════════════════════════
+VERIFY
+═══════════════════════════════════════════════════════
+
+1. Open order 110714 on the dashboard.
+   You should see:
+   - Yellow ⚠️ banner near the top: "Package detected via
+     dashboard config..."
+   - The Bronze Package line item now shows a "Package" flag
+     chip
+   - Constituent items (4-3.5x5 Prints, 8 Wallets) appear
+     beneath the package header
+
+2. Click Reprint this order (or Process if you reset its
+   status to 0).
+   Server log should show:
+     [SytistDB] cart 481794 sku=3 (Print Packages > Bronze
+       Package): Sytist's cart_package=0 but SKU is configured
+       as a package in dashboard settings. Expanding using
+       dashboard config (2 constituents).
+     [Processing] Order 110714: 1 sub-order(s) (workflow=
+       ship_to_home, items=3)
+     [Processing]   sub-order: whole order (3 items)
+     [Imposition] 4-3.5x5 Prints → ...
+     [Imposition] 8 Wallets → ...
+     [Darkroom] Wrote ...
+
+3. Open the new .txt file. It should contain entries for:
+   - 4-3.5x5 Prints (the imposed sheet)
+   - 8 Wallets (the imposed sheet)
+   - 110714_packing_slip.jpg
+   Each at its proper print size — NOT all defaulted to 5x8.
+
+═══════════════════════════════════════════════════════
+EDGE CASES
+═══════════════════════════════════════════════════════
+
+  - SKU not configured in Settings → Packages: behavior
+    unchanged — passes through as a regular line item.
+  - SKU configured but with 0 constituents: passes through
+    (the `length > 0` check protects against this).
+  - SKU configured AND Sytist also flagged it correctly:
+    expansion fires once, source='sytist_flag', no warning
+    log, no UI banner.
+  - Add-on items (Phase 15b/c) and package constituents
+    (synthetic) never have an SKU that matches a package SKU,
+    so this can't infinite-loop.
+
+═══════════════════════════════════════════════════════
+ROLLBACK
+═══════════════════════════════════════════════════════
+
+  git checkout HEAD server/services/sytistDbService.js
+  git checkout HEAD client/src/pages/OrderDetailPage.js
+
+Restart server. Packages will once again only expand when
+Sytist's cart_package > 0 (which appears to be never), so
+they'll stop expanding.
+
+═══════════════════════════════════════════════════════
+NOT REPROCESSED AUTOMATICALLY
+═══════════════════════════════════════════════════════
+
+Order 110714 (and any other order processed before this fix
+with the same bug) needs to be manually re-processed:
+
+  1. Open the order on the dashboard
+  2. Click "Reprint this order" (since status is now 40)
+  3. The new .txt will be _REPRINT-suffixed and contain the
+     correct constituents
+
+The old .txt and printed photo from before this fix remain on
+disk; safe to delete if not needed.

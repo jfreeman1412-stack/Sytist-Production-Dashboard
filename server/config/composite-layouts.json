@@ -1,98 +1,6 @@
 {
   "layouts": [
     {
-      "id": "memory-mate-5x7-v1",
-      "name": "Memory Mate 5×7 (default)",
-      "sheetWidth": 5,
-      "sheetHeight": 7,
-      "dpi": 300,
-      "backgroundColor": "#ffffff",
-      "variants": {
-        "vertical": {
-          "slots": [
-            {
-              "kind": "logo",
-              "x": 0.25,
-              "y": 0.25,
-              "w": 1,
-              "h": 1,
-              "fit": "contain"
-            },
-            {
-              "kind": "playerPhoto",
-              "x": 1.5,
-              "y": 0.25,
-              "w": 3.25,
-              "h": 4,
-              "fit": "cover"
-            },
-            {
-              "kind": "teamPhoto",
-              "x": 0.25,
-              "y": 4.5,
-              "w": 4.5,
-              "h": 1.75,
-              "fit": "cover"
-            },
-            {
-              "kind": "text",
-              "x": 0.25,
-              "y": 6.4,
-              "w": 4.5,
-              "h": 0.4,
-              "text": "{subject.athleteName}",
-              "fontSize": 24,
-              "fontFamily": "Arial",
-              "color": "#000000",
-              "align": "center",
-              "weight": "bold"
-            }
-          ]
-        },
-        "horizontal": {
-          "slots": [
-            {
-              "kind": "logo",
-              "x": 0.25,
-              "y": 0.25,
-              "w": 1,
-              "h": 1,
-              "fit": "contain"
-            },
-            {
-              "kind": "playerPhoto",
-              "x": 0.25,
-              "y": 1.5,
-              "w": 4.5,
-              "h": 3,
-              "fit": "cover"
-            },
-            {
-              "kind": "teamPhoto",
-              "x": 0.25,
-              "y": 4.75,
-              "w": 4.5,
-              "h": 1.5,
-              "fit": "cover"
-            },
-            {
-              "kind": "text",
-              "x": 0.25,
-              "y": 6.4,
-              "w": 4.5,
-              "h": 0.4,
-              "text": "{subject.athleteName}",
-              "fontSize": 24,
-              "fontFamily": "Arial",
-              "color": "#000000",
-              "align": "center",
-              "weight": "bold"
-            }
-          ]
-        }
-      }
-    },
-    {
       "id": "MM-General",
       "name": "Generic Memory Mate",
       "sheetWidth": 8,
@@ -145,24 +53,10 @@
             },
             {
               "kind": "text",
-              "x": 0.9500000000000001,
-              "y": 3.5500000000000003,
-              "w": 3.3000000000000003,
-              "h": 0.8,
-              "text": "{customer.firstName} {customer.lastName}",
-              "fontSize": 150,
-              "fontFamily": "Arial",
-              "color": "#000000",
-              "align": "center",
-              "weight": "normal",
-              "autoFit": true
-            },
-            {
-              "kind": "text",
-              "x": 1.05,
-              "y": 4.05,
-              "w": 3.2,
-              "h": 0.6499999999999999,
+              "x": 0.6551899999999997,
+              "y": 3.6299604687500002,
+              "w": 3.8896200000000007,
+              "h": 0.7900790624999999,
               "text": "{year}",
               "fontSize": 150,
               "fontFamily": "Arial",
@@ -192,6 +86,131 @@
           "uploadedAt": "2026-05-10T14:25:20.607Z",
           "uploadedBy": "joey",
           "originalFilename": "Generic Shimmer MM2025.png"
+        }
+      }
+    },
+    {
+      "id": "Button",
+      "name": "Button",
+      "sheetWidth": 6,
+      "sheetHeight": 4,
+      "dpi": 300,
+      "backgroundColor": "#ffffff",
+      "variants": {
+        "vertical": {
+          "slots": [
+            {
+              "kind": "playerBackground",
+              "x": 0.55,
+              "y": 0,
+              "w": 5,
+              "h": 4,
+              "fit": "cover"
+            },
+            {
+              "kind": "playerPhoto",
+              "x": 0.9500000000000001,
+              "y": -0.15000000000000002,
+              "w": 4.127500000000001,
+              "h": 5.442500000000001,
+              "fit": "contain"
+            }
+          ]
+        },
+        "horizontal": {
+          "slots": []
+        }
+      }
+    },
+    {
+      "id": "wallet",
+      "name": "Wallet",
+      "sheetWidth": 2.5,
+      "sheetHeight": 3.5,
+      "dpi": 300,
+      "backgroundColor": "#ffffff",
+      "variants": {
+        "vertical": {
+          "slots": [
+            {
+              "kind": "playerBackground",
+              "x": 0,
+              "y": 0,
+              "w": 2.5,
+              "h": 3.5,
+              "fit": "cover"
+            },
+            {
+              "kind": "playerPhoto",
+              "x": 0,
+              "y": 0,
+              "w": 2.5,
+              "h": 3.5,
+              "fit": "cover"
+            },
+            {
+              "kind": "text",
+              "x": 1.7000000000000002,
+              "y": 3,
+              "w": 0.7,
+              "h": 0.35,
+              "text": "{year}",
+              "fontSize": 40,
+              "fontFamily": "Arial",
+              "color": "#000000",
+              "align": "center",
+              "weight": "normal"
+            }
+          ]
+        },
+        "horizontal": {
+          "slots": []
+        }
+      }
+    },
+    {
+      "id": "Magnet",
+      "name": "3.5x5 Magnets and Wallet",
+      "sheetWidth": 3.5,
+      "sheetHeight": 5,
+      "dpi": 300,
+      "backgroundColor": "#ffffff",
+      "variants": {
+        "vertical": {
+          "slots": [
+            {
+              "kind": "playerBackground",
+              "x": 0,
+              "y": 0,
+              "w": 3.5,
+              "h": 5,
+              "fit": "cover"
+            },
+            {
+              "kind": "playerPhoto",
+              "x": 0,
+              "y": 0,
+              "w": 3.5,
+              "h": 5,
+              "fit": "cover"
+            },
+            {
+              "kind": "text",
+              "x": 2.4000000000000004,
+              "y": 4.4,
+              "w": 1.05,
+              "h": 0.44999999999999996,
+              "text": "{year}",
+              "fontSize": 40,
+              "fontFamily": "Arial",
+              "color": "#000000",
+              "align": "center",
+              "weight": "normal"
+            }
+          ]
+        },
+        "horizontal": {
+          "slots": []
         }
       }
     }
