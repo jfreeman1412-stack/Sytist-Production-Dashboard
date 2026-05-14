@@ -317,8 +317,6 @@ export default function OrderDetailPage() {
       <PackingSlipBlock orderId={order.orderId} />
 
       <ImpositionBlock order={order} />
-
-      <CompositeBlock order={order} />
     </div>
   );
 }
@@ -653,6 +651,35 @@ function LineItemsBlock({ order, groupByTeam }) {
     };
   }, [order?.orderId]);
 
+  // Phase 46: hoist the composite-mappings fetch up here so we do
+  // one round-trip per order, not one per row. The map is keyed by
+  // String(SKU) so LineItemRow can do an O(1) lookup to decide
+  // whether to show the "✏ Composite" chip + "Edit layout"/"Preview"
+  // buttons. Empty/failed fetch leaves an empty Map → the page
+  // still renders, just without composite affordances.
+  const [compositeMappingsBySku, setCompositeMappingsBySku] = useState(
+    () => new Map()
+  );
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .get('/api/sytist/composite/mappings')
+      .then((r) => {
+        if (cancelled) return;
+        const m = new Map();
+        for (const mapping of r.mappings || []) {
+          m.set(String(mapping.externalId), mapping);
+        }
+        setCompositeMappingsBySku(m);
+      })
+      .catch(() => {
+        if (!cancelled) setCompositeMappingsBySku(new Map());
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   if (lineItems.length === 0) {
     return (
       <Card title="Line items">
@@ -687,6 +714,7 @@ function LineItemsBlock({ order, groupByTeam }) {
           order={order}
           lineItems={lineItems}
           composedThumbnails={composedThumbnails}
+          compositeMappingsBySku={compositeMappingsBySku}
         />
       </Card>
     );
@@ -741,6 +769,7 @@ function LineItemsBlock({ order, groupByTeam }) {
             order={order}
             lineItems={g.items}
             composedThumbnails={composedThumbnails}
+            compositeMappingsBySku={compositeMappingsBySku}
           />
         </div>
       ))}
@@ -748,7 +777,12 @@ function LineItemsBlock({ order, groupByTeam }) {
   );
 }
 
-function LineItemList({ order, lineItems, composedThumbnails = {} }) {
+function LineItemList({
+  order,
+  lineItems,
+  composedThumbnails = {},
+  compositeMappingsBySku = new Map(),
+}) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
       {lineItems.map((li, idx) => (
@@ -757,13 +791,22 @@ function LineItemList({ order, lineItems, composedThumbnails = {} }) {
           order={order}
           lineItem={li}
           composedThumbnailUrl={composedThumbnails[String(li.cartId)] || null}
+          compositeMapping={
+            compositeMappingsBySku.get(String(li.sku)) || null
+          }
         />
       ))}
     </div>
   );
 }
 
-function LineItemRow({ order, lineItem, composedThumbnailUrl = null }) {
+function LineItemRow({
+  order,
+  lineItem,
+  composedThumbnailUrl = null,
+  compositeMapping = null,
+}) {
+  const navigate = useNavigate();
   const photo = lineItem.photo;
   const backgroundPhoto = lineItem.backgroundPhoto;
   const flags = lineItem.flags || {};
@@ -778,6 +821,60 @@ function LineItemRow({ order, lineItem, composedThumbnailUrl = null }) {
   const [reprinting, setReprinting] = useState(false);
   const [reprintResult, setReprintResult] = useState(null);
   const [reprintError, setReprintError] = useState(null);
+
+  // Phase 46: per-item composite affordances. State for the inline
+  // preview lives here so each row's preview is independent —
+  // operators can open multiple previews on the same order.
+  const hasComposite = !!compositeMapping;
+  const [previewExpanded, setPreviewExpanded] = useState(false);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewResult, setPreviewResult] = useState(null);
+  const [previewError, setPreviewError] = useState(null);
+
+  // Phase 46: narrow-viewport detection for the inline preview
+  // layout. ≥768px puts the JPEG and diagnostics side-by-side;
+  // below that, they stack so the JPEG doesn't overflow.
+  const [isNarrow, setIsNarrow] = useState(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return false;
+    return window.matchMedia('(max-width: 767px)').matches;
+  });
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return undefined;
+    const mq = window.matchMedia('(max-width: 767px)');
+    const handler = (e) => setIsNarrow(e.matches);
+    if (mq.addEventListener) mq.addEventListener('change', handler);
+    else mq.addListener(handler); // older Safari
+    return () => {
+      if (mq.removeEventListener) mq.removeEventListener('change', handler);
+      else mq.removeListener(handler);
+    };
+  }, []);
+
+  function handleEditLayout() {
+    navigate(`/overrides/${order.orderId}/${lineItem.cartId}`);
+  }
+
+  async function handleTogglePreview() {
+    if (previewExpanded) {
+      setPreviewExpanded(false);
+      return;
+    }
+    setPreviewExpanded(true);
+    if (previewResult || previewLoading) return; // cached
+    setPreviewLoading(true);
+    setPreviewError(null);
+    try {
+      const r = await api.post('/api/sytist/composite/preview', {
+        orderId: order.orderId,
+        cartId: lineItem.cartId,
+      });
+      setPreviewResult(r);
+    } catch (err) {
+      setPreviewError(err.message);
+    } finally {
+      setPreviewLoading(false);
+    }
+  }
 
   async function handleReprintItem() {
     // Phase 35 hotfix: removed window.confirm (consistent with the
@@ -1089,7 +1186,7 @@ function LineItemRow({ order, lineItem, composedThumbnailUrl = null }) {
           )}
         </div>
 
-        {flagChips.length > 0 && (
+        {(flagChips.length > 0 || hasComposite) && (
           <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
             {flagChips.map((c) => (
               <span
@@ -1108,6 +1205,29 @@ function LineItemRow({ order, lineItem, composedThumbnailUrl = null }) {
                 {c.label}
               </span>
             ))}
+            {hasComposite && (
+              // Phase 46: outlined chip with pencil prefix — visually
+              // distinct from the solid flagChips so operators read it
+              // as "this is editable" rather than another status flag.
+              // Color #b888d0 mirrors the override editor's text/static-
+              // graphic slot color (SLOT_KIND_COLORS) for continuity.
+              <span
+                style={{
+                  fontSize: 10,
+                  padding: '2px 8px',
+                  background: 'transparent',
+                  color: '#b888d0',
+                  border: '1px solid #b888d0',
+                  borderRadius: 10,
+                  fontWeight: 600,
+                  whiteSpace: 'nowrap',
+                  letterSpacing: 0.3,
+                }}
+                title={`Composite layout: ${compositeMapping.layoutId}`}
+              >
+                ✏ Composite
+              </span>
+            )}
           </div>
         )}
 
@@ -1147,6 +1267,145 @@ function LineItemRow({ order, lineItem, composedThumbnailUrl = null }) {
             }}
           >
             {lineItem.notes}
+          </div>
+        )}
+
+        {hasComposite && (
+          // Phase 46: composite action bar + inline preview. Always
+          // visible (not gated on reprint mode) so operators can spot
+          // and fix layout issues BEFORE printing. Sits above the
+          // reprint block: "before printing" actions on top, "after
+          // printing" actions below.
+          <div style={{ marginTop: 10 }}>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <button
+                onClick={handleEditLayout}
+                title={`Open the override editor for cartId ${lineItem.cartId} (layout ${compositeMapping.layoutId})`}
+                style={{
+                  background: '#b888d0',
+                  border: '1px solid #b888d0',
+                  color: '#fff',
+                  padding: '5px 12px',
+                  borderRadius: 6,
+                  fontSize: 11,
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                  fontFamily: 'inherit',
+                }}
+              >
+                ✏ Edit layout
+              </button>
+              <button
+                onClick={handleTogglePreview}
+                disabled={previewLoading}
+                title="Render this item's composite without writing any files"
+                style={{
+                  background: 'transparent',
+                  border: '1px solid var(--border-color)',
+                  color: 'var(--text-secondary)',
+                  padding: '5px 12px',
+                  borderRadius: 6,
+                  fontSize: 11,
+                  fontWeight: 600,
+                  cursor: previewLoading ? 'wait' : 'pointer',
+                  fontFamily: 'inherit',
+                  opacity: previewLoading ? 0.6 : 1,
+                }}
+              >
+                {previewLoading
+                  ? '⟳ Rendering…'
+                  : previewExpanded
+                    ? 'Hide preview'
+                    : 'Preview'}
+              </button>
+            </div>
+
+            {previewExpanded && previewError && (
+              <div
+                style={{
+                  marginTop: 8,
+                  padding: 8,
+                  background: 'rgba(220,53,69,0.1)',
+                  border: '1px solid rgba(220,53,69,0.3)',
+                  borderRadius: 4,
+                  color: '#dc3545',
+                  fontSize: 11,
+                }}
+              >
+                {previewError}
+              </div>
+            )}
+
+            {previewExpanded && previewResult && (
+              <div
+                style={{
+                  marginTop: 8,
+                  padding: 10,
+                  background: 'var(--bg-input)',
+                  border: '1px solid var(--border-color)',
+                  borderRadius: 6,
+                  display: 'flex',
+                  flexDirection: isNarrow ? 'column' : 'row',
+                  gap: 12,
+                  alignItems: 'flex-start',
+                }}
+              >
+                <img
+                  src={`data:image/jpeg;base64,${previewResult.jpegBase64}`}
+                  alt="Composite preview"
+                  style={{
+                    maxWidth: isNarrow ? '100%' : 280,
+                    maxHeight: 360,
+                    width: isNarrow ? '100%' : 'auto',
+                    height: 'auto',
+                    border: '1px solid var(--border-color)',
+                    borderRadius: 4,
+                    background: '#fff',
+                  }}
+                />
+                <div style={{ fontSize: 11, lineHeight: 1.6, flex: 1 }}>
+                  <DetailLine label="Variant" value={previewResult.variant} />
+                  <DetailLine
+                    label="Output"
+                    value={
+                      previewResult.dimensions
+                        ? `${previewResult.dimensions.width} × ${previewResult.dimensions.height} px`
+                        : '—'
+                    }
+                  />
+                  <DetailLine
+                    label="Team photo"
+                    value={
+                      previewResult.teamPhotoFound ? (
+                        <span style={{ color: '#4caf50' }}>✓ Found</span>
+                      ) : (
+                        <span style={{ color: '#e0b341' }}>
+                          ⚠ Missing ({previewResult.teamPhotoReason})
+                        </span>
+                      )
+                    }
+                  />
+                  <DetailLine
+                    label="Logo"
+                    value={
+                      previewResult.logoFound ? (
+                        <span style={{ color: '#4caf50' }}>✓ Found</span>
+                      ) : (
+                        <span style={{ color: '#e0b341' }}>⚠ Missing</span>
+                      )
+                    }
+                  />
+                  <DetailLine
+                    label="Render bytes"
+                    value={
+                      previewResult.sizeBytes
+                        ? `${(previewResult.sizeBytes / 1024).toFixed(1)} KB`
+                        : '—'
+                    }
+                  />
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -5270,293 +5529,11 @@ const errorBoxStyle = {
   fontSize: 13,
 };
 
-// ─── Phase 8b: Composite preview ────────────────────────────
-//
-// Per-line-item composite preview. Renders the same engine that runs
-// during processing — useful for spot-checking before processing an
-// order. Only line items that have a composite mapping appear here;
-// items without a mapping are skipped (composite is opt-in per SKU).
-
-function CompositeBlock({ order }) {
-  const [open, setOpen] = useState(false);
-  const [mappings, setMappings] = useState(null);
-
-  // Load mappings once on first expand so we know which line items have
-  // composite SKUs.
-  useEffect(() => {
-    if (!open || mappings !== null) return;
-    api
-      .get('/api/sytist/composite/mappings')
-      .then((r) => setMappings(r.mappings || []))
-      .catch(() => setMappings([]));
-  }, [open, mappings]);
-
-  const candidateLineItems = (order.lineItems || []).filter((li) => {
-    if (!li.photo || !li.photo.fullUrl) return false;
-    const skipFlags = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell'];
-    if (skipFlags.some((f) => li.flags?.[f])) return false;
-    if (!mappings) return true; // before mappings load, show all eligible
-    return mappings.some((m) => String(m.externalId) === String(li.sku));
-  });
-
-  return (
-    <Card title="Composite preview">
-      <button
-        onClick={() => setOpen((v) => !v)}
-        style={{
-          background: 'transparent',
-          border: '1px solid var(--border-color)',
-          color: 'var(--text-secondary)',
-          padding: '6px 12px',
-          borderRadius: 6,
-          fontSize: 12,
-          cursor: 'pointer',
-          fontFamily: 'inherit',
-        }}
-      >
-        {open ? 'Hide' : 'Show'} composites
-      </button>
-      <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-muted)' }}>
-        Renders memory-mate-style composites for SKUs with a composite mapping.
-        Player photo + team photo (auto-resolved from Sytist) + logo (from app
-        config) + text overlays, composed per the layout's slot definitions.
-      </div>
-
-      {open && mappings === null && (
-        <div style={{ marginTop: 12, fontSize: 12, color: 'var(--text-muted)' }}>
-          Loading mappings…
-        </div>
-      )}
-
-      {open && mappings !== null && candidateLineItems.length === 0 && (
-        <div style={{ marginTop: 12, fontSize: 12, color: 'var(--text-muted)' }}>
-          No line items in this order have composite mappings. Set up mappings in
-          Settings → Composites.
-        </div>
-      )}
-
-      {open &&
-        mappings !== null &&
-        candidateLineItems.map((li) => (
-          <CompositeItemRow
-            key={li.cartId}
-            order={order}
-            lineItem={li}
-            mapping={mappings.find(
-              (m) => String(m.externalId) === String(li.sku)
-            )}
-          />
-        ))}
-    </Card>
-  );
-}
-
-function CompositeItemRow({ order, lineItem, mapping }) {
-  const [expanded, setExpanded] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState(null);
-  const [error, setError] = useState(null);
-
-  // Lazily fetch the preview when expanded — composite render is
-  // bandwidth-heavy (downloads player + team photo from S3) so we
-  // don't render until the operator asks.
-  async function loadPreview() {
-    if (loading || result) return;
-    setLoading(true);
-    setError(null);
-    try {
-      const r = await api.post('/api/sytist/composite/preview', {
-        orderId: order.orderId,
-        cartId: lineItem.cartId,
-        layoutId: mapping?.layoutId,
-      });
-      setResult(r);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  function toggle() {
-    if (!expanded) loadPreview();
-    setExpanded((v) => !v);
-  }
-
-  return (
-    <div
-      style={{
-        marginTop: 12,
-        padding: 10,
-        background: 'var(--bg-input)',
-        border: '1px solid var(--border-color)',
-        borderRadius: 6,
-      }}
-    >
-      <div
-        style={{
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'center',
-        }}
-      >
-        <div style={{ fontSize: 12 }}>
-          <div style={{ fontWeight: 600 }}>{lineItem.productName}</div>
-          <div style={{ color: 'var(--text-muted)', fontSize: 11 }}>
-            cartId {lineItem.cartId} · SKU {lineItem.sku}
-            {mapping ? (
-              <>
-                {' · '}layout{' '}
-                <code style={{ fontSize: 10 }}>{mapping.layoutId}</code>
-                {mapping.chainToImposition && (
-                  <span
-                    style={{
-                      marginLeft: 6,
-                      padding: '1px 5px',
-                      fontSize: 9,
-                      background: 'rgba(120,120,200,0.2)',
-                      color: '#aab',
-                      borderRadius: 3,
-                      textTransform: 'uppercase',
-                      fontWeight: 600,
-                      letterSpacing: 0.5,
-                    }}
-                  >
-                    chain
-                  </span>
-                )}
-              </>
-            ) : null}
-          </div>
-        </div>
-        <button
-          onClick={toggle}
-          style={{
-            background: 'transparent',
-            border: '1px solid var(--border-color)',
-            color: 'var(--text-secondary)',
-            padding: '4px 10px',
-            borderRadius: 4,
-            fontSize: 11,
-            cursor: 'pointer',
-            fontFamily: 'inherit',
-          }}
-        >
-          {expanded ? 'Hide' : 'Preview'}
-        </button>
-      </div>
-
-      {expanded && loading && (
-        <div
-          style={{ marginTop: 10, fontSize: 11, color: 'var(--text-muted)' }}
-        >
-          Rendering composite…
-        </div>
-      )}
-
-      {expanded && error && (
-        <div
-          style={{
-            marginTop: 10,
-            padding: 8,
-            background: 'rgba(220,53,69,0.08)',
-            border: '1px solid rgba(220,53,69,0.3)',
-            borderRadius: 4,
-            color: '#dc3545',
-            fontSize: 11,
-          }}
-        >
-          {error}
-        </div>
-      )}
-
-      {expanded && result && (
-        <div
-          style={{
-            marginTop: 10,
-            display: 'grid',
-            gridTemplateColumns: 'auto 1fr',
-            gap: 12,
-          }}
-        >
-          <img
-            src={`data:image/jpeg;base64,${result.jpegBase64}`}
-            alt="Composite preview"
-            style={{
-              maxWidth: 280,
-              maxHeight: 360,
-              border: '1px solid var(--border-color)',
-              borderRadius: 4,
-              background: '#fff',
-            }}
-          />
-          <div style={{ fontSize: 11, lineHeight: 1.6 }}>
-            <DetailLine label="Variant" value={result.variant} />
-            <DetailLine
-              label="Output"
-              value={
-                result.dimensions
-                  ? `${result.dimensions.width} × ${result.dimensions.height} px`
-                  : '—'
-              }
-            />
-            <DetailLine
-              label="Team photo"
-              value={
-                result.teamPhotoFound ? (
-                  <span style={{ color: '#4caf50' }}>✓ Found</span>
-                ) : (
-                  <span style={{ color: '#e0b341' }}>
-                    ⚠ Missing ({result.teamPhotoReason})
-                  </span>
-                )
-              }
-            />
-            <DetailLine
-              label="Logo"
-              value={
-                result.logoFound ? (
-                  <span style={{ color: '#4caf50' }}>✓ Found</span>
-                ) : (
-                  <span style={{ color: '#e0b341' }}>⚠ Missing</span>
-                )
-              }
-            />
-            <DetailLine
-              label="Render bytes"
-              value={result.sizeBytes ? `${(result.sizeBytes / 1024).toFixed(1)} KB` : '—'}
-            />
-
-            {result.warnings && result.warnings.length > 0 && (
-              <div
-                style={{
-                  marginTop: 8,
-                  padding: 6,
-                  background: 'rgba(224,179,65,0.08)',
-                  border: '1px solid rgba(224,179,65,0.3)',
-                  borderRadius: 4,
-                }}
-              >
-                {result.warnings.map((w, i) => (
-                  <div
-                    key={i}
-                    style={{
-                      fontSize: 10,
-                      color: '#e0b341',
-                      marginBottom: 1,
-                    }}
-                  >
-                    ⚠ {w.message || JSON.stringify(w)}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
+// Phase 46: CompositeBlock + CompositeItemRow removed. Their
+// functionality moved onto LineItemRow as the "✏ Composite" chip,
+// the "Edit layout"/"Preview" action bar, and the inline preview
+// block. DetailLine survives because the new inline preview reuses
+// it.
 
 function DetailLine({ label, value }) {
   return (
