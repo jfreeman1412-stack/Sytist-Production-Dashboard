@@ -1426,7 +1426,110 @@ Files: `client/src/pages/OrderDetailPage.js`, `client/src/pages/settings/Overrid
 
 ---
 
-## 48+. Open follow-ups
+## 48. (Skipped — number reserved for future use)
+
+The Phase 47 follow-ups list briefly referred to "Phase 48 territory" for unifying the thumbnail pipeline via Process-time publish of all photos. After Phase 49 shipped the on-demand resize proxy, that unification is less urgent and tracked as a deferred follow-up rather than a numbered phase. The next concrete phase is 49.
+
+---
+
+## 49. Photo thumbnail proxy with disk cache
+
+The dashboard's line item card tiles previously rendered `lineItem.photo.fullUrl` as the `<img src>`. Phase 12a's reasoning — "prefer un-watermarked original over watermarked thumbnail" — held but the cost wasn't measured at the time: Sytist's S3 buckets serve the originals at full resolution, 6–10 MB per photo. A 30-item order with mostly non-composite items (plain prints, no green-screen) was downloading 200–300 MB to render 30 tiny tiles. Page load reached "up to a minute" per Joey's report, with browser DevTools confirming individual S3 fetches in the 50+ second range under load.
+
+Phase 49 adds a server-side resize proxy. The line item card's `<img src>` now points at `/api/sytist/photo-thumb?src=<encoded>&w=400`. The route fetches the source from S3, resizes to a 400-px max edge JPEG with `sharp` (~30–60 KB), caches the result to local disk, and serves it. The `<a href>` click-through still uses `fullUrl` so operators who actually want to inspect the photo at full size get the un-watermarked original.
+
+### Source URL validation
+
+The proxy accepts only URLs that:
+- Use the `https:` protocol
+- Have a hostname ending in `.amazonaws.com` (Sytist photos are all S3-hosted)
+- End in `.jpg`, `.jpeg`, `.png`, or `.webp` (case-insensitive)
+
+Anything else is rejected and the placeholder is served. The check is defense-in-depth alongside the `requireAuth` middleware on the route — only logged-in dashboard users can hit the proxy at all, so the attack surface is small, but the validation prevents an authenticated operator from using us as a generic open fetcher.
+
+### Disk cache
+
+`server/config/photo-cache/` relative to the service via `path.join(__dirname, '..', 'config', 'photo-cache')`. Portable — no drive-letter assumption. Filename is `sha1(srcUrl + '|' + width).hex + '.jpg'`. Flat directory, no subdirs. `mtime` is touched on every cache hit so popular photos stay alive while orphaned ones age out. Gitignored.
+
+The placeholder lives in the same directory as `_placeholder.jpg`. Generated once at service init via `sharp` over an SVG label ("Photo unavailable" on a dark background). Re-used on every source-fetch failure or validation rejection.
+
+### Sweep
+
+TTL-based, 60 days by default. Runs once per ~24h piggybacked on `schedulerService._pollOnce` — the SS sync poll already runs every 5 minutes, so adding a `_lastPhotoCacheSweepAt` check is essentially free. Sweep enumerates the cache directory, deletes files with `mtime < cutoff`, skips the placeholder, and has a 30-second hard time cap so an overgrown cache doesn't block the scheduler indefinitely. No size cap in v1 — at observed volume the cache stays under 1 GB indefinitely.
+
+### Cache headers
+
+- Success (placeholder false): `Cache-Control: public, max-age=86400, immutable` — content is keyed by `sha1(src + width)` so the URL is effectively immutable for the lifetime of the source photo.
+- Placeholder (source error or invalid URL): `Cache-Control: public, max-age=60` — short cache so transient Sytist outages clear quickly when the source recovers.
+
+`X-Photo-Thumb-Status` header is set to `cache-hit`, `fresh`, or `placeholder` for forensic logging via DevTools or curl.
+
+### Fetch timeout
+
+60 seconds. The diagnostic that motivated Phase 49 measured Sytist S3 download speeds varying from 944 ms to 230 seconds for the same 7 MB photo over the same connection — bursty throttling or congestion that's outside our control. A short timeout (10 s) would serve placeholders for legitimate but slow sources; a long timeout absorbs the bad case at the cost of holding one Express worker for up to 60 s on first load. Since first-load per `(src, width)` happens at most once before the cache kicks in, this is acceptable. If we ever see Express-worker exhaustion under load, the move is to scale workers or pre-publish thumbnails at Process time (Phase 50+).
+
+### Scope of client edits
+
+Only two `<img src>` sites changed — `LineItemRow` tile in `OrderDetailPage.js` and the order/cart switcher tile in `OverrideEditorPage.js`. The override editor's main `LayoutCanvas` keeps `fullUrl` because the canvas renders at ~700 px and needs the full resolution for accurate WYSIWYG positioning. Phase 37 download links and click-through `<a href>` anchors keep `fullUrl` because those are operator-initiated full-quality views, expected to be slow.
+
+### Node fetch quirk worked around
+
+Initial implementation used `AbortController` with `signal: controller.signal` passed to `fetch`. On Node 22.13.1, this causes `resp.arrayBuffer()` to hang indefinitely after headers arrive — verified empirically: same URL with no signal completes in <1 s, with signal hangs at body-read until the abort fires. The service uses `Promise.race` with a separate timeout promise instead. The orphaned fetch on timeout gets GC'd; not ideal but acceptable for a 60-second ceiling.
+
+### What this doesn't solve
+
+- **First load of any given (src, width) is still slow** — proxy waits for the full source fetch + resize. Subsequent loads hit the disk cache (<5 ms).
+- **Click-to-open and download links remain slow** — they hit `fullUrl` directly. Operator-initiated; expected.
+- **LayoutCanvas in the override editor stays on `fullUrl`** — high-res needed for editing fidelity.
+- **Doesn't unify the thumbnail pipeline.** After Phase 49 there are three thumbnail sources: S3 composite renders (Phase 44), S3 green-screen composed (Phase 42), photo-thumb proxy (Phase 49 — plain items). A future phase could publish-all-photos-during-Process to merge them, but the operational value is small now that page loads are fast.
+
+### Verification (post-deploy)
+
+1. Open an order with mostly non-composite items. Confirm tile thumbnails load in <500 ms warm cache (subsequent visits) and within ~10 s cold.
+2. Hover Network tab: tile `<img>` requests hit `/api/sytist/photo-thumb?...` returning 200 with `X-Photo-Thumb-Status` header.
+3. Check `server/config/photo-cache/` — JPEG files appear as orders are viewed.
+4. Click a tile → opens un-watermarked original at full size in new tab.
+5. Disconnect Sytist S3 (or use a known-broken URL). Confirm placeholder appears, page doesn't show broken image icons, layout stable.
+6. After 24h+ uptime, check scheduler logs for `[PhotoCache] swept N files` line.
+
+Files: `.gitignore`, `server/services/photoThumbService.js` (new), `server/routes/sytist.js`, `server/services/schedulerService.js`, `client/src/pages/OrderDetailPage.js`, `client/src/pages/settings/OverrideEditorPage.js`
+
+---
+
+## 50. Linux migration portability cleanup (deferred — not yet implemented)
+
+**Trigger condition**: ship when the Linux migration is concretely planned (date set, target server provisioned, output filesystem chosen). Premature execution provides no value while the dashboard runs Windows-to-Windows.
+
+The Phase 49 audit uncovered three concrete Windows-specific dependencies in server code. None block Phase 49 (its own paths use `path.join(__dirname, ...)`), but all break a Linux deployment.
+
+### Findings
+
+1. **`path.win32.X` used pervasively for operator-output paths.** ~25 call sites across 9 server files (`processingService.js`, `darkroomService.js`, `packingSlipService.js`, `teamDividerService.js`, `qrcodeService.js`, `pathsService.js`, `routes/sytist.js`, etc.). `path.win32.join` always emits backslashes regardless of host OS. Works on Windows-to-Windows; produces broken paths on Linux-to-Linux. **Fix**: mechanical swap to `path.join` (Node uses platform-native separator). No semantic change required.
+
+2. **`FALLBACK_BASE` hardcoded in `pathsService.js:59`**: `'C:\\Users\\Sportsline\\Downloads\\sytist-dashboard-test-output\\{date}'`. Only fires when `path-overrides.json` is missing or malformed, but is unrecoverable on Linux. **Fix**: derive from `os.homedir()` + relative path, OR remove the fallback and treat missing config as a fatal startup error.
+
+3. **JSDoc examples in `routes/sytist.js:1259-1262`** use Windows-style example paths (`C:\Users\Sportsline\...`). Cosmetic; doesn't affect runtime. **Fix**: rewrite as platform-neutral or include both Windows and Linux examples.
+
+### Scope
+
+Single phase, mechanical. Estimated 30–50 lines of net diff (mostly find-and-replace `path.win32.` → `path.`). Plus updates to `path-overrides.json` for the new environment (operator config edit, not code).
+
+### Things to verify after the migration
+
+- Existing Windows operator's path-overrides.json still produces correct paths (smoke test on Joey's machine before declaring the migration phase done).
+- Linux server's `path-overrides.json` with Unix-style paths produces correct output paths.
+- `__dirname`-based server-internal paths (SQLite DB, photo-cache, config files) work on both.
+- The `Cross-platform notes` subsection of CLAUDE.md is the durable reference; update it after this phase ships to mark the bug as resolved.
+
+### Why deferred
+
+The portability bug doesn't manifest on the current production setup. Fixing it preemptively means touching ~25 call sites without an immediate way to test the Linux path (no Linux server to deploy against yet). The risk/reward is wrong: the rewrite is small but the verification surface is large, and bugs introduced now won't surface until the migration. Better to do this as part of the migration itself, with the new Linux server available for end-to-end testing.
+
+Files (when shipped): the 9 files listed under finding (1), plus `pathsService.js` and `routes/sytist.js` for findings (2) and (3).
+
+---
+
+## 51+. Open follow-ups
 
 - Identify the upstream "Sportsline UI" integration creating phantom SS orders. Likely a ShipStation Selling Channel; possibly a coworker's separate tool. Phase 33's "adopt without push" handles it gracefully but root-cause is still unknown.
 - Distinguish dashboard-written vs Sytist-written log entries in our `OrderActivityCard` (currently only the `[Dashboard]` body prefix marks ours)
