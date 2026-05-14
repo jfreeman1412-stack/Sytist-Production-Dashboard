@@ -100,7 +100,11 @@ class ComposedThumbnailCacheService {
           updated_at = excluded.updated_at
       `),
       listByOrder: this._db.prepare(
-        `SELECT cart_id, public_url, backend
+        // Phase 47c: include updated_at so the order-detail endpoint
+        // can compare against order_overrides.updated_at and surface
+        // a "Layout edited" indicator when a Save (no render) happened
+        // after the last cache row was written.
+        `SELECT cart_id, public_url, backend, created_at, updated_at
          FROM composed_thumbnails
          WHERE order_id = ?`
       ),

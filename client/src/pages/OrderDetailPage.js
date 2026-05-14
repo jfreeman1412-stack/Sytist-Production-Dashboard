@@ -631,6 +631,11 @@ function LineItemsBlock({ order, groupByTeam }) {
   // each LineItemRow, which shows the rendered composite instead
   // of the raw subject photo when one exists.
   const [composedThumbnails, setComposedThumbnails] = useState({});
+  // Phase 47c: set of cart_ids where override.updated_at > cache.updated_at,
+  // meaning the operator Saved (no render) a layout edit and the cache
+  // row is stale. Used by LineItemRow to overlay a "Layout edited"
+  // indicator on the tile.
+  const [staleCartIds, setStaleCartIds] = useState(() => new Set());
   useEffect(() => {
     let cancelled = false;
     if (!order?.orderId) return undefined;
@@ -641,10 +646,16 @@ function LineItemsBlock({ order, groupByTeam }) {
         if (data && data.ok && data.thumbnails) {
           setComposedThumbnails(data.thumbnails);
         }
+        if (data && Array.isArray(data.stale)) {
+          setStaleCartIds(new Set(data.stale.map(String)));
+        }
       })
       .catch(() => {
         // Non-fatal — cards fall back to existing photo thumbnail.
-        if (!cancelled) setComposedThumbnails({});
+        if (!cancelled) {
+          setComposedThumbnails({});
+          setStaleCartIds(new Set());
+        }
       });
     return () => {
       cancelled = true;
@@ -715,6 +726,7 @@ function LineItemsBlock({ order, groupByTeam }) {
           lineItems={lineItems}
           composedThumbnails={composedThumbnails}
           compositeMappingsBySku={compositeMappingsBySku}
+          staleCartIds={staleCartIds}
         />
       </Card>
     );
@@ -770,6 +782,7 @@ function LineItemsBlock({ order, groupByTeam }) {
             lineItems={g.items}
             composedThumbnails={composedThumbnails}
             compositeMappingsBySku={compositeMappingsBySku}
+            staleCartIds={staleCartIds}
           />
         </div>
       ))}
@@ -782,6 +795,7 @@ function LineItemList({
   lineItems,
   composedThumbnails = {},
   compositeMappingsBySku = new Map(),
+  staleCartIds = new Set(),
 }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -794,6 +808,7 @@ function LineItemList({
           compositeMapping={
             compositeMappingsBySku.get(String(li.sku)) || null
           }
+          thumbnailStale={staleCartIds.has(String(li.cartId))}
         />
       ))}
     </div>
@@ -805,6 +820,7 @@ function LineItemRow({
   lineItem,
   composedThumbnailUrl = null,
   compositeMapping = null,
+  thumbnailStale = false,
 }) {
   const navigate = useNavigate();
   const photo = lineItem.photo;
@@ -1001,29 +1017,63 @@ function LineItemRow({
           // (Memory Mate, etc.) or the composed green-screen subject
           // on a chosen background — what gets printed and shipped.
           // Click opens it full-size in a new tab.
-          <a
-            href={composedThumbnailUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            title="Composed preview (what will print) — click to open"
-            style={{
-              display: 'block',
-              width: '100%',
-              height: '100%',
-              position: 'relative',
-            }}
-          >
-            <img
-              src={composedThumbnailUrl}
-              alt="Composed preview"
+          <>
+            <a
+              href={composedThumbnailUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={
+                thumbnailStale
+                  ? 'Layout edited since last render — Process or Apply to refresh'
+                  : 'Composed preview (what will print) — click to open'
+              }
               style={{
+                display: 'block',
                 width: '100%',
                 height: '100%',
-                objectFit: 'cover',
-                display: 'block',
+                position: 'relative',
               }}
-            />
-          </a>
+            >
+              <img
+                src={composedThumbnailUrl}
+                alt="Composed preview"
+                style={{
+                  width: '100%',
+                  height: '100%',
+                  objectFit: 'cover',
+                  display: 'block',
+                }}
+              />
+            </a>
+            {/* Phase 47c: layout-edited indicator. The cache row
+                exists but a Save (no render) wrote a newer override
+                snapshot — what the operator sees no longer matches
+                what the next render will produce. Top-right corner
+                in amber, distinct from the bottom-right "Process to
+                generate" badge that signals a missing cache row. */}
+            {thumbnailStale && (
+              <span
+                title="Layout edited since last render — Process or Apply to refresh"
+                style={{
+                  position: 'absolute',
+                  top: 4,
+                  right: 4,
+                  zIndex: 2,
+                  padding: '2px 6px',
+                  fontSize: 9,
+                  fontWeight: 600,
+                  letterSpacing: 0.3,
+                  background: '#e0b341',
+                  color: '#000',
+                  borderRadius: 4,
+                  whiteSpace: 'nowrap',
+                  pointerEvents: 'none',
+                }}
+              >
+                ⚠ Layout edited
+              </span>
+            )}
+          </>
         ) : (
           <>
             {/* Background photo — only rendered for green-screen items.
@@ -1088,6 +1138,35 @@ function LineItemRow({
               >
                 <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>no photo</span>
               </div>
+            )}
+
+            {/* Phase 47d: when this item is composite-mapped but no
+                render exists in the cache (yet), make it clear the
+                operator is looking at the raw player photo, not the
+                final product. Suppressed on package headers — those
+                never get their own render (the engine fires per-
+                constituent). */}
+            {hasComposite && !flags.isPackageHeader && (
+              <span
+                title="Composite layout will render at next Process or Apply"
+                style={{
+                  position: 'absolute',
+                  bottom: 4,
+                  right: 4,
+                  zIndex: 2,
+                  padding: '2px 6px',
+                  fontSize: 9,
+                  fontWeight: 600,
+                  letterSpacing: 0.3,
+                  background: 'rgba(0,0,0,0.6)',
+                  color: '#fff',
+                  borderRadius: 4,
+                  whiteSpace: 'nowrap',
+                  pointerEvents: 'none',
+                }}
+              >
+                🔄 Process to generate
+              </span>
             )}
           </>
         )}

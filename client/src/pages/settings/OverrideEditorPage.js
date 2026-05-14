@@ -457,6 +457,14 @@ export default function OverrideEditorPage() {
         txtPath: r.txtPath,
         warnings: r.warnings || [],
       });
+      // Phase 47a: terminal actions (Overwrite / Reprint) navigate
+      // back to the order detail page on success. The updated
+      // thumbnail there is itself the confirmation — no need for the
+      // operator to read filename detail on this page. Save (no
+      // render) intentionally does NOT navigate, since it's a batch-
+      // staging action where the operator typically wants to edit
+      // additional items in the same order.
+      navigate(`/orders/${encodeURIComponent(orderId)}`);
     } catch (err) {
       setActionError(err.message);
     } finally {
@@ -639,8 +647,11 @@ export default function OverrideEditorPage() {
 
       {actionResult && actionResult.mode === 'save' && (
         <StatusBanner kind="success">
-          Override saved. Composite will be re-rendered with these
-          changes the next time you Process or Reprint this order.
+          Override staged. The thumbnail on the order detail page will
+          show a <strong>⚠ Layout edited</strong> badge until the next
+          render — click <strong>Apply (Overwrite)</strong> or
+          <strong> Apply (Reprint)</strong> here, or Process the order,
+          to refresh it.
         </StatusBanner>
       )}
       {actionResult && actionResult.mode === 'overwrite' && (

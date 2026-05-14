@@ -778,7 +778,14 @@ router.delete('/orders/:orderId/notes/:noteId', async (req, res) => {
 // the scheduler when an order ships.
 //
 // Returns:
-//   { ok: true, thumbnails: { [cart_id]: public_url, ... } }
+//   {
+//     ok: true,
+//     thumbnails: { [cart_id]: public_url, ... },
+//     stale: [cart_id, ...]   // Phase 47c: cart_ids whose override
+//                             //   was saved AFTER the last cache row,
+//                             //   so the thumbnail no longer reflects
+//                             //   the current layout.
+//   }
 router.get('/orders/:orderId/composed-thumbnails', async (req, res) => {
   try {
     const orderId = req.params.orderId;
@@ -788,13 +795,39 @@ router.get('/orders/:orderId/composed-thumbnails', async (req, res) => {
     for (const r of rows) {
       thumbnails[r.cart_id] = r.public_url;
     }
-    res.json({ ok: true, thumbnails });
+
+    // Phase 47c: compute stale set. An override row whose updated_at
+    // is later than the cache row's updated_at means the operator
+    // Saved (no render) a layout edit after the last render — the
+    // thumbnail is now out of date until the next Apply or Process.
+    const stale = [];
+    try {
+      const overrides = orderOverrideService.listByOrder(orderId) || [];
+      const cacheUpdatedByCart = new Map();
+      for (const r of rows) {
+        cacheUpdatedByCart.set(String(r.cart_id), r.updated_at || r.created_at);
+      }
+      for (const o of overrides) {
+        const overrideTs = o.updated_at || o.created_at;
+        const cacheTs = cacheUpdatedByCart.get(String(o.cart_id));
+        if (!overrideTs) continue;
+        if (!cacheTs) continue; // no cache row → "Process to generate" badge handles this case, not staleness
+        if (overrideTs > cacheTs) stale.push(String(o.cart_id));
+      }
+    } catch (staleErr) {
+      // Non-fatal — return empty stale list rather than 500.
+      console.warn(
+        `[sytist/orders/${orderId}/composed-thumbnails] stale check failed (non-fatal): ${staleErr.message}`
+      );
+    }
+
+    res.json({ ok: true, thumbnails, stale });
   } catch (err) {
     // Non-fatal — UI falls back to its existing photo thumbnail.
     console.warn(
       `[sytist/orders/${req.params.orderId}/composed-thumbnails] read failed: ${err.message}`
     );
-    res.json({ ok: true, thumbnails: {} });
+    res.json({ ok: true, thumbnails: {}, stale: [] });
   }
 });
 
@@ -3428,6 +3461,59 @@ async function renderOverrideForOrder({
         },
       ];
     }
+  }
+
+  // Phase 47b: publish the rendered composite to the configured
+  // thumbnail backend + upsert the cache row. Without this, an
+  // operator clicking Apply Overwrite or Apply Reprint sees no
+  // change on the order detail thumbnail (it stays stuck at the
+  // last Process-time render or stays empty if Process never ran).
+  // Mirrors processingService.js's composite engine publish step
+  // shape-for-shape so the cache row matches what Process would
+  // produce. Non-fatal: failures surface as warnings.
+  try {
+    const sharp = require('sharp');
+    const composedThumbnailService = require('../services/composedThumbnailService');
+    const composedThumbnailCacheService = require('../services/composedThumbnailCacheService');
+
+    const thumbBuffer = await sharp(result.buffer)
+      .resize({
+        width: 500,
+        height: 500,
+        fit: 'inside',
+        withoutEnlargement: true,
+      })
+      .jpeg({ quality: 80 })
+      .toBuffer();
+
+    const publishedUrl = await composedThumbnailService.publish(
+      order.orderId,
+      cartId,
+      thumbBuffer
+    );
+    if (publishedUrl) {
+      try {
+        const status = composedThumbnailService.status();
+        composedThumbnailCacheService.upsert({
+          orderId: order.orderId,
+          cartId,
+          publicUrl: publishedUrl,
+          backend: status?.active || null,
+        });
+      } catch (cacheErr) {
+        console.warn(
+          `[Override] Order ${order.orderId} cart ${cartId}: cache upsert failed (non-fatal): ${cacheErr.message}`
+        );
+      }
+    }
+  } catch (thumbErr) {
+    result.warnings = [
+      ...(result.warnings || []),
+      {
+        type: 'override_thumbnail_publish_failed',
+        message: `Could not publish composite thumbnail: ${thumbErr.message}`,
+      },
+    ];
   }
 
   return {
