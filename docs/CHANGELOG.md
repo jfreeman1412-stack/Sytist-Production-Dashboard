@@ -228,24 +228,6 @@ Format: phase number → short title → what shipped → key files touched.
 - 47e: Save (no render) success banner rephrased to explicitly mention the ⚠ Layout edited indicator on the order detail page and the three ways to clear it (Apply Overwrite, Apply Reprint, or Process)
 - Files: `client/src/pages/OrderDetailPage.js`, `client/src/pages/settings/OverrideEditorPage.js`, `server/routes/sytist.js`, `server/services/composedThumbnailCacheService.js`
 
-## Phase 48 — Skipped
-- Number reserved during Phase 47 planning for a "Save and stay" multi-item editing variant. The Phase 47 final design solved the use case by not auto-navigating on Save (no render), so Phase 48 never shipped. Next concrete phase is 49
-
-## Phase 49 — Photo thumbnail proxy with disk cache
-- Line item card tiles were downloading 6–10 MB original photos to render 150-px thumbnails (Phase 12a's "prefer un-watermarked fullUrl" decision, with the bandwidth cost unmeasured at the time). 30-item orders took ~60 s to load all tiles. Phase 49 adds a server-side resize proxy that fetches, resizes via sharp to 400-px max edge, caches to disk, and serves ~50 KB JPEGs
-- New `server/services/photoThumbService.js` (~290 lines): `getOrCreate(src, width)`, source URL validation (https + `.amazonaws.com` host + safe extension), disk cache at `server/config/photo-cache/<sha1>.jpg`, mtime-touch on hit, `_generatePlaceholder` for source failures, `sweep({ maxAgeDays })` for TTL cleanup
-- New route `GET /api/sytist/photo-thumb?src=<encoded>&w=400` with `requireAuth`. Returns 200 image/jpeg with `Cache-Control: max-age=86400, immutable` on cache hits/freshes, `max-age=60` on placeholder. `X-Photo-Thumb-Status` header surfaces `cache-hit`/`fresh`/`placeholder` for diagnostics
-- `schedulerService` runs the sweep opportunistically once per ~24 h piggybacked on its existing SS-poll tick. 30-second hard time cap on the sweep prevents an overgrown cache from blocking the scheduler. No size cap in v1
-- Client changes: `LineItemRow` tile `<img src>` and `OverrideEditorPage` switcher tile `<img src>` route through the proxy. `<a href>` click-through stays on `fullUrl` so operators get un-watermarked originals on demand. `LayoutCanvas` keeps `fullUrl` (editor needs high-res). Phase 37 download links keep `fullUrl`. Added `loading="lazy"` to both proxied `<img>` tags so off-screen items defer until scrolled into view
-- Node 22 fetch quirk worked around: passing `AbortSignal` to `fetch` causes `resp.arrayBuffer()` to hang after headers arrive (verified empirically). The service uses `Promise.race` with a separate timeout promise instead. Fetch timeout is 60 s to accommodate observed Sytist S3 download variance (944 ms to 230 s for the same 7 MB photo)
-- Files: `.gitignore`, `server/services/photoThumbService.js` (new), `server/routes/sytist.js`, `server/services/schedulerService.js`, `client/src/pages/OrderDetailPage.js`, `client/src/pages/settings/OverrideEditorPage.js`
-
-## Phase 50 — Linux migration portability cleanup (deferred)
-- Audit during Phase 49 planning surfaced three Windows-specific dependencies in server code: `path.win32.X` used across 9 files for operator-output paths (always emits backslashes — breaks on Linux), `FALLBACK_BASE` hardcoded `'C:\\Users\\...'` in `pathsService.js` (only fires if `path-overrides.json` is missing/malformed), and JSDoc examples in `routes/sytist.js` using Windows paths (cosmetic). None of these block Phase 49 — its own paths use portable `path.join(__dirname, ...)` — but all break a Linux deployment
-- Trigger condition: ship when Linux migration is concretely planned (target server provisioned, deployment date set). Premature execution provides no value while the dashboard runs Windows-to-Windows and adds verification surface (~25 call sites) with no Linux server to end-to-end-test against
-- Estimated scope: 30–50 lines of mostly mechanical `path.win32.` → `path.` find-and-replace. Single phase
-- Tracked durably in `CLAUDE.md` under "Cross-platform notes" (working conventions) and "Open follow-ups" (Phase 50 named explicitly)
-
 ---
 
 ## Reversed / removed

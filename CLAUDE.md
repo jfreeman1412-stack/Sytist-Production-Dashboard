@@ -246,7 +246,7 @@ For deeper detail, see:
 - **`docs/AdminManual.md`** — Settings UI walkthrough, AWS S3 setup, troubleshooting (sections 38–44 are the most recent)
 - **`docs/OperatorManual.md`** — what end users see and do
 
-## Open follow-ups (as of Phase 49)
+## Open follow-ups (as of Phase 47)
 
 These aren't urgent but are worth knowing about:
 
@@ -254,9 +254,8 @@ These aren't urgent but are worth knowing about:
 - **Scheduler poll interval** is hardcoded at 300000ms; would be nice in Settings UI
 - **`_nextReprintNumber`** doesn't scan specialty subfolders — edge case, none observed
 - **S3 storage sweep** for old shipped orders, decoupled from the poll cycle — not needed at current scale but worth a phase eventually
+- **On-demand composite preview** before processing — currently you have to Process to populate the thumbnail cache. A preview endpoint that calls composite engine without writing files would let operators see "what will this look like" before committing
 - **Audit downstream effects of `flags.digital` propagation in canonical order shape** (rejected Phase 45 alternative). The narrower Phase 45 fix only teaches the SS filter about packaging-config category=digital. A broader fix would set `flags.download = true` at `sytistDbService.getOrderById` time for any digital-by-config SKU so every downstream consumer (slip, Darkroom .txt, composite engine, imposition) gets the same behavior automatically. Rejected for Phase 45 because of regression risk on slip display, the Darkroom .txt's skip-if-download logic, and Phase 43 hotfix 1's careful work to keep `flags.download` from propagating incorrectly to package constituents. Worth revisiting once we want symmetric "digital is digital everywhere" handling.
-- **Phase 50 — Linux migration portability cleanup**. Planned but deferred. Audit during Phase 49 surfaced three concrete Windows-specific dependencies: `path.win32.X` used across 9 server files (always emits backslashes — breaks on Linux), `FALLBACK_BASE` hardcoded `'C:\\Users\\...'` in `pathsService.js`, and JSDoc examples using Windows paths (cosmetic). None block current Windows-to-Windows production. Trigger condition: ship when Linux migration is concretely planned (target server provisioned, deployment date set). Full design notes in `docs/SPEC.md` §50. Working principles for new code under "Cross-platform notes" above.
-- **Unify the three thumbnail sources**. Phase 42/44 publish composite + green-screen renders to S3 during Process. Phase 49 serves plain-photo thumbnails on demand via the local proxy. A future phase could publish-all-photos-during-Process to merge them into a single S3-backed pipeline, eliminating the proxy's first-load latency. Not urgent now that Phase 49 makes page loads fast on warm cache. On-demand composite preview (the earlier follow-up) is functionally subsumed by Phase 46's preview button which uses `POST /composite/preview`.
 
 ## How to ask me for things
 

@@ -2,7 +2,7 @@
 
 Web-based production dashboard for processing Sytist orders into Darkroom-ready txt files, packing slips, ShipStation shipments, and back into Sytist as status updates + activity-log entries. Pulls order data directly from the Sytist MySQL database.
 
-**Status:** Phase 49 — production. See `SPEC.md` for the full phase history and `CHANGELOG.md` for a chronological summary.
+**Status:** Phase 47 — production. See `SPEC.md` for the full phase history and `CHANGELOG.md` for a chronological summary.
 
 ---
 
@@ -260,9 +260,6 @@ The dashboard reads from and writes to Sytist's existing `ms_notes` table. Every
 | 45    | SS eligibility honors packaging-config category=digital | ✅ |
 | 46    | Order-detail composite affordances on each line item | ✅ |
 | 47    | Override editor wired into the operator-fix loop | ✅ |
-| 48    | (skipped — reserved during Phase 47 planning, not needed) | ⏭️ |
-| 49    | Photo thumbnail proxy with disk cache | ✅ |
-| 50    | Linux migration portability cleanup | 🕒 deferred |
 
 See `CHANGELOG.md` for what each phase delivered and `SPEC.md` for the full design notes.
 
