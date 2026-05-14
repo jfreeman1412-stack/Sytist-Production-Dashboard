@@ -1145,8 +1145,21 @@ function LineItemRow({
                 operator is looking at the raw player photo, not the
                 final product. Suppressed on package headers — those
                 never get their own render (the engine fires per-
-                constituent). */}
-            {hasComposite && !flags.isPackageHeader && (
+                constituent).
+
+                Phase 47 hotfix 2: also suppress when the order is
+                already in Printing (40) or Shipped (39) — by then
+                "Process to generate" is misleading regardless of
+                whether the cache row is missing. Most missing cache
+                rows turn out to be orders processed by the upstream
+                Sportsline UI tool (operator: Kirsten), which doesn't
+                go through our processOrder. Showing the badge on
+                those orders implies "not processed yet" which
+                contradicts what Sytist itself displays. Reuses
+                isReprintMode (already computed for the per-item
+                reprint button) since the semantic is identical:
+                "already-processed-by-someone." */}
+            {hasComposite && !flags.isPackageHeader && !isReprintMode && (
               <span
                 title="Composite layout will render at next Process or Apply"
                 style={{
