@@ -851,7 +851,11 @@ function LineItemRow({
   }, []);
 
   function handleEditLayout() {
-    navigate(`/overrides/${order.orderId}/${lineItem.cartId}`);
+    // Phase 46 hotfix 1: the override editor route is mounted under
+    // /settings (see AppLayout.js's nested <Route path="/settings">),
+    // so the URL needs the /settings prefix. Without it the wildcard
+    // fallback bounces to /.
+    navigate(`/settings/overrides/${order.orderId}/${lineItem.cartId}`);
   }
 
   async function handleTogglePreview() {

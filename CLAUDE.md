@@ -129,6 +129,10 @@ sytist-dashboard/
 - **Services own state**: cache reads/writes, database calls, external API calls all live in services.
 - **Failure modes for audit-style writes are non-blocking**: `ms_notes`, `order_status_audit`, thumbnail cache upserts. The action succeeds even if the audit write fails. The operator just doesn't see the side-effect entry.
 
+### Client routing
+
+Settings pages live under `/settings/<page>` — when navigating to the override editor, gallery assets, or any other settings page from non-settings code, include the `/settings` prefix in the URL. Unknown paths fall through to a wildcard `<Route path="*" element={<Navigate to="/" replace />} />` in `AppLayout.js`, so a missing prefix silently redirects to the dashboard home instead of erroring. Cross-check against an existing working call (e.g. `OrderOverridesPage.openEditor`) when in doubt.
+
 ### Logging conventions
 
 The dashboard logs aggressively. Match the existing style when adding new logs:
