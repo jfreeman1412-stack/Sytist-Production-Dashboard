@@ -219,6 +219,15 @@ Format: phase number → short title → what shipped → key files touched.
 - Net diff: +269 / −292 in one file (`client/src/pages/OrderDetailPage.js`). No server change
 - Files: `client/src/pages/OrderDetailPage.js`
 
+## Phase 47 — Override editor wired into the operator-fix loop
+- Phase 46 made the override editor reachable from each line item. Phase 47 closes the workflow: edit → return to order page → updated thumbnail visible (Apply paths) OR clear staleness indicator visible (Save no-render path). Plus a "Process to generate" badge for composite-mapped items that haven't been processed yet, addressing the operator confusion that triggered Phase 47 to begin with
+- 47a: Apply Overwrite + Apply Reprint navigate to `/orders/<orderId>` immediately on success. No setTimeout. Save (no render) intentionally stays on the editor so batch-staging across multiple cart fixes doesn't force round-trips
+- 47b: `routes/sytist.js renderOverrideForOrder` now publishes the rendered composite to the configured thumbnail backend + upserts `composed_thumbnails`. Mirrors `processingService.js`'s composite engine publish shape. Non-fatal failures surface as render warnings. Closes the gap where Apply Overwrite wrote the file to disk but the order detail thumbnail stayed at the last Process-time state
+- 47c: `/composed-thumbnails` endpoint returns a `stale: [cart_id, ...]` array. Cart ids are stale when `order_overrides.updated_at > composed_thumbnails.updated_at`. Order detail's `LineItemRow` renders a top-right amber ⚠ Layout edited overlay when stale. `composedThumbnailCacheService.listByOrder` extended to include `created_at`/`updated_at` (additive, doesn't break existing consumers)
+- 47d: bottom-right dark "🔄 Process to generate" badge on tiles where `hasComposite && !flags.isPackageHeader && !composedThumbnailUrl`. The two overlays are mutually exclusive — "Process to generate" only when no cache row; "Layout edited" only when a stale one exists
+- 47e: Save (no render) success banner rephrased to explicitly mention the ⚠ Layout edited indicator on the order detail page and the three ways to clear it (Apply Overwrite, Apply Reprint, or Process)
+- Files: `client/src/pages/OrderDetailPage.js`, `client/src/pages/settings/OverrideEditorPage.js`, `server/routes/sytist.js`, `server/services/composedThumbnailCacheService.js`
+
 ---
 
 ## Reversed / removed
