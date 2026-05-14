@@ -133,20 +133,6 @@ sytist-dashboard/
 
 Settings pages live under `/settings/<page>` — when navigating to the override editor, gallery assets, or any other settings page from non-settings code, include the `/settings` prefix in the URL. Unknown paths fall through to a wildcard `<Route path="*" element={<Navigate to="/" replace />} />` in `AppLayout.js`, so a missing prefix silently redirects to the dashboard home instead of erroring. Cross-check against an existing working call (e.g. `OrderOverridesPage.openEditor`) when in doubt.
 
-### Cross-platform notes
-
-The dashboard runs on Joey's Windows machine today and writes to a Windows `Z:` network drive for operator output. It will eventually move to a Linux server — keep the code portable enough that the move is a config edit, not a rewrite.
-
-**For server-internal paths** (SQLite DB, config files, cache dirs, anything inside `server/`): use `path.join(__dirname, ...)` with `path.join` from `require('path')` — not `path.win32` or `path.posix`. Node picks the platform's native separator automatically. Never hardcode drive letters (`C:`, `Z:`) or absolute paths in code; derive from `__dirname` or read from configurable JSON.
-
-**For operator-output paths** (where files land for the lab — `Z:\Photo Day\...` today): the path values themselves live in `server/config/path-overrides.json` and are operator-edited. The code joining base + segments should use `path.join` (uses platform-native separator) so the result is correct on whatever OS the dashboard runs on. **There is currently a portability bug here**: many call sites use `path.win32.join`, which always emits backslashes — works on Windows-to-Windows today, breaks on Linux-to-Linux. Search for `path.win32` before touching output-path logic; flag in any new code so we don't add more sites.
-
-**Shell-outs and platform-specific binaries**: zero today. No `child_process.exec`, no `cmd.exe`/`powershell` invocations, no `.bat` scripts. Keep it that way — anything platform-specific should be a configurable command in `app-settings.json`, not a hardcoded path.
-
-**OS detection**: not used anywhere today. If you ever need platform-specific behavior, prefer `process.platform === 'win32'` over `os.platform()` (they're equivalent but `process.platform` is more idiomatic in Node) and put the check at the lowest reasonable level.
-
-**The `Z:` references in CLAUDE.md and SPEC.md** are environment facts (what the current production setup looks like), not code facts. They stay even after a Linux migration as historical context.
-
 ### Logging conventions
 
 The dashboard logs aggressively. Match the existing style when adding new logs:
