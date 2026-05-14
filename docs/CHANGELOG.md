@@ -203,6 +203,13 @@ Format: phase number → short title → what shipped → key files touched.
 - Phase 44 hotfix 1: the three slip preview routes (`GET /slip/preview/:id`, `POST /slip/preview/:id/save`, `GET /slip/preview/:id/info`) don't have access to local composite paths. New helper `_loadCompositeUrlsForOrder(orderId)` reads the SQLite cache and passes URLs via a new `compositeUrlsByCartId` option. Slip's Tier 0 split into 0a (path, fastest) and 0b (URL fetch, for route handlers)
 - Phase 44 hotfix 2: removed both `composedThumbnailService.cleanup` and `composedThumbnailCacheService.deleteByOrder` calls from `schedulerService`. Auto-cleanup was racing against operator visibility — orders detected as shipped within the same poll cycle as creation were getting their cache rows wiped before the operator could view the order detail or slip preview. Cache rows + S3 objects now persist indefinitely; trivial storage cost (file: `server/services/schedulerService.js`)
 
+## Phase 45 — ShipStation eligibility honors packaging-config category=digital
+- Real order 111042 was sent to SS with only a drop-shipped specialty (SKU 14) and a digital-package SKU (5D). Sytist sets `cart_download = 0` on digital-package SKUs (3D, 5D, 20D, plus three long-string CHEER/digital variants), so the existing `flags.download` filter missed them — they fell through into `shippable` and SS create proceeded. Class of bug, ~256 orders in the data window had this shape; 1 currently has a leftover `shipstation_links` row (left as-is, mirrors Phase 44 hotfix 2's no-auto-clean principle)
+- Part A — config: added 6 digital SKU entries to `packaging-config.json` (`3D`, `5D`, `20D`, `5 DIGITALS - CHEER`, `5 DIGITALS`, `10 HIGH RESOLUTION DIGITAL IMAGES CHEER`), all `category: 'digital'`. Removed `packaging-config.json` from `.gitignore` so the canonical digital classification travels with the code
+- Part B — code: new `packagingService.isDigital(sku)` mirrors `specialtyService.isDropShipped(sku)`, case-tolerant lookup (tries uppercased then raw). Wired into all three filter sites: `shipstationService.buildOrderFromSytist`, `shipstationService.previewPackagingForOrder`, `routes/shipstation.js _computeEligibility`. New check sits between SKIP_FLAGS and the shippable push, after the drop-ship check
+- Verification: real order 111260 (mixed `[3D, 25, 25, 25, 9]`, ship_to_home) processed cleanly — payload contained only SKU 9; synthetic `[14, 5D]` returned `__skipShipStation: true, message: "... 1 dropShipped, 1 digital"`
+- Files: `.gitignore`, `server/config/packaging-config.json`, `server/services/packagingService.js`, `server/services/shipstationService.js`, `server/routes/shipstation.js`
+
 ---
 
 ## Reversed / removed

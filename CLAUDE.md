@@ -50,6 +50,16 @@ The pipeline has a single source of truth: the `composed_thumbnails` SQLite tabl
 - Some orders show as `shipped` in SS within seconds of creation, with no tracking number. Cause not yet diagnosed. Don't auto-clean the cache on shipped detection (see above).
 - ShipStation may reassign `packageCode` based on its own rules. The dashboard surfaces this as a "drift" warning, not an error.
 
+### SS eligibility filter — three layered skip reasons
+
+The line-item filter in `shipstationService.buildOrderFromSytist` skips an item if any of these match. Same three checks are mirrored in `previewPackagingForOrder` and `routes/shipstation.js _computeEligibility`. **Keep all three in sync** when adding new skip reasons:
+
+1. **`SKIP_FLAGS` on the line item's `flags`**: `['download', 'giftCert', 'creditProduct', 'booking', 'preSell']`. Driven by Sytist `ms_cart` columns (`cart_download`, `cart_gift_certificate`, etc.) populated in `sytistDbService.getOrderById`.
+2. **`specialtyService.isDropShipped(li.sku)`**: per-SKU lookup against `specialty-products.json` `dropShipped: true` entries. There is no `flags.dropShip` — drop-ship is a config-driven SKU check, not a line-item flag.
+3. **`packagingService.isDigital(li.sku)`** (Phase 45): per-SKU lookup against `packaging-config.json` `productWeights[sku].category === 'digital'`. Case-tolerant (uppercase first, raw fallback). Added because Sytist sets `cart_download = 0` on digital-package SKUs like 3D / 5D / 20D, so `flags.download` misses them. Affected ~256 historical orders. Real bug case: order 111042.
+
+If you ever see a "digital" or "non-shippable" SKU bypass the filter, the fix is usually a missing `packaging-config.json` entry rather than a code change. Add the SKU with `category: 'digital'` (uppercased key) and the next process call picks it up — `packagingService.getConfig` reads from disk each call, no restart needed.
+
 ## Repo layout
 
 ```

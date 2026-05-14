@@ -1288,7 +1288,46 @@ Files: `server/services/processingService.js`, `server/services/packingSlipServi
 
 ---
 
-## 45+. Open follow-ups
+## 45. ShipStation eligibility honors packaging-config category=digital
+
+A real order (111042) was sent to ShipStation despite containing only a drop-shipped specialty (SKU 14) and a digital-package SKU (5D). The SS eligibility filter previously skipped a line item only if `flags.download === true` (driven by Sytist's `cart_download` column) or if `specialtyService.isDropShipped(sku)` returned true. Sytist sets `cart_download = 0` for digital-package SKUs (3D, 5D, 20D, and a few long-string variants), so the existing filter missed them and they ended up in the `shippable` array — keeping the order eligible for an SS create call.
+
+This is a class of bug, not a one-off: 6 distinct SKUs across ~256 orders in our data window had `cart_download = 0` despite being digital products. (Other digital SKUs, like 25, already have `cart_download = 1` set by Sytist and were filtered correctly.)
+
+**Part A — config**: add the 6 missing SKUs to `packaging-config.json` with `category: 'digital'`. Keys are stored uppercased to match the lookup convention; lookups normalize the incoming `li.sku` to uppercase before reading from `productWeights`. Entries:
+
+| SKU | Category | Volume |
+|---|---|---|
+| `3D` | digital | 162 orders |
+| `5D` | digital | 79 orders |
+| `20D` | digital | 1 order |
+| `5 DIGITALS - CHEER` | digital | 8 orders |
+| `5 DIGITALS` | digital | 2 orders |
+| `10 HIGH RESOLUTION DIGITAL IMAGES CHEER` | digital | 4 orders |
+
+Side decision: `packaging-config.json` was previously gitignored as "local operator-edited config." Phase 45 removes it from gitignore so the canonical digital classification travels with the code. Other listed configs (app-settings.json with AWS keys, specialty-products.json, etc.) stay gitignored.
+
+**Part B — code**: new `packagingService.isDigital(sku)` method mirroring `specialtyService.isDropShipped(sku)` in shape and call convention. Wired into all three filter sites:
+
+- `shipstationService.buildOrderFromSytist` — the real create path
+- `shipstationService.previewPackagingForOrder` — the packaging engine's preview, used by Settings → Packaging test calculator and the order detail page's Ship card pre-fill
+- `routes/shipstation.js _computeEligibility` — the eligibility-summary endpoint that drives the order detail page's "X shippable, Y skipped" badge
+
+The check sits after the SKIP_FLAGS check and after the drop-ship check, before the line is added to `shippable`. Same defensive try/catch fallback pattern as the drop-ship check — if the lookup throws, the item is treated as shippable (easier to refund a label than to fail to ship).
+
+Case-tolerance: `isDigital` tries the uppercased SKU first, falls back to the raw key. So `5D`, `5d`, `5D`, all match the stored `5D` entry. Numeric SKUs like `25` work unchanged since `'25'.toUpperCase() === '25'`.
+
+**Orphan scope**: of the 29 orders currently in `shipstation_links`, exactly 1 (order 111042) would have been skipped under the new filter but wasn't under the old. The orphaned SS row stays — we don't auto-clean per Phase 44 hotfix 2's principle, and one row isn't worth a manual sweep. The bug-case universe is much larger (~256 orders) but most predate the dashboard or hit Sytist's status pipeline through other paths and never appeared in `shipstation_links`.
+
+**Verification**:
+- Regression check (real order 111260, ship_to_home, mixed `[3D, 25, 25, 25, 9]`): payload built and sent to SS contained exactly one item — SKU 9 (8x10 Team Photo). The 3D was caught by the new rule; the three 25s by the existing `flags.download` filter.
+- Bug case (synthetic `[14, 5D]`): `buildOrderFromSytist` returned `{ __skipShipStation: true, reason: 'no_shippable_items', message: '... 1 dropShipped, 1 digital' }`. `previewPackagingForOrder` returned `ok: false, shippableCount: 0`.
+
+Files: `.gitignore`, `server/config/packaging-config.json`, `server/services/packagingService.js`, `server/services/shipstationService.js`, `server/routes/shipstation.js`
+
+---
+
+## 46+. Open follow-ups
 
 - Identify the upstream "Sportsline UI" integration creating phantom SS orders. Likely a ShipStation Selling Channel; possibly a coworker's separate tool. Phase 33's "adopt without push" handles it gracefully but root-cause is still unknown.
 - Distinguish dashboard-written vs Sytist-written log entries in our `OrderActivityCard` (currently only the `[Dashboard]` body prefix marks ours)
