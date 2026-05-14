@@ -4,6 +4,36 @@ This manual covers the day-to-day workflow for processing Sytist orders: logging
 
 If you need to install the dashboard, add users, configure API keys, or manage packages/add-ons, see `AdminManual.md`. For a per-phase history of features, see `CHANGELOG.md`.
 
+If the dashboard URL doesn't load in your browser, see [Starting the dashboard](#starting-the-dashboard) below before continuing.
+
+---
+
+## Starting the dashboard
+
+If **http://localhost:3010** doesn't load — usually after a computer restart, a closed terminal window, or a power outage — you need to start the dashboard server.
+
+**Steps:**
+
+1. Open **Command Prompt** (or PowerShell) from the Start menu.
+2. Navigate to the dashboard folder:
+   ```cmd
+   cd C:\Users\Sportsline\Downloads\sytist-dashboard\sytist-dashboard
+   ```
+3. Start both the server and the client:
+   ```cmd
+   npm run dev
+   ```
+4. Wait until you see two lines (about 30 seconds the first time):
+   - `[server]` listening on port 3011
+   - `[client] Compiled successfully!` (or similar)
+5. Open **http://localhost:3010** in your browser and log in.
+
+**Keep the Command Prompt window open.** Closing it stops the dashboard. Minimize it if it's in the way, but don't close it.
+
+If the dashboard stops responding mid-session, go back to the Command Prompt window, press **Ctrl+C** (and `y` if asked), then run `npm run dev` again.
+
+If startup errors with "cannot find module" or similar, your admin needs to run `npm run install-all` from the same folder once, then try `npm run dev` again.
+
 ---
 
 ## Table of contents
