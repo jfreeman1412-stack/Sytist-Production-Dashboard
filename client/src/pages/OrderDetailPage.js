@@ -945,21 +945,8 @@ function LineItemRow({
 
   // Phase 12a: pick un-watermarked thumbnail URLs for both the
   // player photo and (if green-screen) the chosen background.
-  // Phase 49: split into two values. `playerFullUrl` is the
-  // un-watermarked original — used as the click-through target so
-  // operators get full quality when they open the photo. The tile's
-  // <img src> uses the photo-thumb proxy below to avoid downloading
-  // 6–10 MB just to render a 150-px tile.
-  const playerFullUrl = photo
+  const playerUrl = photo
     ? photo.fullUrl || photo.largeUrl || photo.thumbUrl
-    : null;
-  // Kept under the original variable name so other call sites that
-  // reference `playerUrl` (e.g. the <a href> open-in-new-tab) don't
-  // need to change shape. Only the <img src> below is routed through
-  // the proxy.
-  const playerUrl = playerFullUrl;
-  const playerThumbSrc = playerFullUrl
-    ? `/api/sytist/photo-thumb?src=${encodeURIComponent(playerFullUrl)}&w=400`
     : null;
   const bgUrl = backgroundPhoto
     ? backgroundPhoto.fullUrl ||
@@ -1127,13 +1114,9 @@ function LineItemRow({
                 }}
               >
                 <img
-                  // Phase 49: tile src goes through the photo-thumb
-                  // proxy to fetch a resized JPEG (~50 KB) instead
-                  // of the un-watermarked original (6–10 MB). The
-                  // <a href> above keeps playerUrl (the original)
-                  // so click-through opens full quality in a new tab.
-                  src={playerThumbSrc}
-                  loading="lazy"
+                  // Phase 12: prefer fullUrl (un-watermarked original)
+                  // over thumbUrl/largeUrl (both watermarked).
+                  src={playerUrl}
                   alt={photo.originalFilename || ''}
                   style={{
                     width: '100%',
