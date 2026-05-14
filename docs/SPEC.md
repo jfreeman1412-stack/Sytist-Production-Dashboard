@@ -1291,7 +1291,6 @@ Files: `server/services/processingService.js`, `server/services/packingSlipServi
 ## 45+. Open follow-ups
 
 - Identify the upstream "Sportsline UI" integration creating phantom SS orders. Likely a ShipStation Selling Channel; possibly a coworker's separate tool. Phase 33's "adopt without push" handles it gracefully but root-cause is still unknown.
-- Reason field UI for reprints (server already accepts it; client doesn't expose an input)
 - Distinguish dashboard-written vs Sytist-written log entries in our `OrderActivityCard` (currently only the `[Dashboard]` body prefix marks ours)
 - Migrate remaining JSON configs to SQLite where it makes sense (low priority)
 - Configurable scheduler poll interval via Settings UI (currently hardcoded to 300000ms)

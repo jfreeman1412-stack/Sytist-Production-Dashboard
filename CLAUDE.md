@@ -223,7 +223,6 @@ For deeper detail, see:
 These aren't urgent but are worth knowing about:
 
 - **Why are SS orders auto-shipping** without a tracking number, seconds after creation? Cache survives now (Phase 44 hotfix 2), but the root cause is unknown. Could be an SS account workflow rule.
-- **Reason field for reprints** is server-accepted but client doesn't expose an input
 - **Scheduler poll interval** is hardcoded at 300000ms; would be nice in Settings UI
 - **`_nextReprintNumber`** doesn't scan specialty subfolders — edge case, none observed
 - **S3 storage sweep** for old shipped orders, decoupled from the poll cycle — not needed at current scale but worth a phase eventually

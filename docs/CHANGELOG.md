@@ -224,7 +224,6 @@ Format: phase number → short title → what shipped → key files touched.
 ## Known follow-ups (not yet phased)
 
 - The upstream "Sportsline UI" tool that creates phantom SS orders is unidentified as of Phase 37. Pinpointing it (likely a ShipStation Selling Channel) would let us either reconfigure or remove the workaround.
-- The reason field for reprints is wired server-side but not exposed in the UI yet — a free-text input on the reprint button would let operators tag why they reprinted (damage, wrong photo, etc.).
 - ms_notes UI doesn't currently distinguish system events from "this dashboard wrote it" vs "Sytist wrote it" — the `[Dashboard]` prefix is the only signal. Could be a colored badge in a future polish phase.
 - Auto-fetch scheduler polls every 5 minutes; configurable in code only. Settings UI exposure would be useful.
 - `_nextReprintNumber` scans only the regular download dir; doesn't see specialty subfolder reprints. Edge case — none observed in practice yet.
