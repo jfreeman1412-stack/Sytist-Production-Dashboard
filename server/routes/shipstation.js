@@ -717,6 +717,7 @@ router.post('/scheduler/poll', async (req, res) => {
  */
 async function _computeEligibility(order) {
   const specialtyService = require('../services/specialtyService');
+  const packagingService = require('../services/packagingService');
   const items = order.lineItems || [];
   let digitalCount = 0;
   let dropShippedCount = 0;
@@ -741,6 +742,16 @@ async function _computeEligibility(order) {
       const isDrop = await specialtyService.isDropShipped(li.sku);
       if (isDrop) {
         dropShippedCount += 1;
+        continue;
+      }
+    } catch (e) {
+      // Defensive: treat as shippable
+    }
+    // Phase 45: mirror buildOrderFromSytist's digital-by-config check
+    // so the UI's eligibility preview matches the real SS filter.
+    try {
+      if (await packagingService.isDigital(li.sku)) {
+        digitalCount += 1;
         continue;
       }
     } catch (e) {

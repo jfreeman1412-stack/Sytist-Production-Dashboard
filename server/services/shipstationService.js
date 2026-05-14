@@ -367,6 +367,7 @@ class ShipStationService {
    */
   async buildOrderFromSytist(order, overrides = {}) {
     const specialtyService = require('./specialtyService');
+    const packagingService = require('./packagingService');
 
     // ─── Filter line items ──────────────────────────────
     const allLineItems = order.lineItems || [];
@@ -394,6 +395,17 @@ class ShipStationService {
       } catch (e) {
         // Defensive: if the check throws, include the item.
         // Easier to refund a label than to fail to ship.
+      }
+      // Phase 45: digital-by-config check. Catches SKUs like 5D where
+      // Sytist's cart_download=0 (so flags.download is false) but the
+      // dashboard's packaging-config classifies the SKU as digital.
+      try {
+        if (await packagingService.isDigital(li.sku)) {
+          skipped.push({ cartId: li.cartId, reason: 'digital', sku: li.sku });
+          continue;
+        }
+      } catch (e) {
+        // Same defensive fallback as drop-ship.
       }
       shippable.push(li);
     }
@@ -739,6 +751,16 @@ class ShipStationService {
         }
       } catch (e) {
         // Defensive — same fallback as buildOrderFromSytist
+      }
+      // Phase 45: mirror the digital-by-config check in buildOrderFromSytist
+      // so the preview reflects the same eligibility the real path applies.
+      try {
+        if (await packagingService.isDigital(li.sku)) {
+          skipped.push({ cartId: li.cartId, reason: 'digital', sku: li.sku });
+          continue;
+        }
+      } catch (e) {
+        // Same defensive fallback.
       }
       shippable.push(li);
     }

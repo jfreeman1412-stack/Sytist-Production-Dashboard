@@ -274,6 +274,22 @@ class PackagingService {
     return config.productWeights || {};
   }
 
+  // Phase 45: returns true if the SKU's productWeights entry has
+  // category='digital'. Sytist doesn't reliably set cart_download=1
+  // for digital-package SKUs like 5D, so the SS filter can't lean
+  // on flags.download alone. Lookup is case-tolerant: tries the
+  // uppercased SKU first (matches how digital entries are stored),
+  // falls back to the raw key (preserves behavior for legacy
+  // numeric SKUs and any future lowercased config entry).
+  async isDigital(sku) {
+    if (!sku) return false;
+    const weights = await this.getProductWeights();
+    const raw = String(sku);
+    const upper = raw.toUpperCase();
+    const entry = weights[upper] || (raw !== upper ? weights[raw] : null);
+    return !!(entry && entry.category === 'digital');
+  }
+
   async setProductWeight(sku, data) {
     const config = await this.getConfig();
     config.productWeights[String(sku)] = {
