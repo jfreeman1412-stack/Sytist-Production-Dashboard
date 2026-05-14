@@ -125,6 +125,62 @@ router.get('/gallery-assets/logos/:galleryId/preview', async (req, res) => {
   }
 });
 
+// ─── Phase 49 v2: photo thumbnail proxy ────────────────────
+//
+// NO requireAuth on this route — deliberately. The proxy is
+// consumed by <img src> tags, which can't reliably carry session
+// cookies across CRA dev-proxy + SameSite restrictions (Phase 49
+// v1 tried with requireAuth and got 401s on every image —
+// reverted). SSRF protection comes from photoThumbService's
+// isValidSource: HTTPS only, exact-host allowlist (env-configurable
+// via PHOTO_PROXY_ALLOWED_HOSTS), no query string / fragment /
+// embedded credentials, safe extension only, plus redirect:'error'
+// on the fetch itself. Acceptable because the server runs
+// localhost-only today.
+//
+// IF THIS DASHBOARD EVER MOVES TO A PUBLIC-FACING DEPLOYMENT:
+// replace this with signed URLs (HMAC over src + width + expiry)
+// BEFORE deploy. The <img>-via-cookie approach is fragile and
+// will need rethinking when auth becomes load-bearing. See
+// CLAUDE.md → Cross-platform notes for the durable version of
+// this note.
+//
+// GET /api/sytist/photo-thumb?src=<encoded_url>&w=400
+//
+// Response: 200 image/jpeg (cache hit, fresh fetch, or placeholder).
+// X-Photo-Thumb-Status header distinguishes cache-hit / fresh /
+// placeholder for log forensics.
+router.get('/photo-thumb', async (req, res) => {
+  try {
+    const photoThumbService = require('../services/photoThumbService');
+    const src = req.query.src;
+    const width = req.query.w;
+    const { buffer, fromCache, isPlaceholder } =
+      await photoThumbService.getOrCreate(src, width);
+
+    res.set('Content-Type', 'image/jpeg');
+    res.set(
+      'X-Photo-Thumb-Status',
+      isPlaceholder ? 'placeholder' : fromCache ? 'cache-hit' : 'fresh'
+    );
+    if (isPlaceholder) {
+      // Short cache so transient Sytist outages clear quickly
+      // when the source recovers.
+      res.set('Cache-Control', 'public, max-age=60');
+    } else {
+      // Content is keyed by sha1(src + width) so the URL is
+      // effectively immutable for the lifetime of the source.
+      res.set('Cache-Control', 'public, max-age=86400, immutable');
+    }
+    res.send(buffer);
+  } catch (err) {
+    // Last-resort 500 — shouldn't happen because getOrCreate is
+    // designed never to throw. Logged for forensics.
+    console.error(`[sytist/photo-thumb] unexpected error: ${err.message}`);
+    res.status(500).send('');
+  }
+});
+
 router.use(requireAuth);
 
 router.get('/health', async (req, res) => {
