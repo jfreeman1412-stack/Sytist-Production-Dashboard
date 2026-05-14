@@ -831,6 +831,51 @@ router.get('/orders/:orderId/composed-thumbnails', async (req, res) => {
   }
 });
 
+// ─── Phase 49: photo thumbnail proxy ─────────────────────────
+//
+// Sytist photos are stored at high resolution on S3 (6–10 MB per
+// original). The dashboard's line item card tiles display them at
+// 150 px, which means each card was downloading hundreds of times
+// more data than it displays. This route fetches the source, resizes
+// with sharp, caches the result to disk, and serves the small
+// resized JPEG. See photoThumbService.js for storage + sweep details.
+//
+// GET /api/sytist/photo-thumb?src=<encoded_full_url>&w=400
+//
+// Responses:
+//   200 image/jpeg — the resized thumbnail (or the placeholder if
+//     source fetch fails / URL rejects validation). HTTP 200 on the
+//     placeholder path is deliberate so the <img> doesn't show a
+//     broken icon or shift layout. X-Photo-Thumb-Status header
+//     distinguishes the success and placeholder paths.
+router.get('/photo-thumb', async (req, res) => {
+  try {
+    const photoThumbService = require('../services/photoThumbService');
+    const src = req.query.src;
+    const width = req.query.w;
+    const { buffer, fromCache, isPlaceholder } =
+      await photoThumbService.getOrCreate(src, width);
+
+    res.set('Content-Type', 'image/jpeg');
+    res.set('X-Photo-Thumb-Status', isPlaceholder ? 'placeholder' : fromCache ? 'cache-hit' : 'fresh');
+    if (isPlaceholder) {
+      // Short cache on the placeholder path so transient Sytist
+      // outages clear quickly when the source recovers.
+      res.set('Cache-Control', 'public, max-age=60');
+    } else {
+      // Content is keyed by sha1(src + width), so the URL is
+      // effectively immutable — long browser cache is safe.
+      res.set('Cache-Control', 'public, max-age=86400, immutable');
+    }
+    res.send(buffer);
+  } catch (err) {
+    // Last-resort 500 — shouldn't happen because getOrCreate is
+    // designed never to throw. Logged for forensics.
+    console.error(`[sytist/photo-thumb] unexpected error: ${err.message}`);
+    res.status(500).send('');
+  }
+});
+
 router.post(
   '/orders/:orderId/push-packaging',
   requireRole('admin', 'operator'),

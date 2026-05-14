@@ -47,6 +47,11 @@ class SchedulerService {
     this._lastPollAt = null;
     this._lastPollResult = null;
     this._pollCount = 0;
+    // Phase 49: track when the photo-cache TTL sweep last ran. Each
+    // SS poll tick checks this; if >24h has elapsed since the last
+    // sweep, kick off a sweep alongside the poll. Lazily piggybacking
+    // on the existing scheduler avoids spinning up a second timer.
+    this._lastPhotoCacheSweepAt = 0;
   }
 
   /**
@@ -405,6 +410,24 @@ class SchedulerService {
       this._lastPollAt = summary.finishedAt;
       this._lastPollResult = summary;
       this._isPolling = false;
+    }
+
+    // Phase 49: opportunistic photo-cache TTL sweep. Runs at most
+    // once per 24h, piggybacking on whichever SS poll tick is first
+    // past the threshold. Errors are swallowed — sweep failures
+    // mustn't poison the SS sync summary or future ticks. Awaiting
+    // here is intentional: a fresh server restart that immediately
+    // sweeps blocks for a few seconds before responding to the SS
+    // sync, which is fine in the background.
+    const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+    if (Date.now() - this._lastPhotoCacheSweepAt > ONE_DAY_MS) {
+      this._lastPhotoCacheSweepAt = Date.now();
+      try {
+        const photoThumbService = require('./photoThumbService');
+        await photoThumbService.sweep();
+      } catch (e) {
+        console.warn(`[Scheduler] PhotoCache sweep failed (non-fatal): ${e.message}`);
+      }
     }
 
     return summary;

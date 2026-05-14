@@ -21,6 +21,9 @@ server/config/*.db-wal
 server/config/*.sqlite
 server/config/*.sqlite3
 
+# Phase 49: photo thumbnail proxy cache (regenerated on demand)
+server/config/photo-cache/
+
 # Local config that isn't committed
 server/config/app-settings.json
 server/config/folder-sort.json

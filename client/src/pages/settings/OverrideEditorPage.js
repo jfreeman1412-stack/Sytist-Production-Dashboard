@@ -1133,11 +1133,17 @@ function OrderSwitcher({
                 const isCurrent =
                   String(li.cartId) === String(currentCartId) &&
                   String(loadedOrderId) === String(currentOrderId);
-                // Phase 11i: fullUrl for un-watermarked thumbs.
-                const thumbUrl =
+                // Phase 11i → Phase 49: pick the un-watermarked
+                // source but route the tile <img src> through the
+                // photo-thumb proxy so we serve a ~50 KB resized
+                // JPEG instead of a 6–10 MB original.
+                const sourceUrl =
                   li.photo?.fullUrl ||
                   li.photo?.largeUrl ||
                   li.photo?.thumbUrl;
+                const thumbUrl = sourceUrl
+                  ? `/api/sytist/photo-thumb?src=${encodeURIComponent(sourceUrl)}&w=400`
+                  : null;
                 return (
                   <div
                     key={li.cartId}
@@ -1167,6 +1173,7 @@ function OrderSwitcher({
                     {thumbUrl ? (
                       <img
                         src={thumbUrl}
+                        loading="lazy"
                         alt=""
                         style={{
                           width: 110,
