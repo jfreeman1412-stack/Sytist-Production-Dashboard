@@ -236,7 +236,8 @@ For deeper detail, see:
 
 These aren't urgent but are worth knowing about:
 
-- **Why are SS orders auto-shipping** without a tracking number, seconds after creation? Cache survives now (Phase 44 hotfix 2), but the root cause is unknown. Could be an SS account workflow rule.
+- **Why are SS orders auto-shipping** without a tracking number, seconds after creation? Cache survives now (Phase 44 hotfix 2). Likely root cause identified during Phase 47 hotfix 2 diagnosis: an upstream tool ("Sportsline UI", operator Kirsten) processes most orders outside our dashboard — it creates SS orders that may auto-fulfill via an SS workflow rule. Phase 33's "adopt without push" already handles the coexistence; the auto-ship behavior is cosmetic noise from that tool's flow, not a bug in ours.
+- **The upstream tool processes most production traffic.** As of Phase 47 hotfix 2 diagnosis: 546 of 555 composite-mapped orders in the last 14 days were processed by Kirsten's tool (ms_notes signed "Kirsten" with "Order Has been changed to Printing and Production" — distinct from our "Sytist Dashboard: Order processed..." prefix). Our dashboard's value-adds (S3 composite cache, audit notes, ShipStation packaging logic) are only applied to the ~2% that flow through us. This is a workflow / coordination concern, not a code concern — worth a conversation with Kirsten about whether the dashboard should be the primary tool or stay a special-case path.
 - **Scheduler poll interval** is hardcoded at 300000ms; would be nice in Settings UI
 - **`_nextReprintNumber`** doesn't scan specialty subfolders — edge case, none observed
 - **S3 storage sweep** for old shipped orders, decoupled from the poll cycle — not needed at current scale but worth a phase eventually

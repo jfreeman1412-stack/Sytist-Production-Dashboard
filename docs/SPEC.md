@@ -1428,7 +1428,7 @@ Files: `client/src/pages/OrderDetailPage.js`, `client/src/pages/settings/Overrid
 
 ## 48+. Open follow-ups
 
-- Identify the upstream "Sportsline UI" integration creating phantom SS orders. Likely a ShipStation Selling Channel; possibly a coworker's separate tool. Phase 33's "adopt without push" handles it gracefully but root-cause is still unknown.
+- ~~Identify the upstream "Sportsline UI" integration creating phantom SS orders.~~ **Identified during Phase 47 hotfix 2 diagnosis (2026-05-14)**: a separate processing tool used by operator Kirsten. Writes to Sytist directly (`note_who: "Kirsten"` with "Order Has been changed to Printing and Production" — distinct from our `"Sytist Dashboard: Order processed..."` prefix) and creates SS orders outside our pipeline. The ms_notes comparison showed our dashboard processed ~9 of 555 composite-mapped orders in the last 14 days; the other 546 went through Kirsten's tool. Phase 33's "adopt without push" already handles the coexistence pattern — no code change required. The remaining question is operational, not technical: should the dashboard become the primary tool, or stay a special-case path? Worth a conversation with Kirsten, not more code.
 - Distinguish dashboard-written vs Sytist-written log entries in our `OrderActivityCard` (currently only the `[Dashboard]` body prefix marks ours)
 - Migrate remaining JSON configs to SQLite where it makes sense (low priority)
 - Configurable scheduler poll interval via Settings UI (currently hardcoded to 300000ms)
