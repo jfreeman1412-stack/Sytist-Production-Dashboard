@@ -1327,7 +1327,46 @@ Files: `.gitignore`, `server/config/packaging-config.json`, `server/services/pac
 
 ---
 
-## 46+. Open follow-ups
+## 46. Order-detail composite affordances on each line item
+
+Composite-layout products (Memory Mate, Photo Button, etc.) sometimes render wrong during Process — team photo didn't auto-pull, text in a slot is incorrect, wrong image in an image slot. Before Phase 46 the operator workflow was: Process → look at the printed composite → reprint with overrides. That wastes a print run. The corrective tool — the per-(orderId, cartId) override editor from Phases 10-11f — was already capable enough to fix all three cases (geometry adjustments via canvas drag/resize, drift detection, three apply modes), but operators had to navigate Settings → Order Overrides → type the order ID → Load → click a line item thumbnail to reach it. Four-plus clicks, no in-the-moment use.
+
+Phase 46 closes the discovery gap. The override editor itself is unchanged. What changed is the order detail page: every line item whose SKU has a composite mapping now shows three affordances inline.
+
+### Affordances on `LineItemRow` when `compositeMapping !== null`
+
+- **"✏ Composite" chip** in the existing flag-chip strip. Visually distinct from the solid flagChips: transparent background, full-opacity `#b888d0` border, pencil prefix. The outline-vs-fill is the "this is an action target, not a status" signal. Color matches the override editor's `SLOT_KIND_COLORS.text` / `.staticGraphic` value for visual continuity between the chip and the editor it links to.
+- **"✏ Edit layout" button**: navigates to `/overrides/${orderId}/${cartId}` via the existing `useNavigate` import. One click.
+- **"Preview" button**: lazily POSTs to `/api/sytist/composite/preview` (existing endpoint, no server change) and expands an inline block showing the rendered JPEG plus diagnostics (variant, output dimensions, team photo found/missing with reason, logo found/missing, render bytes). The "team photo ⚠ Missing" line is the most operationally useful piece — operators spot the case where the auto-lookup failed without printing first.
+
+### Loading state
+
+Composite renders are bandwidth-heavy (downloads player + team photo + logo, runs sharp compositing). The Preview button:
+- Disables on click
+- Flips label to `⟳ Rendering…`
+- Switches cursor to `wait` and reduces opacity to 0.6
+
+Per-row preview state is local to that row, so multiple previews on the same order can be open at once.
+
+### Narrow-viewport layout
+
+The inline preview uses `window.matchMedia('(max-width: 767px)')` (with addEventListener / removeListener fallback for older Safari). At ≥768px the JPEG and diagnostics sit side-by-side via flex-row; below 768px they stack column-wise and the JPEG goes full-width so it doesn't overflow the line item card.
+
+### Mappings fetch hoisting
+
+`LineItemsBlock` fetches `/api/sytist/composite/mappings` once on mount and builds a `Map<String(SKU), mapping>` that's threaded down through `LineItemList` to each `LineItemRow`. Previously the (deprecated) `CompositeBlock` re-fetched on every expand. One round-trip per order page now, regardless of how many composite-mapped items appear.
+
+Empty or failed fetch leaves an empty Map — no chips, no buttons, page still renders. Same defensive-degradation pattern as the composed-thumbnails fetch.
+
+### CompositeBlock deprecation
+
+The bottom-of-page `CompositeBlock` + `CompositeItemRow` (~290 lines, Phase 8b) are removed entirely. Two paths to the same thing was UI debt; the per-line-item affordances strictly dominate. `DetailLine` survives — the new inline preview reuses it.
+
+Files: `client/src/pages/OrderDetailPage.js`
+
+---
+
+## 47+. Open follow-ups
 
 - Identify the upstream "Sportsline UI" integration creating phantom SS orders. Likely a ShipStation Selling Channel; possibly a coworker's separate tool. Phase 33's "adopt without push" handles it gracefully but root-cause is still unknown.
 - Distinguish dashboard-written vs Sytist-written log entries in our `OrderActivityCard` (currently only the `[Dashboard]` body prefix marks ours)

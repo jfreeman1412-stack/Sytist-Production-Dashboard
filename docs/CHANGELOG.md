@@ -210,6 +210,15 @@ Format: phase number → short title → what shipped → key files touched.
 - Verification: real order 111260 (mixed `[3D, 25, 25, 25, 9]`, ship_to_home) processed cleanly — payload contained only SKU 9; synthetic `[14, 5D]` returned `__skipShipStation: true, message: "... 1 dropShipped, 1 digital"`
 - Files: `.gitignore`, `server/config/packaging-config.json`, `server/services/packagingService.js`, `server/services/shipstationService.js`, `server/routes/shipstation.js`
 
+## Phase 46 — Order-detail composite affordances on each line item
+- Composite-layout fixes (team photo missing, wrong text, wrong image in a slot) previously required Settings → Order Overrides → 4+ click navigation. The override editor was capable enough; it just wasn't reachable in-the-moment. Phase 46 surfaces it on each line item card so operators spot and fix issues BEFORE printing instead of reprinting after
+- `LineItemRow` gets three new affordances when the SKU has a composite mapping: outlined "✏ Composite" chip in the flag-chip strip (distinct from solid flag chips so it reads as an action target, not a status), "✏ Edit layout" button → `navigate('/overrides/:orderId/:cartId')`, and "Preview" button that lazy-fires `POST /api/sytist/composite/preview` (existing endpoint, no server change) and expands an inline JPEG + diagnostics (variant, output dims, team photo found/missing with reason, logo found/missing, render bytes)
+- Preview button has a proper loading state (`⟳ Rendering…`, disabled, wait cursor) since composite renders take a few seconds. Inline preview layout is side-by-side at ≥768px, stacks vertically below that via `window.matchMedia`
+- `LineItemsBlock` hoists the `/composite/mappings` fetch once per order page into a `Map<String(SKU), mapping>` threaded down to each row — one round-trip regardless of how many composite-mapped items appear. Empty/failed fetch leaves no chips/buttons; page still renders
+- Bottom-of-page `CompositeBlock` + `CompositeItemRow` removed wholesale (~290 lines). Two paths to the same thing was UI debt; per-line-item affordances strictly dominate. `DetailLine` helper preserved — new inline preview reuses it
+- Net diff: +269 / −292 in one file (`client/src/pages/OrderDetailPage.js`). No server change
+- Files: `client/src/pages/OrderDetailPage.js`
+
 ---
 
 ## Reversed / removed

@@ -228,7 +228,7 @@ For deeper detail, see:
 - **`docs/AdminManual.md`** — Settings UI walkthrough, AWS S3 setup, troubleshooting (sections 38–44 are the most recent)
 - **`docs/OperatorManual.md`** — what end users see and do
 
-## Open follow-ups (as of Phase 45)
+## Open follow-ups (as of Phase 46)
 
 These aren't urgent but are worth knowing about:
 
