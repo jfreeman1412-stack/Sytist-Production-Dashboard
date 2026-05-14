@@ -129,6 +129,22 @@ sytist-dashboard/
 - **Services own state**: cache reads/writes, database calls, external API calls all live in services.
 - **Failure modes for audit-style writes are non-blocking**: `ms_notes`, `order_status_audit`, thumbnail cache upserts. The action succeeds even if the audit write fails. The operator just doesn't see the side-effect entry.
 
+### Cross-platform notes
+
+The dashboard runs on Joey's Windows machine today and writes to a Windows `Z:` network drive for operator output. It will eventually move to a Linux server — keep the code portable enough that the move is a config edit, not a rewrite.
+
+**For server-internal paths** (SQLite DB, config files, cache dirs, anything inside `server/`): use `path.join(__dirname, ...)` with `path.join` from `require('path')` — not `path.win32` or `path.posix`. Node picks the platform's native separator automatically. Never hardcode drive letters (`C:`, `Z:`) or absolute paths in code; derive from `__dirname` or read from configurable JSON.
+
+**For operator-output paths** (where files land for the lab — `Z:\Photo Day\...` today): the path values themselves live in `server/config/path-overrides.json` and are operator-edited. The code joining base + segments should use `path.join` (uses platform-native separator) so the result is correct on whatever OS the dashboard runs on. **There is currently a portability bug here**: many call sites use `path.win32.join`, which always emits backslashes — works on Windows-to-Windows today, breaks on Linux-to-Linux. Search for `path.win32` before touching output-path logic; flag in any new code so we don't add more sites.
+
+**Shell-outs and platform-specific binaries**: zero today. No `child_process.exec`, no `cmd.exe`/`powershell` invocations, no `.bat` scripts. Keep it that way — anything platform-specific should be a configurable command in `app-settings.json`, not a hardcoded path.
+
+**OS detection**: not used anywhere today. If you ever need platform-specific behavior, prefer `process.platform === 'win32'` over `os.platform()` (they're equivalent but `process.platform` is more idiomatic in Node) and put the check at the lowest reasonable level.
+
+**Photo proxy** (`/api/sytist/photo-thumb`, Phase 49 v2) is intentionally **unauthenticated** and relies on SSRF validation only (HTTPS + exact-host allowlist via `PHOTO_PROXY_ALLOWED_HOSTS` env + `redirect:'error'` + no query string/fragment/credentials + safe extension). Safe because the dashboard server is localhost-only. **If this ever moves to a public-facing deployment, replace with signed URLs (HMAC over src/width/expiry) before deploy** — see the inline comment on the route in `routes/sytist.js` and SPEC §49 for context. The `<img>`-via-session-cookie approach was tried in v1 and consistently 401'd; don't reintroduce it without solving the cookie/CORS path.
+
+**The `Z:` references in CLAUDE.md and SPEC.md** are environment facts (what the current production setup looks like), not code facts. They stay even after a Linux migration as historical context.
+
 ### Client routing
 
 Settings pages live under `/settings/<page>` — when navigating to the override editor, gallery assets, or any other settings page from non-settings code, include the `/settings` prefix in the URL. Unknown paths fall through to a wildcard `<Route path="*" element={<Navigate to="/" replace />} />` in `AppLayout.js`, so a missing prefix silently redirects to the dashboard home instead of erroring. Cross-check against an existing working call (e.g. `OrderOverridesPage.openEditor`) when in doubt.
@@ -237,7 +253,7 @@ For deeper detail, see:
 These aren't urgent but are worth knowing about:
 
 - **Why are SS orders auto-shipping** without a tracking number, seconds after creation? Cache survives now (Phase 44 hotfix 2). Likely root cause identified during Phase 47 hotfix 2 diagnosis: an upstream tool ("Sportsline UI", operator Kirsten) processes most orders outside our dashboard — it creates SS orders that may auto-fulfill via an SS workflow rule. Phase 33's "adopt without push" already handles the coexistence; the auto-ship behavior is cosmetic noise from that tool's flow, not a bug in ours.
-- **The upstream tool processes most production traffic.** As of Phase 47 hotfix 2 diagnosis: 546 of 555 composite-mapped orders in the last 14 days were processed by Kirsten's tool (ms_notes signed "Kirsten" with "Order Has been changed to Printing and Production" — distinct from our "Sytist Dashboard: Order processed..." prefix). Our dashboard's value-adds (S3 composite cache, audit notes, ShipStation packaging logic) are only applied to the ~2% that flow through us. This is a workflow / coordination concern, not a code concern — worth a conversation with Kirsten about whether the dashboard should be the primary tool or stay a special-case path.
+- **Kirsten coexistence** — most production traffic flows through an upstream tool used by operator Kirsten, not our dashboard. As of Phase 47 hotfix 2 diagnosis (2026-05-14): **546 of 555** composite-mapped orders in the last 14 days were processed by Kirsten's tool. ms_notes signed `"Kirsten"` with body `"Order Has been changed to Printing and Production"` (vs our `"Sytist Dashboard: Order processed..."`). Our dashboard's value-adds (S3 composite cache, audit notes, ShipStation packaging logic) are only applied to the ~2% that flow through us. Phase 33's "adopt without push" already handles the SS-side coexistence; the **open question is the workflow side** — bring upstream-processed orders into our composite/audit/packaging pipeline, OR accept that we add value only for orders that come through us. Worth a real conversation with Kirsten before more code investment. Planning item, not code work.
 - **Scheduler poll interval** is hardcoded at 300000ms; would be nice in Settings UI
 - **`_nextReprintNumber`** doesn't scan specialty subfolders — edge case, none observed
 - **S3 storage sweep** for old shipped orders, decoupled from the poll cycle — not needed at current scale but worth a phase eventually

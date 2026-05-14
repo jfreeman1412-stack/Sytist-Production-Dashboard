@@ -1426,12 +1426,103 @@ Files: `client/src/pages/OrderDetailPage.js`, `client/src/pages/settings/Overrid
 
 ---
 
-## 48+. Open follow-ups
+## 49. Photo thumbnail proxy with disk cache
+
+The dashboard's line item card tiles rendered `lineItem.photo.fullUrl` as the `<img src>`. Phase 12a's reasoning — "prefer un-watermarked original over watermarked thumbnail" — held but the cost wasn't measured at the time: Sytist's S3 buckets serve originals at full resolution, 6–10 MB per photo. A 30-item order downloaded 200–300 MB to render 30 tiny tiles. Production page load reached "up to a minute" per Joey's report (DevTools-confirmed 2026-05-14).
+
+Phase 49 v2 adds a server-side resize proxy. The line item card's `<img src>` now points at `/api/sytist/photo-thumb?src=<encoded>&w=400`. The route fetches the source from S3, resizes to 400-px max edge with `sharp` (~30–60 KB), caches the result to local disk, and serves it. `<a href>` click-through still uses `fullUrl` so operators who actually want to inspect the photo at full size get the un-watermarked original.
+
+### Why "v2" and what changed from v1
+
+Phase 49 v1 (reverted at `9db1e15`) shipped with `requireAuth` on the proxy route on the assumption that same-origin `<img>` requests would carry session cookies. They didn't — CRA dev-proxy + SameSite cookie semantics broke the flow, and every `<img>` got 401. v2 drops auth entirely and hardens the SSRF validation as the only line of defense.
+
+| v1 | v2 |
+|---|---|
+| `requireAuth` applied (caused 401s on every image) | No auth; SSRF validation only |
+| Hostname check via `endsWith('.amazonaws.com')` | Hostname check via exact-match allowlist (env-configurable) |
+| Query string and fragment ignored | Query string and fragment rejected |
+| `fetch(src)` followed redirects by default | `fetch(src, { redirect: 'error' })` |
+| Also swapped OverrideEditor switcher | Switcher stays on `fullUrl` (out of scope) |
+| 60-second fetch timeout | 20-second fetch timeout |
+| Defensive comment about auth being belt-and-suspenders | Explicit comment + CLAUDE.md note documenting the no-auth-because-localhost assumption |
+
+### Source URL validation (SSRF)
+
+`photoThumbService._isValidSource` accepts only URLs that:
+- Use the `https:` protocol
+- Have a hostname exactly in `ALLOWED_HOSTS` (env-configurable via `PHOTO_PROXY_ALLOWED_HOSTS`, default `s3.dualstack.us-east-1.amazonaws.com`)
+- Have no embedded credentials (`user:pass@host`)
+- Have no query string
+- Have no fragment
+- End in `.jpg`/`.jpeg`/`.png`/`.webp` (case-insensitive)
+- Have no `..` or `//` in the pathname
+
+The fetch additionally uses `redirect: 'error'` so a 3xx response from S3 to a host outside the allowlist throws rather than silently following.
+
+### No-auth rationale
+
+The dashboard runs on Joey's local Windows machine, not exposed to the public internet. The proxy can only fetch from `*.amazonaws.com` hosts in the allowlist — anyone reachable to the server can pull resized Sytist photos, but they could also hit Sytist S3 directly, so the proxy doesn't add capability they don't already have. Auth on this specific route would protect nothing meaningful while consistently breaking `<img>`-based consumption (v1 demonstrated this).
+
+**If the dashboard ever moves to a public-facing deployment**, the right move is signed URLs (HMAC over `src + width + expiry`), not patching cookies. Captured in both the route's inline comment and CLAUDE.md → Cross-platform notes.
+
+### Disk cache
+
+`server/config/photo-cache/` relative to the service via `path.join(__dirname, '..', 'config', 'photo-cache')`. Portable. Filename is `sha1(srcUrl + '|' + width).hex + '.jpg'`. Flat directory, no subdirs. `mtime` is touched on every cache hit so popular photos stay alive while orphans age out. Gitignored.
+
+The placeholder lives at `_placeholder.jpg` in the same directory. Generated once at service init via `sharp` over an SVG label ("Photo unavailable" on a dark background). Re-used on every source-fetch failure or validation rejection.
+
+### Sweep
+
+TTL-based, 60 days by default. Runs once per ~24h piggybacked on `schedulerService._pollOnce` — the SS sync poll already runs every 5 minutes, so a `_lastPhotoCacheSweepAt` check is essentially free. Sweep enumerates the cache directory, deletes files with `mtime < cutoff`, skips the placeholder, and has a 30-second hard time cap. No size cap in v1.
+
+### Cache headers
+
+- Success: `Cache-Control: public, max-age=86400, immutable` — content is keyed by `sha1(src + width)`, effectively immutable for the lifetime of the source.
+- Placeholder: `Cache-Control: public, max-age=60` — short cache so transient Sytist outages clear quickly when the source recovers.
+- `X-Photo-Thumb-Status` header is `cache-hit`, `fresh`, or `placeholder` for forensic logging.
+
+### Fetch timeout: 20 seconds
+
+The diagnostic that motivated Phase 49 v1 observed one pathological case of 230 s to download a 7.5 MB photo. v1 set timeout to 60 s to "accommodate the bad case." v2 cuts to 20 s based on operational reasoning: if a fetch takes >20 s the operator has already given up scrolling that order anyway, and a 60-s wait holds an Express worker uselessly. 20 s captures realistic slow paths (5–15 s S3 spikes) without the worst-case hold.
+
+If the 230 s scenario recurs, the operator sees the placeholder, the placeholder's 60 s `max-age` expires within a minute, refresh retries, and the cache typically populates on the second attempt.
+
+### Node fetch quirk worked around
+
+v1 initial implementation used `AbortController` with `signal: controller.signal` passed to `fetch`. On Node 22.13.1, this causes `resp.arrayBuffer()` to hang indefinitely after headers arrive — verified empirically. v2 (and the final v1 before revert) uses `Promise.race` with a separate timeout promise instead. The orphaned fetch on timeout gets GC'd; acceptable for a 20 s ceiling.
+
+### Scope of client edits
+
+**One `<img src>` site changed** — `LineItemRow` tile in `OrderDetailPage.js`. The `OverrideEditor` switcher (v1 also swapped) is intentionally **out of scope** in v2: operators visit it rarely, slow load is acceptable there, and a swap would have to thread the composed-thumbnails cache map down into the switcher to be safe — more code surface for a rarely-hit path.
+
+`LayoutCanvas` main editor view, `<a href>` click-throughs, and Phase 37 download links keep `fullUrl` for the same reasons as v1: editor needs hi-res for WYSIWYG, operator-initiated full-quality views, operator-expected slow.
+
+### Why this matters more than initially framed
+
+The Phase 47 hotfix 2 diagnosis surfaced that 546 of 555 recently-processed composite-mapped orders went through Kirsten's upstream tool, not our dashboard. Those orders have no S3 composite cache entry, so their LineItemRow tiles fall through to the player photo fallback — exactly the path Phase 49 v2 speeds up. The fallback was framed in v1 as "rare edge case"; v2 ships knowing it's the common path.
+
+### Verification
+
+1. Open an order with mostly non-composite items (or one Kirsten processed). Confirm tile thumbnails load in <500 ms warm, within ~15 s cold.
+2. Network tab: tile `<img>` requests hit `/api/sytist/photo-thumb` returning 200 with `X-Photo-Thumb-Status` header.
+3. `dir server\config\photo-cache\` shows growing `<sha1>.jpg` files (30-60 KB each) as orders are viewed.
+4. **Verify `.gitignore` works**: after the cache populates with a few files, run `git status` — `server/config/photo-cache/` should NOT appear as untracked or modified.
+5. Click a tile → opens un-watermarked original at full size in new tab.
+6. Force a bad URL (DevTools tamper to a non-allowlist host) → placeholder appears, layout stable, `X-Photo-Thumb-Status: placeholder`.
+7. After 24h+ uptime: `[PhotoCache] swept N files, freed M MB` line in scheduler log.
+
+Files: `.gitignore`, `server/services/photoThumbService.js` (new), `server/routes/sytist.js`, `server/services/schedulerService.js`, `client/src/pages/OrderDetailPage.js`
+
+---
+
+## 50+. Open follow-ups
 
 - ~~Identify the upstream "Sportsline UI" integration creating phantom SS orders.~~ **Identified during Phase 47 hotfix 2 diagnosis (2026-05-14)**: a separate processing tool used by operator Kirsten. Writes to Sytist directly (`note_who: "Kirsten"` with "Order Has been changed to Printing and Production" — distinct from our `"Sytist Dashboard: Order processed..."` prefix) and creates SS orders outside our pipeline. The ms_notes comparison showed our dashboard processed ~9 of 555 composite-mapped orders in the last 14 days; the other 546 went through Kirsten's tool. Phase 33's "adopt without push" already handles the coexistence pattern — no code change required. The remaining question is operational, not technical: should the dashboard become the primary tool, or stay a special-case path? Worth a conversation with Kirsten, not more code.
 - Distinguish dashboard-written vs Sytist-written log entries in our `OrderActivityCard` (currently only the `[Dashboard]` body prefix marks ours)
 - Migrate remaining JSON configs to SQLite where it makes sense (low priority)
 - Configurable scheduler poll interval via Settings UI (currently hardcoded to 300000ms)
+- **Kirsten coexistence** — bring upstream-processed orders into the dashboard's composite/audit/packaging pipeline, OR accept that the dashboard only adds value for the orders that come through it. Identified during Phase 47 hotfix 2 (2026-05-14): 546 of 555 composite-mapped orders in the last 14 days are processed by Kirsten's tool, not our dashboard. Phase 33's "adopt without push" already handles the SS-side coexistence; the open question is whether to integrate Kirsten's workflow into ours (so all orders get our composite cache + S3 thumbnails + audit notes), or accept that our dashboard is a special-case path for orders Joey personally handles. Worth a real conversation with Kirsten before more code investment. This is a planning item, not code work.
+- **Phase 49 v2 → public-facing deployment**: if this dashboard ever moves off localhost, the `/photo-thumb` proxy must switch from "no auth, SSRF-only" to signed URLs (HMAC over `src + width + expiry`) before deploy. See SPEC §49 for the rationale and the inline comment in `routes/sytist.js`.
 - **Auto-ship investigation**: orders sometimes show as `shipped` in SS within seconds of creation, with no tracking number. Cause unknown; not blocking after Phase 44 hotfix 2 (cache survives) but worth understanding.
 - **On-demand composite preview** before processing — currently the dashboard order detail page only shows composite thumbnails for orders that have already been processed. Adding a "preview what this will look like" requires calling the composite engine from a UI endpoint.
 - **S3 storage sweep** for orders shipped > N days. Decoupled from the poll cycle so the visibility race doesn't recur.
