@@ -25,7 +25,6 @@ server/config/*.sqlite3
 server/config/app-settings.json
 server/config/folder-sort.json
 server/config/imposition-layouts.json
-server/config/packaging-config.json
 server/config/path-overrides.json
 server/config/size-mappings.json
 server/config/specialty-products.json
