@@ -155,10 +155,13 @@ router.get('/photo-thumb', async (req, res) => {
     const photoThumbService = require('../services/photoThumbService');
     const src = req.query.src;
     const width = req.query.w;
-    const { buffer, fromCache, isPlaceholder } =
+    const { buffer, format, fromCache, isPlaceholder } =
       await photoThumbService.getOrCreate(src, width);
 
-    res.set('Content-Type', 'image/jpeg');
+    // Phase 49 v2.1: Content-Type follows the format the service
+    // chose. PNG sources get WebP output (alpha preserved); others
+    // get JPEG. Placeholder is always JPEG.
+    res.set('Content-Type', format === 'webp' ? 'image/webp' : 'image/jpeg');
     res.set(
       'X-Photo-Thumb-Status',
       isPlaceholder ? 'placeholder' : fromCache ? 'cache-hit' : 'fresh'

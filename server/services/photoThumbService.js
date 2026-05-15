@@ -109,26 +109,30 @@ class PhotoThumbService {
     return this._initPromise;
   }
 
-  // Returns { buffer, fromCache, isPlaceholder } — the JPEG bytes
-  // plus diagnostic flags. Never throws on source failure; returns
-  // the placeholder buffer with isPlaceholder=true instead.
+  // Returns { buffer, format, fromCache, isPlaceholder }.
+  //   - format: 'jpeg' or 'webp' — caller uses this to set
+  //     Content-Type. WebP is produced for PNG sources (which may
+  //     have transparency, like Sytist's green-screen keyed-out
+  //     subjects); JPEG for everything else (smaller for opaque).
+  //   - Never throws on source failure; returns the placeholder
+  //     buffer (always JPEG) with isPlaceholder=true instead.
   async getOrCreate(src, width) {
     await this.init();
     const w = this._normalizeWidth(width);
 
     if (!this._isValidSource(src)) {
       console.warn(`[PhotoThumb] Rejected source URL: ${src}`);
-      return { buffer: this._placeholderBuffer, fromCache: false, isPlaceholder: true };
+      return { buffer: this._placeholderBuffer, format: 'jpeg', fromCache: false, isPlaceholder: true };
     }
 
-    const cachePath = this._cachePath(src, w);
+    const { path: cachePath, format } = this._cachePath(src, w);
     // Cache hit?
     try {
       const buf = await fsp.readFile(cachePath);
       // Touch mtime so the sweep TTL doesn't evict hot entries.
       const now = new Date();
       fsp.utimes(cachePath, now, now).catch(() => {});
-      return { buffer: buf, fromCache: true, isPlaceholder: false };
+      return { buffer: buf, format, fromCache: true, isPlaceholder: false };
     } catch (e) {
       if (e.code !== 'ENOENT') {
         console.warn(`[PhotoThumb] Cache read error (non-fatal): ${e.message}`);
@@ -141,23 +145,31 @@ class PhotoThumbService {
       sourceBuffer = await this._fetchSource(src);
     } catch (e) {
       console.warn(`[PhotoThumb] Source fetch failed for ${src}: ${e.message}`);
-      return { buffer: this._placeholderBuffer, fromCache: false, isPlaceholder: true };
+      return { buffer: this._placeholderBuffer, format: 'jpeg', fromCache: false, isPlaceholder: true };
     }
 
     let resized;
     try {
-      resized = await sharp(sourceBuffer)
-        .resize({
-          width: w,
-          height: w,
-          fit: 'inside',
-          withoutEnlargement: true,
-        })
-        .jpeg({ quality: 80 })
-        .toBuffer();
+      // Phase 49 v2.1: conditional output format. PNG sources may
+      // be transparent (Sytist's green-screen keyed-out subjects).
+      // JPEG output flattens transparency against black, which
+      // broke green-screen tile display in v2 — the player photo
+      // covered the background `<img>` with a black rectangle.
+      // WebP preserves alpha and is significantly smaller than PNG.
+      const pipeline = sharp(sourceBuffer).resize({
+        width: w,
+        height: w,
+        fit: 'inside',
+        withoutEnlargement: true,
+      });
+      resized = await (
+        format === 'webp'
+          ? pipeline.webp({ quality: 80 })
+          : pipeline.jpeg({ quality: 80 })
+      ).toBuffer();
     } catch (e) {
       console.warn(`[PhotoThumb] Resize failed for ${src}: ${e.message}`);
-      return { buffer: this._placeholderBuffer, fromCache: false, isPlaceholder: true };
+      return { buffer: this._placeholderBuffer, format: 'jpeg', fromCache: false, isPlaceholder: true };
     }
 
     // Write atomically: tmp + rename.
@@ -170,7 +182,7 @@ class PhotoThumbService {
       fsp.unlink(tmpPath).catch(() => {});
     }
 
-    return { buffer: resized, fromCache: false, isPlaceholder: false };
+    return { buffer: resized, format, fromCache: false, isPlaceholder: false };
   }
 
   // Sweep: delete cache files with mtime older than maxAgeDays.
@@ -196,7 +208,9 @@ class PhotoThumbService {
     let abortedByTimeout = false;
     for (const name of entries) {
       if (name === PLACEHOLDER_FILENAME) continue;
-      if (!name.endsWith('.jpg')) continue;
+      // Phase 49 v2.1: handle both .jpg (opaque sources) and .webp
+      // (transparent PNG sources, alpha-preserved).
+      if (!name.endsWith('.jpg') && !name.endsWith('.webp')) continue;
       if (Date.now() - start > maxDurationMs) {
         abortedByTimeout = true;
         break;
@@ -268,12 +282,41 @@ class PhotoThumbService {
     return true;
   }
 
+  // Phase 49 v2.1: pick output format based on source URL extension.
+  // PNG sources MAY have transparency (Sytist green-screen subjects
+  // are keyed-out transparent PNGs). Output WebP for those to
+  // preserve alpha — JPEG flattening against black is what broke v2.
+  // Everything else (JPEG, WebP source) is treated as opaque and
+  // gets JPEG output for size.
+  //
+  // Determining format from URL extension (not from sharp.metadata)
+  // keeps the cache lookup a single readFile against a deterministic
+  // path. Probing alpha would require fetching the source before
+  // deciding the cache filename — defeats the cache.
+  _inferOutputFormat(src) {
+    try {
+      const u = new URL(src);
+      const ext = path.extname(u.pathname).toLowerCase();
+      return ext === '.png' ? 'webp' : 'jpeg';
+    } catch {
+      return 'jpeg';
+    }
+  }
+
   _cachePath(src, width) {
+    const format = this._inferOutputFormat(src);
+    // Hash key doesn't include format because format is derived
+    // deterministically from src (same URL → same extension → same
+    // format). The filename extension serves as the format hint
+    // for sweep + the response Content-Type.
     const key = crypto
       .createHash('sha1')
       .update(`${src}|${width}`)
       .digest('hex');
-    return path.join(CACHE_DIR, `${key}.jpg`);
+    return {
+      path: path.join(CACHE_DIR, `${key}.${format === 'webp' ? 'webp' : 'jpg'}`),
+      format,
+    };
   }
 
   async _fetchSource(src) {
