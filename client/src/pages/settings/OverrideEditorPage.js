@@ -13,6 +13,7 @@ import {
 import LayoutCanvas, {
   PLACEHOLDER_TOKENS,
   DEFAULT_SNAP_STEP,
+  substituteTokens,
 } from '../../components/LayoutCanvas';
 
 /**
@@ -588,14 +589,14 @@ export default function OverrideEditorPage() {
       ? slots[selectedIndex]
       : null;
 
-  // Sample tokens for the canvas — built from the actual order data
-  // so text slots show real names, etc. The server preview uses its
-  // own real-data tokens, but the canvas needs them too for slot
-  // outlines that reference subject names.
+  // Real-data tokens for the canvas + text-content editor (Phase 48).
+  // Mirrors server compositeService.buildTokensFromOrder so what the
+  // operator sees in the preview matches what production will render.
+  // PLACEHOLDER_TOKENS is the fallback for any keys an empty order
+  // doesn't fill in.
   const sampleTokens = {
     ...PLACEHOLDER_TOKENS,
-    'subject.athleteName': lineItem.productName || 'Customer Name',
-    'order.number': String(order.orderNumber || order.orderId || ''),
+    ...buildTokensFromOrder(order, lineItem),
   };
 
   return (
@@ -788,6 +789,7 @@ export default function OverrideEditorPage() {
           <Section title="Layers">
             <LayersList
               slots={slots}
+              baseSlots={baseLayout?.variants?.[variant]?.slots || null}
               selectedIndex={selectedIndex}
               onSelect={setSelectedIndex}
               lockedSlots={lockedSlots}
@@ -819,6 +821,10 @@ export default function OverrideEditorPage() {
               ) : (
                 <QuickEditPanel
                   slot={selectedSlot}
+                  baseSlot={
+                    baseLayout?.variants?.[variant]?.slots?.[selectedIndex] || null
+                  }
+                  tokens={sampleTokens}
                   sheetWidth={layout.sheetWidth}
                   sheetHeight={layout.sheetHeight}
                   onChange={(newSlot) =>
@@ -1256,6 +1262,7 @@ function OrderSwitcher({
 
 function LayersList({
   slots,
+  baseSlots,
   selectedIndex,
   onSelect,
   lockedSlots = {},
@@ -1344,21 +1351,44 @@ function LayersList({
               >
                 {SLOT_KIND_LABELS[slot.kind] || slot.kind}
               </div>
-              {slot.kind === 'text' && slot.text && (
-                <div
-                  style={{
-                    fontSize: 10,
-                    color: 'var(--text-muted)',
-                    fontFamily: 'var(--font-mono, monospace)',
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    whiteSpace: 'nowrap',
-                  }}
-                  title={slot.text}
-                >
-                  "{slot.text}"
-                </div>
-              )}
+              {slot.kind === 'text' && slot.text && (() => {
+                // Phase 48: a slot's text is "custom" when it differs
+                // from the base layout's value at the same index. The
+                // operator has typed a literal that no longer follows
+                // Sytist subject/customer data. Indicate inline so the
+                // disconnect is visible at a glance from the layers
+                // list — otherwise the override-vs-token state is
+                // invisible until you click the slot.
+                const baseSlot = baseSlots ? baseSlots[jsonIndex] : null;
+                const isCustomText =
+                  baseSlot && baseSlot.kind === 'text' &&
+                  slot.text !== baseSlot.text;
+                return (
+                  <div
+                    style={{
+                      fontSize: 10,
+                      color: 'var(--text-muted)',
+                      fontFamily: 'var(--font-mono, monospace)',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                      fontStyle: isCustomText ? 'italic' : 'normal',
+                    }}
+                    title={
+                      isCustomText
+                        ? `Custom text — base layout had: "${baseSlot.text}"`
+                        : slot.text
+                    }
+                  >
+                    "{slot.text}"
+                    {isCustomText && (
+                      <span style={{ color: '#d09030', marginLeft: 4 }}>
+                        ·custom
+                      </span>
+                    )}
+                  </div>
+                );
+              })()}
             </span>
             {/* Phase 11c: lock toggle. Locked layers can't be
                 accidentally selected or dragged from the canvas;
@@ -1426,8 +1456,30 @@ const SLOT_KIND_LABELS = {
 // Trimmed-down property editor. Just enough to nudge what's wrong.
 // Position + size for everything; fontSize for text.
 
-function QuickEditPanel({ slot, sheetWidth, sheetHeight, onChange }) {
+function QuickEditPanel({
+  slot,
+  baseSlot,
+  tokens,
+  sheetWidth,
+  sheetHeight,
+  onChange,
+}) {
   const isText = slot.kind === 'text';
+  // Phase 48: resolved value = what the slot will render to with the
+  // current text + the order's real Sytist data. If slot.text is a
+  // token template ("{subject.athleteName}"), this is the substituted
+  // name ("John Smith"). If slot.text is a literal, it's the literal.
+  // The textarea defaults to this so the operator sees what the
+  // composite will actually show, not the template syntax.
+  const resolvedText = isText
+    ? substituteTokens(slot.text || '', tokens || {})
+    : '';
+  // "Custom" = the operator has typed over the base layout's template.
+  // Same detection as LayersList. When the base text contained a
+  // {token}, this means the slot no longer follows Sytist data.
+  const isCustomText =
+    isText && baseSlot && baseSlot.kind === 'text' &&
+    slot.text !== baseSlot.text;
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
       <div
@@ -1488,18 +1540,90 @@ function QuickEditPanel({ slot, sheetWidth, sheetHeight, onChange }) {
         </FormRow>
       </div>
 
-      {/* Text-only: fontSize. Other text properties (font, color,
-          weight, align) are layout decisions, not override material. */}
+      {/* Text-only: content editor + font size. Other text properties
+          (font, color, weight, align) are layout decisions, not
+          override material. Phase 48: content input added so the
+          operator can correct a misspelled name or override one slot's
+          text without touching the underlying layout. The textarea is
+          populated with the resolved value (slot.text run through
+          token substitution against the order's Sytist data), so what
+          the operator types over is what the composite will render.
+          If the operator leaves the value untouched, slot.text stays
+          as-is (token templates keep working). If they type anything,
+          slot.text becomes that literal — the badge below flags the
+          disconnect. Tokens still pass through if the operator types
+          one explicitly (e.g. "{subject.athleteName}") because the
+          server's render-time substituteTokens runs unchanged. */}
       {isText && (
-        <FormRow label="Font size (px)" hint="">
-          <NumberInput
-            value={slot.fontSize || 24}
-            onChange={(v) => onChange({ ...slot, fontSize: clamp(v, 6, 200) })}
-            step={1}
-            min={6}
-            max={200}
-          />
-        </FormRow>
+        <>
+          <FormRow label="Text content" hint="">
+            {/* Display rule: when slot.text contains a {token},
+                show the resolved value so the operator sees what
+                will render. Otherwise show slot.text directly (it's
+                already literal — either from a literal layout or
+                from a previous operator edit). This is independent
+                of isCustomText (which requires baseSlot to detect)
+                so the editor still behaves sensibly if the base
+                layout is missing. */}
+            <textarea
+              value={
+                (slot.text || '').indexOf('{') !== -1
+                  ? resolvedText
+                  : slot.text || ''
+              }
+              onChange={(e) => onChange({ ...slot, text: e.target.value })}
+              rows={2}
+              style={{
+                width: '100%',
+                padding: '6px 8px',
+                fontSize: 12,
+                fontFamily: 'inherit',
+                background: 'var(--bg-input)',
+                color: 'var(--text-primary)',
+                border: '1px solid var(--border-color)',
+                borderRadius: 4,
+                resize: 'vertical',
+              }}
+            />
+          </FormRow>
+          {isCustomText ? (
+            <div
+              style={{
+                fontSize: 11,
+                color: '#d09030',
+                fontStyle: 'italic',
+                marginTop: -4,
+              }}
+              title={`Base layout had: "${baseSlot.text}"`}
+            >
+              Custom text (overrides token) — won't follow Sytist data
+            </div>
+          ) : (
+            slot.text &&
+            slot.text.indexOf('{') !== -1 && (
+              <div
+                style={{
+                  fontSize: 11,
+                  color: 'var(--text-muted)',
+                  fontFamily: 'var(--font-mono, monospace)',
+                  marginTop: -4,
+                }}
+                title="This slot's text follows a token template; editing it makes it literal for this order."
+              >
+                Pulls from: {slot.text}
+              </div>
+            )
+          )}
+          <FormRow label="Font size (px)" hint="">
+            <NumberInput
+              value={slot.fontSize || 24}
+              onChange={(v) => onChange({ ...slot, fontSize: clamp(v, 6, 200) })}
+              step={1}
+              min={6}
+              max={200}
+            />
+          </FormRow>
+        </>
       )}
     </div>
   );
@@ -1508,6 +1632,51 @@ function QuickEditPanel({ slot, sheetWidth, sheetHeight, onChange }) {
 function clamp(n, lo, hi) {
   if (typeof n !== 'number' || isNaN(n)) return lo;
   return Math.max(lo, Math.min(hi, n));
+}
+
+// Phase 48: client-side mirror of server compositeService.buildTokensFromOrder.
+// Kept in sync so the editor's preview + text-content input resolve to the same
+// values production will render. The shape — customer / subject / galleryName /
+// order / year / date — must match the server; the subject key camelCasing must
+// match too, since templates like {subject.athleteName} bind to the camelCased
+// label from ms_subjects.
+function buildTokensFromOrder(order, lineItem) {
+  const subject = {};
+  if (order && order.subject && Array.isArray(order.subject.fields)) {
+    for (const f of order.subject.fields) {
+      const key = camelCaseKey(f.label || '');
+      if (key) subject[key] = f.value || '';
+    }
+  }
+  return {
+    customer: { ...((order && order.customer) || {}) },
+    subject,
+    galleryName: (order && order.galleryName) || '',
+    subGalleryName:
+      (order && order.subGalleryName) ||
+      (lineItem && lineItem.subGalleryName) ||
+      '',
+    order: {
+      id: (order && order.orderId) || '',
+      date: ((order && order.orderDate) || '').split(' ')[0] || '',
+    },
+    year: new Date().getFullYear(),
+    date: new Date().toISOString().split('T')[0],
+  };
+}
+
+function camelCaseKey(label) {
+  if (!label) return '';
+  return String(label)
+    .replace(/[^a-zA-Z0-9 ]/g, '')
+    .trim()
+    .split(/\s+/)
+    .map((w, i) =>
+      i === 0
+        ? w.toLowerCase()
+        : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()
+    )
+    .join('');
 }
 
 // ─── Button styles ─────────────────────────────────────────

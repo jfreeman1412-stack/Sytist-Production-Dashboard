@@ -943,7 +943,7 @@ function clamp(value, lo, hi) {
   return Math.min(Math.max(value, lo), hi);
 }
 
-function substituteTokens(template, ctx) {
+export function substituteTokens(template, ctx) {
   if (!template) return '';
   return template.replace(/\{([^}]+)\}/g, (_, key) => {
     const parts = key.split('.');
