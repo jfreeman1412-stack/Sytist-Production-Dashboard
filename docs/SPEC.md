@@ -1544,6 +1544,47 @@ The `_placeholder.jpg` regenerates automatically on next service init.
 
 Files: `server/services/photoThumbService.js`, `server/routes/sytist.js`
 
+### Phase 49 v2.2 — metadata-based format detection (v2.1 was still wrong)
+
+**Bug**: v2.1's URL-extension inference (`.png` → WebP, else JPEG) turned out to be unreliable for Sytist's actual photo URLs. Operators reported black-background regression still occurring for transparent green-screen subject photos — the source URLs don't consistently end in `.png`, so the inference defaulted to JPEG and the alpha got flattened again. v2.1 fixed only the subset of cases where Sytist happened to use `.png` extension.
+
+**Fix**: switch to ground-truth detection. After fetching the source buffer, probe alpha via `sharp.metadata().hasAlpha` and choose output format from that. URL extension is no longer consulted — it's a guess; alpha-channel detection is the actual signal.
+
+**Cache key design**: format is now determined AFTER fetch, not before. This means cache lookup can't predict which extension to read. Solution: store the hash key without an extension and try **both** `<key>.webp` and `<key>.jpg` on lookup. Same URL always produces the same hash → at most one of the two files exists in steady state. The lookup cost is two failed `readFile`s on miss (both ENOENT, fast) vs one on hit. Negligible.
+
+```js
+const key = sha1(src + '|' + width).hex;
+const webpPath = ${key}.webp;
+const jpegPath = ${key}.jpg;
+// try webp → try jpeg → miss → fetch + metadata + write
+```
+
+**On cache miss**:
+
+1. Fetch source.
+2. `sharp(buffer).metadata()` — reads header bytes only, cheap.
+3. `format = meta.hasAlpha ? 'webp' : 'jpeg'`.
+4. Resize + encode in chosen format.
+5. Write to `${key}.${format === 'webp' ? 'webp' : 'jpg'}`.
+
+**X-Photo-Thumb-Status header** now includes the format suffix for diagnostic clarity. Values: `placeholder:jpeg`, `cache-hit:webp`, `cache-hit:jpeg`, `fresh:webp`, `fresh:jpeg`. When this regresses for a third time (it won't, but if it does), the format part of the header tells future-you instantly what the proxy decided.
+
+**Code cleanup**: `_inferOutputFormat` removed (dead code). `_cachePath` renamed to `_cacheKey` — returns just the hash string, not a `{path, format}` object. The route's `Content-Type` still follows the service-returned `format` field.
+
+**Sweep**: unchanged — already handles both extensions and the TTL check is format-agnostic.
+
+**Verified**: opaque JPEG and transparent PNG roundtripping was verified against synthetic inputs in v2.1's pre-commit checks. v2.2 changes the detection mechanism, not the encoding pipeline, so the alpha-preservation guarantee carries forward.
+
+**Deploy step required**: clear both `.jpg` and `.webp` cache entries. Existing files include the broken black-background `.jpg` files that v2.1 wrote for transparent sources at unrecognized URL extensions. Letting everything regenerate cleanly:
+
+```cmd
+del /Q server\config\photo-cache\*.jpg server\config\photo-cache\*.webp
+```
+
+Placeholder regenerates on next service init.
+
+Files: `server/services/photoThumbService.js`, `server/routes/sytist.js`
+
 ---
 
 ## 50+. Open follow-ups

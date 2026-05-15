@@ -158,14 +158,21 @@ router.get('/photo-thumb', async (req, res) => {
     const { buffer, format, fromCache, isPlaceholder } =
       await photoThumbService.getOrCreate(src, width);
 
-    // Phase 49 v2.1: Content-Type follows the format the service
-    // chose. PNG sources get WebP output (alpha preserved); others
-    // get JPEG. Placeholder is always JPEG.
+    // Phase 49 v2.2: Content-Type follows the format the service
+    // chose. Transparent sources get WebP output (alpha preserved);
+    // opaque sources get JPEG (smaller). Placeholder is always JPEG.
     res.set('Content-Type', format === 'webp' ? 'image/webp' : 'image/jpeg');
-    res.set(
-      'X-Photo-Thumb-Status',
-      isPlaceholder ? 'placeholder' : fromCache ? 'cache-hit' : 'fresh'
-    );
+    // Status header includes format suffix for debugging — when
+    // this regresses (again), the format part of the header tells
+    // us at a glance whether the proxy chose WebP or JPEG for a
+    // given source. Values: placeholder:jpeg, cache-hit:webp,
+    // cache-hit:jpeg, fresh:webp, fresh:jpeg.
+    const statusBase = isPlaceholder
+      ? 'placeholder'
+      : fromCache
+        ? 'cache-hit'
+        : 'fresh';
+    res.set('X-Photo-Thumb-Status', `${statusBase}:${format}`);
     if (isPlaceholder) {
       // Short cache so transient Sytist outages clear quickly
       // when the source recovers.

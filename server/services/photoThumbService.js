@@ -111,11 +111,15 @@ class PhotoThumbService {
 
   // Returns { buffer, format, fromCache, isPlaceholder }.
   //   - format: 'jpeg' or 'webp' — caller uses this to set
-  //     Content-Type. WebP is produced for PNG sources (which may
-  //     have transparency, like Sytist's green-screen keyed-out
-  //     subjects); JPEG for everything else (smaller for opaque).
+  //     Content-Type. WebP for transparent sources (alpha preserved),
+  //     JPEG for opaque (smaller).
   //   - Never throws on source failure; returns the placeholder
   //     buffer (always JPEG) with isPlaceholder=true instead.
+  //
+  // Phase 49 v2.2: format is decided AFTER fetch by probing
+  // sharp.metadata().hasAlpha — ground truth, not a URL-extension
+  // guess. Cache lookup tries `<key>.webp` then `<key>.jpg`;
+  // whichever exists wins.
   async getOrCreate(src, width) {
     await this.init();
     const w = this._normalizeWidth(width);
@@ -125,21 +129,31 @@ class PhotoThumbService {
       return { buffer: this._placeholderBuffer, format: 'jpeg', fromCache: false, isPlaceholder: true };
     }
 
-    const { path: cachePath, format } = this._cachePath(src, w);
-    // Cache hit?
-    try {
-      const buf = await fsp.readFile(cachePath);
-      // Touch mtime so the sweep TTL doesn't evict hot entries.
-      const now = new Date();
-      fsp.utimes(cachePath, now, now).catch(() => {});
-      return { buffer: buf, format, fromCache: true, isPlaceholder: false };
-    } catch (e) {
-      if (e.code !== 'ENOENT') {
-        console.warn(`[PhotoThumb] Cache read error (non-fatal): ${e.message}`);
+    const key = this._cacheKey(src, w);
+    const webpPath = path.join(CACHE_DIR, `${key}.webp`);
+    const jpegPath = path.join(CACHE_DIR, `${key}.jpg`);
+
+    // Cache lookup: try webp first, then jpeg. Two readFile attempts
+    // is fine — ENOENT is fast. Same URL always produces same hash,
+    // so at most one of the two files exists in steady state.
+    for (const [tryPath, tryFormat] of [
+      [webpPath, 'webp'],
+      [jpegPath, 'jpeg'],
+    ]) {
+      try {
+        const buf = await fsp.readFile(tryPath);
+        // Touch mtime so the sweep TTL doesn't evict hot entries.
+        const now = new Date();
+        fsp.utimes(tryPath, now, now).catch(() => {});
+        return { buffer: buf, format: tryFormat, fromCache: true, isPlaceholder: false };
+      } catch (e) {
+        if (e.code !== 'ENOENT') {
+          console.warn(`[PhotoThumb] Cache read error (non-fatal): ${e.message}`);
+        }
       }
     }
 
-    // Cache miss — fetch + resize + write.
+    // Cache miss — fetch the source.
     let sourceBuffer;
     try {
       sourceBuffer = await this._fetchSource(src);
@@ -148,14 +162,22 @@ class PhotoThumbService {
       return { buffer: this._placeholderBuffer, format: 'jpeg', fromCache: false, isPlaceholder: true };
     }
 
+    // Phase 49 v2.2: probe alpha via sharp.metadata() — reads only
+    // the header bytes, cheap. hasAlpha is the ground truth.
+    // URL-extension inference (v2.1) was unreliable for Sytist's
+    // photo URLs and let the regression back in.
+    let format = 'jpeg';
+    try {
+      const meta = await sharp(sourceBuffer).metadata();
+      if (meta.hasAlpha) format = 'webp';
+    } catch (e) {
+      // Metadata probe failed — the resize step below will also
+      // fail and serve placeholder. Fall through with jpeg default.
+      console.warn(`[PhotoThumb] Metadata probe failed for ${src}: ${e.message}`);
+    }
+
     let resized;
     try {
-      // Phase 49 v2.1: conditional output format. PNG sources may
-      // be transparent (Sytist's green-screen keyed-out subjects).
-      // JPEG output flattens transparency against black, which
-      // broke green-screen tile display in v2 — the player photo
-      // covered the background `<img>` with a black rectangle.
-      // WebP preserves alpha and is significantly smaller than PNG.
       const pipeline = sharp(sourceBuffer).resize({
         width: w,
         height: w,
@@ -172,11 +194,12 @@ class PhotoThumbService {
       return { buffer: this._placeholderBuffer, format: 'jpeg', fromCache: false, isPlaceholder: true };
     }
 
-    // Write atomically: tmp + rename.
-    const tmpPath = cachePath + '.tmp';
+    // Write to the format-specific path. Atomic: tmp + rename.
+    const writePath = format === 'webp' ? webpPath : jpegPath;
+    const tmpPath = writePath + '.tmp';
     try {
       await fsp.writeFile(tmpPath, resized);
-      await fsp.rename(tmpPath, cachePath);
+      await fsp.rename(tmpPath, writePath);
     } catch (e) {
       console.warn(`[PhotoThumb] Cache write failed (non-fatal): ${e.message}`);
       fsp.unlink(tmpPath).catch(() => {});
@@ -282,41 +305,21 @@ class PhotoThumbService {
     return true;
   }
 
-  // Phase 49 v2.1: pick output format based on source URL extension.
-  // PNG sources MAY have transparency (Sytist green-screen subjects
-  // are keyed-out transparent PNGs). Output WebP for those to
-  // preserve alpha — JPEG flattening against black is what broke v2.
-  // Everything else (JPEG, WebP source) is treated as opaque and
-  // gets JPEG output for size.
+  // Phase 49 v2.2: return just the hash key (no extension). Format
+  // is determined at write time from the source's actual alpha
+  // channel, not from URL inference. Cache lookup tries both
+  // <key>.webp and <key>.jpg variants.
   //
-  // Determining format from URL extension (not from sharp.metadata)
-  // keeps the cache lookup a single readFile against a deterministic
-  // path. Probing alpha would require fetching the source before
-  // deciding the cache filename — defeats the cache.
-  _inferOutputFormat(src) {
-    try {
-      const u = new URL(src);
-      const ext = path.extname(u.pathname).toLowerCase();
-      return ext === '.png' ? 'webp' : 'jpeg';
-    } catch {
-      return 'jpeg';
-    }
-  }
-
-  _cachePath(src, width) {
-    const format = this._inferOutputFormat(src);
-    // Hash key doesn't include format because format is derived
-    // deterministically from src (same URL → same extension → same
-    // format). The filename extension serves as the format hint
-    // for sweep + the response Content-Type.
-    const key = crypto
+  // The URL-extension-based inference in v2.1 turned out to be
+  // unreliable: Sytist serves transparent green-screen subject
+  // photos at URLs that don't end in .png, so the inference
+  // defaulted to JPEG and killed the alpha. v2.2 switches to
+  // sharp.metadata().hasAlpha as the ground truth.
+  _cacheKey(src, width) {
+    return crypto
       .createHash('sha1')
       .update(`${src}|${width}`)
       .digest('hex');
-    return {
-      path: path.join(CACHE_DIR, `${key}.${format === 'webp' ? 'webp' : 'jpg'}`),
-      format,
-    };
   }
 
   async _fetchSource(src) {
