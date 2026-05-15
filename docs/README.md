@@ -295,7 +295,7 @@ See `CHANGELOG.md` for what each phase delivered and `SPEC.md` for the full desi
 
 **Photos won't download from the line item links** — the Sytist URL needs to be reachable from your browser. The download link uses the same `fullUrl` the dashboard uses for processing; if it works in Process, it works here.
 
-**Phantom SS orders appearing without dashboard involvement** — an external integration (a coworker's tool, a connected ShipStation store, a script) is creating SS orders. The dashboard's Phase 33 "adopt without push" behavior handles this gracefully, but to fix the root cause, identify the integration in ShipStation Settings → Selling Channels.
+**Phantom SS orders appearing without dashboard involvement** — Kirsten's processing tool creates these (identified Phase 47 hotfix 2, 2026-05-14: it processes ~98% of recent composite-mapped orders outside our dashboard, writing to Sytist directly and creating SS orders via a non-Selling-Channel path). The dashboard's Phase 33 "adopt without push" handles the SS-side coexistence; the remaining question is workflow-side (whether to fold Kirsten's orders into our composite/audit pipeline or accept the dual-path setup), which is a planning conversation rather than code work.
 
 ---
 

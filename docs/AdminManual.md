@@ -922,17 +922,28 @@ If something OTHER than the dashboard creates a ShipStation order with the same 
 - **PATH=adopt_existing**: SS order found → create local link, DON'T push packaging
 - **PATH=fresh_create**: no SS order → create fresh with our packaging
 
-This lets the dashboard coexist with upstream tools (the known "Sportsline UI" integration, possibly a coworker's separate tool, possibly a ShipStation Selling Channel).
+This lets the dashboard coexist with the upstream tool, identified during Phase 47 hotfix 2 diagnosis (2026-05-14) as Kirsten's processing tool. It writes to Sytist directly (ms_notes signed `"Kirsten"` with body `"Order Has been changed to Printing and Production"`, distinct from our `"Sytist Dashboard: Order processed..."`) and creates SS orders outside our pipeline — ~546 of 555 recent composite-mapped orders flowed through it, not us.
 
-### Identifying the upstream integration
+### Identifying which tool processed an order
 
-In ShipStation:
-- **Settings → Selling Channels → Store Setup** lists every connected store
-- Opening an SS order shows "Imported from [store]" or similar text
+The ms_notes signature is authoritative. Query Sytist directly to see which path an order took:
 
-If you find the source, options are:
-- **Disable that store** if it's redundant → dashboard becomes the only path
-- **Keep it but reconfigure** so it doesn't auto-process
+```sql
+SELECT note_who, note_body, note_date
+FROM ms_notes
+WHERE order_id = <id>
+  AND note_body LIKE '%Printing and Production%'
+ORDER BY note_date DESC;
+```
+
+- `note_who = "Kirsten"` with `note_body = "Order Has been changed to Printing and Production"` → processed by Kirsten's tool
+- `note_body LIKE 'Sytist Dashboard: Order processed%'` → processed by our dashboard
+
+The SS Selling Channels view (`Settings → Selling Channels`) is **not** the right place to look — Kirsten's tool isn't a connected SS store; it creates orders via a separate path that doesn't show up under Selling Channels. Earlier versions of this doc suggested checking there; that was a dead lead.
+
+### What to do about the dual-path situation
+
+There's nothing operational to fix — Phase 33's "adopt without push" already handles the SS-side coexistence safely. The open question is workflow-side: should we fold Kirsten's orders into our composite/audit/packaging pipeline (so all production traffic benefits from S3 thumbnails, audit notes, packaging logic), or accept that our dashboard adds value only for the ~2% that flow through us? Planning conversation, not code change.
 
 ### Manual override: "Push packaging to ShipStation"
 

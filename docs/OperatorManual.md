@@ -347,7 +347,7 @@ The links use the same `fullUrl` the dashboard uses internally for processing.
 
 ## 14. Push packaging
 
-Background: occasionally a separate tool or integration creates a ShipStation order before the dashboard does (the "Sportsline UI" upstream integration is the known case). In that situation, the dashboard's Process action sees the existing SS order and **adopts** it without pushing our packaging fields, to avoid clobbering whatever the upstream tool wrote (Phase 33 behavior).
+Background: occasionally a separate tool or integration creates a ShipStation order before the dashboard does. The known case is Kirsten's processing tool (identified during Phase 47 hotfix 2 diagnosis, 2026-05-14), which handles roughly 98% of recent composite-mapped orders outside our dashboard. In that situation, the dashboard's Process action sees the existing SS order and **adopts** it without pushing our packaging fields, to avoid clobbering whatever the upstream tool wrote (Phase 33 behavior).
 
 If you WANT our packaging on the SS order despite this, use the **Push packaging to ShipStation** button on the Shipping card. It:
 1. Builds the same packaging payload the dashboard would have sent on Process
@@ -458,7 +458,7 @@ If a recent order is missing thumbnails on the order detail page but the printed
 
 ### "ShipStation says the order is shipped but I never marked it"
 
-Some orders show as `shipped` in ShipStation within seconds of creation, without a tracking number — cause not yet diagnosed (possibly an SS workflow rule or selling channel). This doesn't affect the dashboard or the cache anymore (Phase 44 hotfix 2), but if it's confusing operators, mention it to your admin.
+Some orders show as `shipped` in ShipStation within seconds of creation, without a tracking number. This is from Kirsten's processing tool, which creates SS orders that auto-fulfill via an SS workflow rule (identified during Phase 47 hotfix 2 diagnosis, 2026-05-14) — not a bug in the dashboard. The cache survives the auto-ship (Phase 44 hotfix 2), so the order detail page and packing slip still work normally. Safe to treat as cosmetic noise.
 
 ---
 
