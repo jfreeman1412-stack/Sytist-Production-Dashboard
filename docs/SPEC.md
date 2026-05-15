@@ -1492,6 +1492,67 @@ Phase 48 replaces the flat-key override with `buildTokensFromOrder(order, lineIt
 
 ---
 
+## 48a. Text color editing + conditional Save auto-return
+
+Two enhancements bundled after Phase 48 verification surfaced operator workflow gaps. Both are confined to the override editor + one entry-point line on the order detail page; no server change.
+
+### Text color editor
+
+Operators can now change a text slot's color from the QuickEditPanel via a native `<input type="color">`. The picker's value is bound to `slot.color`, the existing property the layout JSON has carried since Phase 9b and that `compositeService._textSvg` already reads as `fill="${slot.color || '#000000'}"`. The 7-char hex format (`#rrggbb`) that the native picker emits is byte-identical to what's already in the layout JSON — no conversion, no schema change.
+
+Other text styling (font family, weight, alignment) stays locked at the layout level, same rationale as Phase 47's original QuickEditPanel scoping: those are layout decisions and shouldn't be tweaked per-order. Color is the exception because operators occasionally need to recolor a name to be readable against a particular player photo's background — a per-order concern.
+
+### Generalized "·custom" badge
+
+Phase 48's `·custom` badge in the LayersList was text-only — it fired when `slot.text !== baseSlot.text`. Phase 48a generalizes the detection via a new `getCustomFields(slot, baseSlot)` helper that enumerates which non-geometry override fields differ from the base:
+
+```js
+function getCustomFields(slot, baseSlot) {
+  if (!slot || !baseSlot) return [];
+  const fields = [];
+  if ((slot.text || '') !== (baseSlot.text || '')) fields.push('text');
+  if ((slot.color || '#000000') !== (baseSlot.color || '#000000')) fields.push('color');
+  return fields;
+}
+```
+
+Geometry (x, y, w, h, fontSize) is intentionally excluded — those are layout nudges, not content overrides, and the badge would otherwise fire on every position tweak and lose its signal value.
+
+The badge's semantic meaning shifts with this change: from "this slot has token-disconnect risk" to "this slot has been hand-edited." Broader but more useful — operators can scan the layers list and spot customized slots at a glance regardless of which field differs. The tooltip enumerates specifics: `Custom — base layout had: text="John Smith", color="#000000"`.
+
+Future override capabilities extend the same helper. When image upload ships (a "Replace photo" affordance on player-photo slots), `slot.overrideImageUrl` joins the field check and the badge picks it up without further changes.
+
+### Conditional Save (no render) auto-return
+
+Phase 47a made Apply (Overwrite) and Apply (Reprint) auto-navigate to `/orders/<orderId>` on success, with the rationale that the rendered composite on the order detail page is itself the confirmation. Save (no render) intentionally stayed on the editor — the operator who's batch-staging multiple cart fixes in one order doesn't want a round-trip after every Save.
+
+Phase 48a adds a conditional: **stay-on-editor remains the default, but the single-item fix flow auto-returns**. Distinguished by query param `?from=order`:
+
+| Entry point | Query param | Save (no render) behavior |
+|---|---|---|
+| OrderDetailPage "Edit layout" button (Phase 46) | `?from=order` appended | Auto-returns to order page on success |
+| Settings → Order Overrides search (OrderOverridesPage) | none | Stays on editor (existing behavior) |
+| OrderSwitcher inside the editor (Phase 11a) | none | Stays on editor |
+
+Apply (Overwrite/Reprint) ignore the param — they always navigate to the order page on success, same as Phase 47a.
+
+### Why query param over `location.state`
+
+React Router's `location.state` is more idiomatic for "where did you come from" semantics but **doesn't survive a hard refresh** — operator who Ctrl+Shift+R's mid-edit silently loses the auto-return context and the post-save behavior reverts to staying on the editor. Query param persists in the URL and survives refresh, copy-paste, and bookmarks. The UI-hint nature (no permission decision rides on it) means manual manipulation has no security cost — worst case the operator strips `?from=order` and Save stays on the editor instead of returning, a benign degradation.
+
+### Edge cases
+
+- **Manual URL strip of `?from=order`**: Save stays on editor. Operator navigates back manually. No data loss.
+- **Hard refresh mid-edit**: URL param persists → behavior preserved.
+- **OrderSwitcher mid-edit**: `switchTo()` calls `navigate()` with a new path and no propagated query — naturally drops `from`. Saving the new cart line stays on editor. Probably correct: once the operator switches cart lines they're effectively in multi-item mode.
+- **Middle-click "Edit layout" → new tab**: param is in the URL → new tab's Save returns its own tab to the order page. Original tab unaffected.
+
+### Files
+
+`client/src/pages/OrderDetailPage.js` (append `?from=order` to the navigate URL — one site, the Phase 46 "Edit layout" button); `client/src/pages/settings/OverrideEditorPage.js` (read `from=order` via `useSearchParams`, navigate on Save success when set, color picker in QuickEditPanel, generalized `getCustomFields` badge detection).
+
+---
+
 ## 49. Photo thumbnail proxy with disk cache
 
 The dashboard's line item card tiles rendered `lineItem.photo.fullUrl` as the `<img src>`. Phase 12a's reasoning — "prefer un-watermarked original over watermarked thumbnail" — held but the cost wasn't measured at the time: Sytist's S3 buckets serve originals at full resolution, 6–10 MB per photo. A 30-item order downloaded 200–300 MB to render 30 tiny tiles. Production page load reached "up to a minute" per Joey's report (DevTools-confirmed 2026-05-14).

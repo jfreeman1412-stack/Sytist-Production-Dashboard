@@ -261,6 +261,7 @@ The dashboard reads from and writes to Sytist's existing `ms_notes` table. Every
 | 46    | Order-detail composite affordances on each line item | ✅ |
 | 47    | Override editor wired into the operator-fix loop | ✅ |
 | 48    | Text content editing in the override editor | ✅ |
+| 48a   | Text color editing + conditional Save auto-return | ✅ |
 | 49 v2 | Photo thumbnail proxy with disk cache (no auth, hardened SSRF) | ✅ |
 
 See `CHANGELOG.md` for what each phase delivered and `SPEC.md` for the full design notes.
