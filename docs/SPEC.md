@@ -1513,6 +1513,37 @@ The Phase 47 hotfix 2 diagnosis surfaced that 546 of 555 recently-processed comp
 
 Files: `.gitignore`, `server/services/photoThumbService.js` (new), `server/routes/sytist.js`, `server/services/schedulerService.js`, `client/src/pages/OrderDetailPage.js`
 
+### Phase 49 v2.1 — alpha preservation hotfix
+
+**Bug**: Phase 49 v2 shipped with `.jpeg({ quality: 80 })` as the only output format. JPEG has no alpha channel. When the proxy received a transparent PNG (Sytist's green-screen keyed-out subject photos), sharp flattened the transparent areas against its default black background. The resulting JPEG was rendered on top of the chosen background photo in `LineItemRow`'s fallback stack, producing **black where the customer's background should have shown through**. Reported by Joey 2026-05-14 shortly after deploy.
+
+Composite-cached items were unaffected (they take the IF branch with `composedThumbnailUrl` and skip the proxy entirely). Plain-photo items were unaffected (opaque source, JPEG output fine). Only green-screen items with no cache row were broken — which, after the Kirsten finding (Phase 47 hotfix 2), is most green-screen items in production.
+
+**Fix**: format-aware output in `photoThumbService`. The output format is inferred from the source URL's extension:
+
+- `.png` source → WebP output (preserves alpha)
+- `.jpg` / `.jpeg` / `.webp` source → JPEG output (smaller for opaque)
+
+The inference is URL-based, not content-based — probing alpha via `sharp.metadata()` would require fetching the source first, which defeats the cache. The cache filename uses the inferred format's extension (`<sha1>.webp` or `<sha1>.jpg`) so the cache lookup remains a single deterministic `readFile`. Same URL always produces the same cache filename; old `.jpg` entries for PNG sources orphan automatically when the new code computes `.webp` for the same URL.
+
+`getOrCreate` now returns `{ buffer, format, fromCache, isPlaceholder }`. The route at `/photo-thumb` sets `Content-Type: image/webp` or `image/jpeg` based on `format`. Placeholder remains JPEG (opaque dark rectangle, no alpha needed).
+
+Sweep was updated to delete both `.jpg` and `.webp` files (matched on extension, with the placeholder explicitly skipped by exact name).
+
+**Known assumption**: the URL-extension inference assumes `.webp` sources are opaque. Sytist doesn't serve WebP sources today (only PNG for green-screen subjects, JPEG for everything else). If that changes AND the WebP sources carry alpha, `_inferOutputFormat` needs to widen to `ext === '.png' || ext === '.webp'`.
+
+**Verified** before commit: synthetic transparent PNG (red circle on alpha=0) run through the new pipeline — output WebP retains `hasAlpha: true, channels: 4`. Opaque JPEG control case produces `hasAlpha: false` output.
+
+**Deploy step required**: existing `.jpg` cache entries for PNG sources are still on disk and won't be reused (the new code looks for `.webp` at a different filename), but they take disk space until the 60-day TTL expires. To free that space immediately, run after deploy:
+
+```cmd
+del /Q server\config\photo-cache\*.jpg
+```
+
+The `_placeholder.jpg` regenerates automatically on next service init.
+
+Files: `server/services/photoThumbService.js`, `server/routes/sytist.js`
+
 ---
 
 ## 50+. Open follow-ups
