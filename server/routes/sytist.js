@@ -178,10 +178,39 @@ router.get('/photo-thumb', async (req, res) => {
       // when the source recovers.
       res.set('Cache-Control', 'public, max-age=60');
     } else {
-      // Content is keyed by sha1(src + width) so the URL is
-      // effectively immutable for the lifetime of the source.
-      res.set('Cache-Control', 'public, max-age=86400, immutable');
+      // Phase 49 v2.3: DROPPED the `immutable` directive. v2.2
+      // sent `max-age=86400, immutable` on the assumption that
+      // the URL→bytes mapping never changes. That assumption
+      // broke when v2/v2.1/v2.2 each shipped different output
+      // bytes at the same URL — browsers that had cached the
+      // v2-era black-background JPEG refused to even ASK the
+      // server for the URL again (immutable=never revalidate),
+      // including on hard refresh, until the 24h TTL expired.
+      // Incognito windows worked because they don't share cache.
+      //
+      // stale-while-revalidate splits the difference: fresh for
+      // 1h, then for the next 23h the browser serves cached
+      // bytes instantly AND fires an invisible background
+      // revalidate; after 24h, must fully refetch. Operators
+      // never wait, and when we ship a proxy fix the next page
+      // load after the silent revalidate picks up the new bytes.
+      res.set(
+        'Cache-Control',
+        'public, max-age=3600, stale-while-revalidate=86400'
+      );
     }
+
+    // Phase 49 v2.3: log every proxy hit with its eventual
+    // outcome. v2/v2.1/v2.2 had only error logs — successful
+    // requests were silent. That made "is the proxy even being
+    // called?" undecidable from the log alone (operators had to
+    // poke response headers to know). Per-request log is cheap
+    // and immediately answers that question for the next
+    // regression.
+    console.log(
+      `[PhotoThumb] GET ${src} → ${statusBase}:${format} (${buffer.length} bytes)`
+    );
+
     res.send(buffer);
   } catch (err) {
     // Last-resort 500 — shouldn't happen because getOrCreate is

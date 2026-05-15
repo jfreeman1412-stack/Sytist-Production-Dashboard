@@ -1585,6 +1585,51 @@ Placeholder regenerates on next service init.
 
 Files: `server/services/photoThumbService.js`, `server/routes/sytist.js`
 
+### Phase 49 v2.3 — cache header fix + request-entry log
+
+**Bug**: v2.2 set `Cache-Control: public, max-age=86400, immutable` on success responses on the (wrong) assumption that the URL → bytes mapping never changes. Across v2 → v2.1 → v2.2 the URL stayed the same but the bytes changed (broken JPEG → broken JPEG → correct WebP). Browsers that had cached the v2-era output refused to even ASK the server for the URL again — `immutable` tells the browser not to revalidate, ever, within the max-age window. Including on hard refresh, for `<img>` subresources, on Chrome at least. Affected operators saw stale black-background JPEGs from their browser cache while incognito windows (no shared cache) showed the correct WebP. Diagnosed by Joey 2026-05-14: incognito showed correct render; main browser showed stale.
+
+**Fix part 1: drop `immutable`, switch to `stale-while-revalidate`.**
+
+```js
+// Was:
+res.set('Cache-Control', 'public, max-age=86400, immutable');
+// Now:
+res.set('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400');
+```
+
+- 0–3600 s: browser serves cached bytes directly. Identical UX to before.
+- 3600–86400 s: browser serves cached bytes **immediately** AND fires an asynchronous background revalidation. If the server returns different content, the cache updates for the next page load. Operators never wait on cache expiry.
+- 86400 s+: browser must fully refetch.
+
+This sidesteps the cache-expiry wait that plain `max-age=3600` would impose, while allowing the cache to actually catch up with server-side fixes. When we ship a proxy bug fix, operators see the new bytes silently within one cache cycle — no `Ctrl+Shift+Delete` ritual.
+
+Placeholder responses stay at `Cache-Control: public, max-age=60` (unchanged — failures should clear quickly).
+
+**Fix part 2: request-entry log.**
+
+v2 / v2.1 / v2.2 only logged on errors. A successful proxy hit was completely silent. That meant "is the proxy being called?" was inferred from the absence of error logs, which is not the same thing. Diagnostic for this exact bug got stuck because the user couldn't tell from logs whether the v2.2 server code was running.
+
+Added a per-request log line in `routes/sytist.js`'s `/photo-thumb` handler:
+
+```
+[PhotoThumb] GET <full src URL> → <statusBase>:<format> (<bytes>)
+```
+
+Example outputs:
+- `[PhotoThumb] GET https://s3.dualstack...png → cache-hit:webp (15584 bytes)` — fast path, expected for green-screen items
+- `[PhotoThumb] GET https://s3.dualstack...jpg → fresh:jpeg (45123 bytes)` — first view of an opaque source
+- `[PhotoThumb] GET https://evil.example.com/x.png → placeholder:jpeg (2446 bytes)` — SSRF rejection
+
+Cost: ~200 bytes of log per proxy request. At ~30 line items per order page and a few orders viewed per day, that's a few hundred KB/day. Trivial.
+
+**Verification path post-deploy:**
+1. Server restart picks up the change.
+2. Affected operators clear their browser cache one time (Ctrl+Shift+Delete → cached images and files → all time) — this is necessary because v2.2-era cached `immutable` entries override the new directive until they expire. Or use a different browser profile for ~24h until the old cache TTL passes.
+3. Future proxy hits write a log line — easy to grep for `[PhotoThumb]` to confirm requests are landing on v2.3 code.
+
+Files: `server/routes/sytist.js`
+
 ---
 
 ## 50+. Open follow-ups
