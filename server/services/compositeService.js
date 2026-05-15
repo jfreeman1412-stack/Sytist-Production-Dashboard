@@ -834,6 +834,12 @@ class CompositeService {
    * Build the standard token context from a canonical Sytist order +
    * line item. Convenience for callers — the rendering itself takes a
    * pre-built tokens object so callers can override / extend.
+   *
+   * Phase 48: mirrored client-side at client/src/pages/settings/OverrideEditorPage.js
+   * (buildTokensFromOrder + camelCaseKey) so the override editor's canvas preview
+   * and Text content textarea resolve to the same values production renders. Keep
+   * the shape, field provenance, and camelCase rule in sync — silent divergence
+   * would make the preview lie.
    */
   buildTokensFromOrder(order, lineItem) {
     const subject = {};

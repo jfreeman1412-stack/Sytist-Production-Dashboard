@@ -1426,6 +1426,72 @@ Files: `client/src/pages/OrderDetailPage.js`, `client/src/pages/settings/Overrid
 
 ---
 
+## 48. Text content editing in the override editor
+
+Phase 47 wired the override editor into the operator-fix loop for position/size adjustments. Text *content* — the actual string a text slot renders — remained un-editable: operators could move the player-name slot, resize it, change its font size, but if a player's name was misspelled in Sytist or needed a per-order override ("John Smith" → "Jonathan Smith"), they had to fix it in Sytist or edit the underlying layout. Both were heavy interventions for what was usually a one-character typo.
+
+Phase 48 adds a Text content textarea to the QuickEditPanel for `text` slots. The save path uses the existing `POST /api/sytist/overrides/:orderId/:cartId` endpoint with no server change — slot text templates are already part of the snapshot blob, so editing `slot.text` in place and POSTing the whole snapshot is the entire mechanism.
+
+### Why no server change was needed
+
+The override snapshot mechanism (Phase 11, stored at `order_overrides.layout_snapshot`) is a full layout JSON, not a delta. Slot text templates like `"{subject.athleteName}"` are part of that JSON. At render time, `compositeService.buildSheetBuffer` runs `_substituteTokens(slot.text, tokens)` on whatever string is in `slot.text`, no preferential treatment for tokens vs literals. So if the operator types "Jonathan Smith" over the template, `slot.text` becomes the literal "Jonathan Smith", token substitution sees no tokens to substitute, and the render is correct. The pipeline is content-agnostic by construction.
+
+### The textarea display rule
+
+The input shows the **resolved value** by default, not the template. If `slot.text` is `"{subject.athleteName}"`, the textarea reads "John Smith" — what the composite will actually render. The operator edits over the resolved value, and what they type becomes `slot.text` literally.
+
+Display logic (one-liner): when `slot.text` contains a `{` anywhere, show `substituteTokens(slot.text, tokens)`; otherwise show `slot.text` directly. This handles three cases correctly without needing the base layout for reference:
+
+| `slot.text` | Display | Notes |
+|---|---|---|
+| `"{subject.athleteName}"` | `"John Smith"` | Resolved against real Sytist data |
+| `"Photo Day {year}"` | `"Photo Day 2026"` | Partial tokens substituted |
+| `"Jonathan Smith"` | `"Jonathan Smith"` | Pure literal, identity |
+| `""` | `""` | Empty stays empty |
+
+The `{`-detection heuristic is independent of `isCustomText` (which compares against the base layout) so the textarea still behaves sensibly when `baseLayout` is null — e.g. when an override's underlying base layout was deleted.
+
+### Token pass-through preserved
+
+The earlier design discussion considered "literal-only" UI vs. "pass-through tokens" UI. The conclusion: pass-through is free because the substitution pipeline already handles whatever `slot.text` contains. If an operator types `"{customer.firstName}"` explicitly into the textarea, it gets stored as that string, and at render time `_substituteTokens` substitutes the customer's first name. The UI doesn't advertise tokens to non-technical operators, but doesn't block power users from using them.
+
+### Custom-text indicator (two surfaces)
+
+A slot is "custom" when its `slot.text` differs from `baseLayout.variants[variant].slots[index].text`. Two visible indicators:
+
+- **QuickEditPanel**: an amber italic line below the textarea reading "Custom text (overrides token) — won't follow Sytist data". Hover tooltip surfaces the original base text so the operator can see what they overrode without leaving the editor.
+- **LayersList**: italic styling on the text snippet + a small amber `·custom` suffix next to the slot's text preview. Operator scanning the layers can see at a glance which slots have manual text without selecting them.
+
+When the base text contained a `{token}`, the indicator means "this slot no longer follows Sytist subject/customer data for this order" — the precise concern that motivated making the indicator visible enough to notice without clicking. When the base text was already a literal (e.g. layout has fixed copy "2026 Photo Day"), the indicator simply means "this differs from the base," which is the same thing semantically.
+
+When the slot's text is unchanged from base but contains a token, an alternative info-only hint is shown instead: "Pulls from: `{subject.athleteName}`" in muted monospace. This surfaces the template so the operator knows what to expect if they edit (the resolved value will become literal).
+
+### Side-effect: canvas-preview bug fix
+
+The `sampleTokens` map at `OverrideEditorPage.js` L595 (pre-Phase 48) tried to override `PLACEHOLDER_TOKENS` with real order data but did so with flat dotted keys:
+
+```js
+const sampleTokens = {
+  ...PLACEHOLDER_TOKENS,
+  'subject.athleteName': lineItem.productName || 'Customer Name',
+  'order.number': String(order.orderNumber || order.orderId || ''),
+};
+```
+
+`substituteTokens` walks nested objects (`ctx.subject.athleteName`), never reads the flat keys. The override was dead code. Worse, `lineItem.productName` is the *product* name ("8x10 Memory Mate"), not the player name — even if the flat-key approach had worked, it would have substituted the wrong field.
+
+Phase 48 replaces the flat-key override with `buildTokensFromOrder(order, lineItem)`, a client-side mirror of the server's `compositeService.buildTokensFromOrder`. Same shape (`{ customer, subject, galleryName, subGalleryName, order, year, date }`), same `camelCaseKey` for subject-field labels, same field provenance (`order.subject.fields[]` from `ms_subjects`). The canvas preview now shows real player names instead of "Sample Player", and the textarea's resolved-value default uses the same tokens — so what the canvas shows and what the textarea shows are the same string, and both match what production will render.
+
+### Server-side mirror risk
+
+`buildTokensFromOrder` exists in both `server/services/compositeService.js` and `client/src/pages/settings/OverrideEditorPage.js`. If the server's version evolves (new fields, different camelCase rules), the client diverges silently — the canvas preview and textarea would resolve differently from the actual render. Tolerable today because the function is small and stable. Both sites carry header comments cross-referencing the other so future-you sees the dependency; if the function ever changes meaningfully, the right move is probably a single `tokensForOrder` server endpoint the client calls, eliminating the duplication.
+
+### Files
+
+`client/src/pages/settings/OverrideEditorPage.js`, `client/src/components/LayoutCanvas.js` (export `substituteTokens`).
+
+---
+
 ## 49. Photo thumbnail proxy with disk cache
 
 The dashboard's line item card tiles rendered `lineItem.photo.fullUrl` as the `<img src>`. Phase 12a's reasoning — "prefer un-watermarked original over watermarked thumbnail" — held but the cost wasn't measured at the time: Sytist's S3 buckets serve originals at full resolution, 6–10 MB per photo. A 30-item order downloaded 200–300 MB to render 30 tiny tiles. Production page load reached "up to a minute" per Joey's report (DevTools-confirmed 2026-05-14).

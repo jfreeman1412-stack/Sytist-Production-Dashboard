@@ -260,7 +260,7 @@ The dashboard reads from and writes to Sytist's existing `ms_notes` table. Every
 | 45    | SS eligibility honors packaging-config category=digital | ✅ |
 | 46    | Order-detail composite affordances on each line item | ✅ |
 | 47    | Override editor wired into the operator-fix loop | ✅ |
-| 48    | (skipped — number reserved during planning) | ⏭️ |
+| 48    | Text content editing in the override editor | ✅ |
 | 49 v2 | Photo thumbnail proxy with disk cache (no auth, hardened SSRF) | ✅ |
 
 See `CHANGELOG.md` for what each phase delivered and `SPEC.md` for the full design notes.
