@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import api from '../../services/api';
 import {
   PageHeader,
@@ -51,6 +51,16 @@ import LayoutCanvas, {
 export default function OverrideEditorPage() {
   const { orderId, cartId } = useParams();
   const navigate = useNavigate();
+  // Phase 48a: `?from=order` query param signals the operator arrived
+  // from the order detail page's "Edit layout" button (single-item fix
+  // flow). When set, Save (no render) auto-returns to that order on
+  // success. When absent (Settings → Order Overrides search, internal
+  // OrderSwitcher), Save stays on the editor to support batch-staging
+  // multiple fixes in the same order. Query param chosen over
+  // location.state so the signal survives a hard refresh — operator
+  // who Ctrl+Shift+R's mid-edit doesn't silently lose the auto-return.
+  const [searchParams] = useSearchParams();
+  const fromOrder = searchParams.get('from') === 'order';
 
   // ─── Data state ─────────────────────────────────────────
   const [order, setOrder] = useState(null);
@@ -494,6 +504,17 @@ export default function OverrideEditorPage() {
         }
       );
       setActionResult({ mode: 'save' });
+      // Phase 48a: when the operator arrived from a single-item fix
+      // flow (`?from=order`), auto-return to the order detail page on
+      // success — matches the Apply (Overwrite/Reprint) navigation
+      // pattern from Phase 47a. The ⚠ Layout edited badge on the
+      // order page is the in-context confirmation. When the param is
+      // absent (Settings multi-item search, OrderSwitcher), Save
+      // stays on the editor so batch-staging across cart lines works
+      // as before.
+      if (fromOrder) {
+        navigate(`/orders/${encodeURIComponent(orderId)}`);
+      }
     } catch (err) {
       setActionError(err.message);
     } finally {
@@ -1352,17 +1373,25 @@ function LayersList({
                 {SLOT_KIND_LABELS[slot.kind] || slot.kind}
               </div>
               {slot.kind === 'text' && slot.text && (() => {
-                // Phase 48: a slot's text is "custom" when it differs
-                // from the base layout's value at the same index. The
-                // operator has typed a literal that no longer follows
-                // Sytist subject/customer data. Indicate inline so the
-                // disconnect is visible at a glance from the layers
-                // list — otherwise the override-vs-token state is
-                // invisible until you click the slot.
+                // Phase 48 / 48a: a slot's "·custom" badge fires when
+                // ANY override field differs from the base layout's
+                // value at the same index. Phase 48 covered text
+                // content (token-disconnect risk); Phase 48a adds
+                // color. Future override capabilities (image upload,
+                // etc.) extend the same getCustomFields helper. Badge
+                // meaning is "this slot has been hand-edited" — the
+                // operator scans the layers list and sees at a glance
+                // which slots have been customized, without selecting
+                // each one. Tooltip enumerates which fields differ
+                // and what the base value was.
                 const baseSlot = baseSlots ? baseSlots[jsonIndex] : null;
-                const isCustomText =
-                  baseSlot && baseSlot.kind === 'text' &&
-                  slot.text !== baseSlot.text;
+                const customFields = getCustomFields(slot, baseSlot);
+                const isCustom = customFields.length > 0;
+                const tooltip = isCustom
+                  ? `Custom — base layout had: ${customFields
+                      .map((f) => `${f}=${JSON.stringify(baseSlot[f] ?? '')}`)
+                      .join(', ')}`
+                  : slot.text;
                 return (
                   <div
                     style={{
@@ -1372,16 +1401,12 @@ function LayersList({
                       overflow: 'hidden',
                       textOverflow: 'ellipsis',
                       whiteSpace: 'nowrap',
-                      fontStyle: isCustomText ? 'italic' : 'normal',
+                      fontStyle: isCustom ? 'italic' : 'normal',
                     }}
-                    title={
-                      isCustomText
-                        ? `Custom text — base layout had: "${baseSlot.text}"`
-                        : slot.text
-                    }
+                    title={tooltip}
                   >
                     "{slot.text}"
-                    {isCustomText && (
+                    {isCustom && (
                       <span style={{ color: '#d09030', marginLeft: 4 }}>
                         ·custom
                       </span>
@@ -1480,6 +1505,12 @@ function QuickEditPanel({
   const isCustomText =
     isText && baseSlot && baseSlot.kind === 'text' &&
     slot.text !== baseSlot.text;
+  // Phase 48a: color override detection. Compare against base, treating
+  // missing color as the renderer's default (#000000) so a slot that
+  // explicitly sets the same default doesn't read as "customized."
+  const isCustomColor =
+    isText && baseSlot && baseSlot.kind === 'text' &&
+    (slot.color || '#000000') !== (baseSlot.color || '#000000');
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
       <div
@@ -1614,6 +1645,40 @@ function QuickEditPanel({
               </div>
             )
           )}
+          {/* Phase 48a: text color editor. Native <input type="color">
+              emits 7-char hex (#rrggbb) which matches the schema in
+              composite-layouts.json and what compositeService._textSvg
+              expects for the `fill` attribute. No format conversion. */}
+          <FormRow label="Color" hint="">
+            <input
+              type="color"
+              value={slot.color || '#000000'}
+              onChange={(e) => onChange({ ...slot, color: e.target.value })}
+              style={{
+                width: 48,
+                height: 28,
+                padding: 0,
+                border: '1px solid var(--border-color)',
+                borderRadius: 4,
+                background: 'var(--bg-input)',
+                cursor: 'pointer',
+              }}
+              title={slot.color || '#000000'}
+            />
+          </FormRow>
+          {isCustomColor && (
+            <div
+              style={{
+                fontSize: 11,
+                color: '#d09030',
+                fontStyle: 'italic',
+                marginTop: -4,
+              }}
+              title={`Base layout had: ${baseSlot.color || '#000000'}`}
+            >
+              Custom color (was {baseSlot.color || '#000000'})
+            </div>
+          )}
           <FormRow label="Font size (px)" hint="">
             <NumberInput
               value={slot.fontSize || 24}
@@ -1677,6 +1742,25 @@ function camelCaseKey(label) {
         : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()
     )
     .join('');
+}
+
+// Phase 48a: enumerate which non-geometry override fields on a slot
+// differ from the base layout's version. Geometry (x, y, w, h,
+// fontSize) is intentionally NOT included — those are layout
+// nudges, not content overrides, and the layers list shouldn't
+// flag every position tweak as "custom." Returns an array of field
+// names ([] when no overrides). Designed to grow: future override
+// capabilities (e.g. slot.overrideImageUrl when image upload ships)
+// add their own check here and the badge + tooltip pick them up
+// without further changes. Color comparison treats missing color
+// as the renderer's #000000 default so a slot that explicitly sets
+// the same default doesn't read as customized.
+function getCustomFields(slot, baseSlot) {
+  if (!slot || !baseSlot) return [];
+  const fields = [];
+  if ((slot.text || '') !== (baseSlot.text || '')) fields.push('text');
+  if ((slot.color || '#000000') !== (baseSlot.color || '#000000')) fields.push('color');
+  return fields;
 }
 
 // ─── Button styles ─────────────────────────────────────────

@@ -871,7 +871,15 @@ function LineItemRow({
     // /settings (see AppLayout.js's nested <Route path="/settings">),
     // so the URL needs the /settings prefix. Without it the wildcard
     // fallback bounces to /.
-    navigate(`/settings/overrides/${order.orderId}/${lineItem.cartId}`);
+    // Phase 48a: `?from=order` signals the editor that the operator
+    // arrived from a single-item fix flow (not the Settings → Order
+    // Overrides multi-item search). When set, Save (no render) auto-
+    // returns to this order page on success instead of staying on the
+    // editor — matching how Apply (Overwrite/Reprint) behave. Other
+    // entry points (OrderOverridesPage, OrderSwitcher inside the
+    // editor) intentionally omit this param so multi-item workflows
+    // keep the existing stay-on-editor behavior.
+    navigate(`/settings/overrides/${order.orderId}/${lineItem.cartId}?from=order`);
   }
 
   async function handleTogglePreview() {
