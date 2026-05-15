@@ -43,6 +43,11 @@ server/assets/fonts/*
 !server/assets/logos/.gitkeep
 !server/assets/fonts/.gitkeep
 
+# Gallery-assets (operator-uploaded per-gallery logo registry + files — runtime data, analogous to server/assets/*)
+server/config/gallery-assets.json
+server/config/gallery-assets/logos/*
+!server/config/gallery-assets/logos/.gitkeep
+
 # Logs
 *.log
 npm-debug.log*
@@ -62,6 +67,7 @@ desktop.ini
 .idea/
 *.sublime-workspace
 *.sublime-project
+.claude/
 
 # Misc
 .cache/
