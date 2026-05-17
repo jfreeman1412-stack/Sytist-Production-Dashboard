@@ -106,6 +106,12 @@ class OrderOverrideService {
                 original_composite_filename, reprint_composite_filename
          FROM order_overrides WHERE order_id = ?`
       ),
+      // Phase 52: full rows incl. layout_snapshot, for the
+      // process-time batch load (one indexed query per order →
+      // Map<cartId, override>, instead of an N-line-item .get() fan-out).
+      listByOrderFull: this._db.prepare(
+        `SELECT * FROM order_overrides WHERE order_id = ?`
+      ),
       // UPSERT: insert or update on conflict
       upsert: this._db.prepare(`
         INSERT INTO order_overrides (
@@ -176,6 +182,29 @@ class OrderOverrideService {
   listByOrder(orderId) {
     this.init();
     return this._stmts.listByOrder.all(Number(orderId));
+  }
+
+  /**
+   * Phase 52: every override for an order WITH its parsed snapshot.
+   * One query; same per-row shape as get(). processingService builds
+   * a Map<String(cartId), override> from this once per order so the
+   * composite loop pays a single indexed read, not one per line item.
+   */
+  listByOrderWithSnapshots(orderId) {
+    this.init();
+    const rows = this._stmts.listByOrderFull.all(Number(orderId));
+    return rows.map((row) => ({
+      orderId: row.order_id,
+      cartId: row.cart_id,
+      layoutId: row.layout_id,
+      variant: row.variant,
+      layoutSnapshot: JSON.parse(row.layout_snapshot),
+      originalCompositeFilename: row.original_composite_filename,
+      reprintCompositeFilename: row.reprint_composite_filename,
+      createdAt: row.created_at,
+      createdBy: row.created_by,
+      updatedAt: row.updated_at,
+    }));
   }
 
   /**

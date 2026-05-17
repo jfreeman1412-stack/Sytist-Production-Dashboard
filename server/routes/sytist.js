@@ -21,6 +21,9 @@ const compositeGraphicsService = require('../services/compositeGraphicsService')
 // Phase 11: per-order layout overrides
 const orderOverrideService = require('../services/orderOverrideService');
 const orderAssetOverrideService = require('../services/orderAssetOverrideService');
+// Phase 52: shared layout/variant + image-override resolution, also
+// used by processingService so Process and Apply can't drift.
+const overrideRenderService = require('../services/overrideRenderService');
 const { requireAuth, requireRole } = require('../middleware/auth');
 
 // Phase 36: small helper to pull the audit context (display name +
@@ -3589,25 +3592,34 @@ async function renderOverrideForOrder({
     throw new Error(`Line item has no player photo URL`);
   }
 
-  // ─── Resolve layout: explicit > override > mapping ─────
-  let layout = explicitLayout;
-  if (!layout) {
-    const override = orderOverrideService.get(orderId, cartId);
-    if (override) {
-      layout = override.layoutSnapshot;
-    } else {
-      const mapping = await compositeService.findMapping(lineItem.sku);
-      if (!mapping) {
-        throw new Error(
-          `No composite mapping for SKU "${lineItem.sku}" and no override exists`
-        );
-      }
-      layout = await compositeService.getLayout(mapping.layoutId);
-      if (!layout) {
-        throw new Error(`Mapped layout "${mapping.layoutId}" missing`);
-      }
-    }
+  // ─── Resolve layout + variant (Phase 52 shared helper) ─────
+  // Was: inline explicit>override>mapping, then a SEPARATE pickVariant
+  // that IGNORED override.variant — a latent bug (an override saved
+  // against the vertical variant rendered against horizontal when the
+  // player photo was landscape, silently dropping the operator's
+  // edits incl. Phase 50 image overrides). The helper now returns the
+  // variant the operator actually edited; processingService uses the
+  // same helper so Process and Apply produce identical output.
+  const override = explicitLayout
+    ? null
+    : orderOverrideService.get(orderId, cartId);
+  const resolved = await overrideRenderService.resolveLayoutAndVariant({
+    lineItem,
+    override,
+    explicitLayout,
+  });
+  if (!resolved.layout) {
+    // Preserve prior throw behavior for the unrecoverable cases.
+    const w = (resolved.warnings || []).find(
+      (x) => x.type === 'no_mapping' || x.type === 'layout_missing'
+    );
+    throw new Error(
+      (w && w.message) ||
+        `No layout resolvable for order ${orderId} cart ${cartId}`
+    );
   }
+  const layout = resolved.layout;
+  const variant = resolved.variant;
 
   // ─── Fetch player photo, team photo, logo, background ──
   // Phase 50: `let` (was `const`) so per-slot image overrides can replace
@@ -3622,11 +3634,8 @@ async function renderOverrideForOrder({
   }
   let playerPhoto = Buffer.from(await playerResp.arrayBuffer());
 
-  const variant = compositeService.pickVariant(
-    layout,
-    lineItem.photo.width || 0,
-    lineItem.photo.height || 0
-  );
+  // variant resolved above by overrideRenderService (Phase 52) —
+  // honors override.variant; no separate pickVariant here anymore.
 
   const teamLookup = await teamPhotoService.findTeamPhoto(
     lineItem.subGalleryId
@@ -3668,50 +3677,27 @@ async function renderOverrideForOrder({
     }
   }
 
-  // ─── Phase 50: per-slot image overrides ─────────────────
-  // After default resolution, iterate the snapshot's slots and replace
-  // any image-kind slot's buffer with the operator's uploaded asset.
-  // Missing-on-disk → log warning and keep the default buffer (already
-  // fetched above); this protects against backup/restore mismatches and
-  // operator-side disk shenanigans without failing the render.
-  for (let i = 0; i < (variantDef.slots || []).length; i++) {
-    const slot = variantDef.slots[i];
-    if (!slot || !slot.overrideImage) continue;
-    if (
-      !orderAssetOverrideService.ELIGIBLE_SLOT_KINDS.includes(slot.kind)
-    ) {
-      continue;
-    }
-    try {
-      const got = await orderAssetOverrideService.readAssetBuffer({
-        orderId,
-        cartId,
-        slotIndex: i,
-        filename: slot.overrideImage.filename,
-      });
-      if (!got) {
-        console.warn(
-          `[OrderAsset] override missing for order=${orderId} cart=${cartId} slot=${i} kind=${slot.kind} — falling back to default`
-        );
-        continue;
-      }
-      if (slot.kind === 'playerPhoto') {
-        playerPhoto = got.buffer;
-      } else if (slot.kind === 'teamPhoto') {
-        teamPhotoBuffer = got.buffer;
-      } else if (slot.kind === 'logo') {
-        logoBuffer = got.buffer;
-      } else if (slot.kind === 'playerBackground') {
-        playerBackgroundBuffer = got.buffer;
-      }
-      console.log(
-        `[OrderAsset] applied override for order=${orderId} cart=${cartId} slot=${i} kind=${slot.kind} bytes=${got.buffer.length}`
-      );
-    } catch (err) {
-      console.warn(
-        `[OrderAsset] override read failed for order=${orderId} cart=${cartId} slot=${i}: ${err.message} (falling back to default)`
-      );
-    }
+  // ─── Phase 52: per-slot image overrides (shared helper) ────
+  // Was an inline Phase 50 loop here; lifted into overrideRenderService
+  // so Process (processingService) and Apply (this path) apply image
+  // overrides identically. Missing-on-disk → keeps the default buffer
+  // + a warning (never fails the render).
+  const imgOv = await overrideRenderService.applyImageOverrides({
+    orderId,
+    cartId,
+    layout,
+    variant,
+    buffers: {
+      playerPhoto,
+      teamPhoto: teamPhotoBuffer,
+      logo: logoBuffer,
+      playerBackground: playerBackgroundBuffer,
+    },
+  });
+  for (const w of imgOv.warnings || []) {
+    console.warn(
+      `[Override render] ${w.type}: ${w.message}`
+    );
   }
 
   const tokens = compositeService.buildTokensFromOrder(order, lineItem);
@@ -3739,10 +3725,10 @@ async function renderOverrideForOrder({
   const result = await compositeService.buildSheetBuffer({
     layout,
     variant,
-    playerPhoto,
-    teamPhoto: teamPhotoBuffer,
-    logo: logoBuffer,
-    playerBackground: playerBackgroundBuffer,
+    playerPhoto: imgOv.buffers.playerPhoto,
+    teamPhoto: imgOv.buffers.teamPhoto,
+    logo: imgOv.buffers.logo,
+    playerBackground: imgOv.buffers.playerBackground,
     tokens,
   });
 

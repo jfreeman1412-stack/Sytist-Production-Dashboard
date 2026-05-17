@@ -70,6 +70,13 @@ const greenscreenService = require('./greenscreenService');
 const sytistDb = require('./sytistDbService');
 const composedThumbnailService = require('./composedThumbnailService');
 const composedThumbnailCacheService = require('./composedThumbnailCacheService');
+// Phase 52: per-order overrides now take effect during normal Process
+// (not just the editor's Apply path). orderOverrideService is the SQLite
+// read; overrideRenderService is the shared layout/variant + image-buffer
+// resolution policy, also used by renderOverrideForOrder so the two
+// paths can't drift.
+const orderOverrideService = require('./orderOverrideService');
+const overrideRenderService = require('./overrideRenderService');
 const sharp = require('sharp');
 
 const SETTINGS_PATH = path.join(
@@ -1363,6 +1370,25 @@ class ProcessingService {
     // Failures fall back to placeholders — the orchestrator continues
     // rather than blocking the whole sub-order. Operator sees warnings
     // in the result UI.
+    // Phase 52: batch-load every saved override for this order ONCE
+    // (one indexed SQLite read, snapshots included) into a Map keyed by
+    // String(cartId). The composite loop below consults this instead of
+    // a per-line-item .get() fan-out. Non-fatal: a read failure just
+    // means we render with SKU-mapped layouts (pre-Phase-52 behavior).
+    const overridesByCart = new Map();
+    try {
+      for (const ov of orderOverrideService.listByOrderWithSnapshots(
+        order.orderId
+      )) {
+        overridesByCart.set(String(ov.cartId), ov);
+      }
+    } catch (err) {
+      subResult.warnings.push({
+        type: 'override_batch_load_failed',
+        message: `Could not load saved overrides for order ${order.orderId}: ${err.message} (rendering SKU-mapped layouts)`,
+      });
+    }
+
     const skipImpositionCartIds = new Set();
     for (const li of sub.lineItems) {
       const downloaded = photosByCartId[li.cartId];
@@ -1381,19 +1407,36 @@ class ProcessingService {
       }
       if (!mapping) continue; // no composite mapping = use default flow
 
-      let layout;
-      try {
-        layout = await compositeService.getLayout(mapping.layoutId);
-      } catch {
-        layout = null;
+      // Phase 52: resolve layout + variant via the shared helper. When a
+      // saved override exists for this cart its snapshot is used
+      // WHOLESALE (and its OWN variant — the one the operator edited),
+      // otherwise the SKU-mapped layout + orientation pick (exactly the
+      // pre-Phase-52 behavior). `mapping` is passed through so the
+      // helper doesn't re-query it; chainToImposition/specialty/
+      // green-screen continue to key off `mapping` unchanged.
+      const resolved = await overrideRenderService.resolveLayoutAndVariant(
+        {
+          lineItem: li,
+          override: overridesByCart.get(String(li.cartId)) || null,
+          mapping,
+        }
+      );
+      for (const w of resolved.warnings || []) {
+        subResult.warnings.push({ cartId: li.cartId, ...w });
       }
+      const layout = resolved.layout;
       if (!layout) {
         subResult.warnings.push({
           type: 'composite_layout_missing',
           cartId: li.cartId,
-          message: `Composite mapping points at layout "${mapping.layoutId}" which doesn't exist`,
+          message: `No usable layout for cart ${li.cartId} (override + SKU mapping both unresolved)`,
         });
         continue;
+      }
+      if (resolved.layoutSource === 'override') {
+        console.log(
+          `[Processing] Order ${order.orderNumber || order.orderId} cart ${li.cartId}: using SAVED OVERRIDE layout (variant=${resolved.variant})`
+        );
       }
 
       try {
@@ -1498,14 +1541,10 @@ class ProcessingService {
         // didn't reference a background, we DON'T warn. Some orders just
         // don't have green-screen backgrounds; the slot silently skips.
 
-        // Pick variant from the player photo's orientation
-        const playerWidth = li.photo?.width || 0;
-        const playerHeight = li.photo?.height || 0;
-        const variant = compositeService.pickVariant(
-          layout,
-          playerWidth,
-          playerHeight
-        );
+        // Phase 52: variant comes from resolveLayoutAndVariant — for an
+        // override it's the variant the operator edited; otherwise it's
+        // the orientation pick (same as the old inline pickVariant).
+        const variant = resolved.variant;
 
         // Build tokens from the order
         const tokens = compositeService.buildTokensFromOrder(order, li);
@@ -1552,13 +1591,33 @@ class ProcessingService {
         // kept for backward compat with the existing render path).
         tokens.overlays = graphicsMap;
 
+        // Phase 52: apply Phase 50 per-slot image overrides before
+        // compositing — same shared helper renderOverrideForOrder uses,
+        // so Process and Apply produce identical output. Missing-on-disk
+        // override → keeps the default buffer + a warning (never fails).
+        const imgOv = await overrideRenderService.applyImageOverrides({
+          orderId: order.orderId,
+          cartId: li.cartId,
+          layout,
+          variant,
+          buffers: {
+            playerPhoto: playerBuffer,
+            teamPhoto: teamBuffer,
+            logo: logoBuffer,
+            playerBackground: playerBackgroundBuffer,
+          },
+        });
+        for (const w of imgOv.warnings || []) {
+          subResult.warnings.push({ cartId: li.cartId, ...w });
+        }
+
         const result = await compositeService.buildSheetBuffer({
           layout,
           variant,
-          playerPhoto: playerBuffer,
-          teamPhoto: teamBuffer,
-          logo: logoBuffer,
-          playerBackground: playerBackgroundBuffer,
+          playerPhoto: imgOv.buffers.playerPhoto,
+          teamPhoto: imgOv.buffers.teamPhoto,
+          logo: imgOv.buffers.logo,
+          playerBackground: imgOv.buffers.playerBackground,
           tokens,
         });
 
