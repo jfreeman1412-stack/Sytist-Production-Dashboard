@@ -48,6 +48,9 @@ server/config/gallery-assets.json
 server/config/gallery-assets/logos/*
 !server/config/gallery-assets/logos/.gitkeep
 
+# Order asset overrides (Phase 50: operator-uploaded per-order, per-cart, per-slot image overrides — runtime data)
+server/config/order-asset-overrides/
+
 # Logs
 *.log
 npm-debug.log*

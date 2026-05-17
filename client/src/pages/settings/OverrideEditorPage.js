@@ -522,6 +522,174 @@ export default function OverrideEditorPage() {
     }
   }
 
+  // Phase 50: upload an image asset for the given slot index. Reads the
+  // file as base64, POSTs to the asset endpoint, mutates the slot's
+  // overrideImage in client state, then persists the snapshot so the
+  // new URL survives a reload. Three round-trips (read file, upload,
+  // save snapshot) but they happen behind one operator action.
+  //
+  // If the upload succeeds but the snapshot save fails, the file is
+  // on disk without a snapshot reference (orphan). Accepted per plan
+  // — future storage-sweep follow-up will clean these up.
+  async function uploadSlotAsset(slotIndex, file) {
+    if (!file || !layout) return;
+    setActionLoading(`upload-${slotIndex}`);
+    setActionError(null);
+    setActionResult(null);
+    try {
+      const slots = layout.variants?.[variant]?.slots || [];
+      const targetSlot = slots[slotIndex];
+      if (!targetSlot) {
+        throw new Error(`Slot index ${slotIndex} not found in current layout`);
+      }
+
+      // Read the File into base64. FileReader.readAsDataURL gives a
+      // "data:<mime>;base64,<payload>" string; we strip the prefix.
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error || new Error('FileReader failed'));
+        reader.readAsDataURL(file);
+      });
+      const comma = String(dataUrl).indexOf(',');
+      const dataBase64 = comma > 0 ? String(dataUrl).slice(comma + 1) : '';
+      if (!dataBase64) {
+        throw new Error('Failed to read file as base64');
+      }
+
+      // POST the upload
+      const upResp = await api.post(
+        `/api/sytist/order-overrides/${encodeURIComponent(orderId)}/${encodeURIComponent(cartId)}/assets/${encodeURIComponent(slotIndex)}`,
+        {
+          dataBase64,
+          filename: file.name || null,
+          slotKind: targetSlot.kind,
+        }
+      );
+
+      // Mutate slot.overrideImage in the working layout state
+      const newOverrideImage = upResp.overrideImage;
+      setLayout((prev) => {
+        if (!prev) return prev;
+        const variantDef = prev.variants?.[variant];
+        if (!variantDef) return prev;
+        const nextSlots = variantDef.slots.map((s, idx) =>
+          idx === slotIndex ? { ...s, overrideImage: newOverrideImage } : s
+        );
+        return {
+          ...prev,
+          variants: {
+            ...prev.variants,
+            [variant]: { ...variantDef, slots: nextSlots },
+          },
+        };
+      });
+
+      // Persist the snapshot so the new overrideImage URL survives a
+      // reload. We re-read the layout from state via the functional
+      // setter pattern to avoid a stale closure.
+      const updatedLayout = (() => {
+        const variantDef = layout.variants?.[variant];
+        const nextSlots = (variantDef?.slots || []).map((s, idx) =>
+          idx === slotIndex ? { ...s, overrideImage: newOverrideImage } : s
+        );
+        return {
+          ...layout,
+          variants: {
+            ...layout.variants,
+            [variant]: { ...variantDef, slots: nextSlots },
+          },
+        };
+      })();
+      await api.post(
+        `/api/sytist/overrides/${encodeURIComponent(orderId)}/${encodeURIComponent(cartId)}`,
+        {
+          layoutId: updatedLayout.id,
+          variant,
+          layoutSnapshot: updatedLayout,
+        }
+      );
+
+      setActionResult({
+        mode: 'upload',
+        slotIndex,
+        slotKind: targetSlot.kind,
+        url: newOverrideImage.url,
+        sizeBytes: newOverrideImage.sizeBytes,
+      });
+    } catch (err) {
+      setActionError(err.message || String(err));
+    } finally {
+      setActionLoading(null);
+    }
+  }
+
+  // Phase 50: remove a slot's image override. Unlinks the file from
+  // disk via DELETE, clears slot.overrideImage in client state, then
+  // saves the snapshot so the cleared state persists.
+  async function removeSlotAsset(slotIndex) {
+    if (!layout) return;
+    setActionLoading(`remove-asset-${slotIndex}`);
+    setActionError(null);
+    setActionResult(null);
+    try {
+      await api._fetch(
+        `/api/sytist/order-overrides/${encodeURIComponent(orderId)}/${encodeURIComponent(cartId)}/assets/${encodeURIComponent(slotIndex)}`,
+        { method: 'DELETE' }
+      );
+
+      // Clear overrideImage in client state
+      setLayout((prev) => {
+        if (!prev) return prev;
+        const variantDef = prev.variants?.[variant];
+        if (!variantDef) return prev;
+        const nextSlots = variantDef.slots.map((s, idx) => {
+          if (idx !== slotIndex) return s;
+          const { overrideImage, ...rest } = s;
+          return rest;
+        });
+        return {
+          ...prev,
+          variants: {
+            ...prev.variants,
+            [variant]: { ...variantDef, slots: nextSlots },
+          },
+        };
+      });
+
+      // Persist the cleared snapshot
+      const updatedLayout = (() => {
+        const variantDef = layout.variants?.[variant];
+        const nextSlots = (variantDef?.slots || []).map((s, idx) => {
+          if (idx !== slotIndex) return s;
+          const { overrideImage, ...rest } = s;
+          return rest;
+        });
+        return {
+          ...layout,
+          variants: {
+            ...layout.variants,
+            [variant]: { ...variantDef, slots: nextSlots },
+          },
+        };
+      })();
+      await api.post(
+        `/api/sytist/overrides/${encodeURIComponent(orderId)}/${encodeURIComponent(cartId)}`,
+        {
+          layoutId: updatedLayout.id,
+          variant,
+          layoutSnapshot: updatedLayout,
+        }
+      );
+
+      setActionResult({ mode: 'remove-asset', slotIndex });
+    } catch (err) {
+      setActionError(err.message || String(err));
+    } finally {
+      setActionLoading(null);
+    }
+  }
+
   async function removeOverride() {
     if (
       !window.confirm(
@@ -709,6 +877,21 @@ export default function OverrideEditorPage() {
           )}
         </StatusBanner>
       )}
+      {actionResult && actionResult.mode === 'upload' && (
+        <StatusBanner kind="success">
+          Image uploaded for the <strong>{actionResult.slotKind}</strong>{' '}
+          slot ({Math.round((actionResult.sizeBytes || 0) / 1024)} KB).
+          The override snapshot has been saved — click Apply (Overwrite)
+          or Apply (Reprint) to render the composite with this image,
+          or Save to stage the change for later processing.
+        </StatusBanner>
+      )}
+      {actionResult && actionResult.mode === 'remove-asset' && (
+        <StatusBanner kind="success">
+          Image override removed for slot {actionResult.slotIndex}. The
+          slot will fall back to the default image on next render.
+        </StatusBanner>
+      )}
 
       {actionError && (
         <StatusBanner kind="error">{actionError}</StatusBanner>
@@ -850,6 +1033,12 @@ export default function OverrideEditorPage() {
                   sheetHeight={layout.sheetHeight}
                   onChange={(newSlot) =>
                     handleSlotChange(selectedIndex, newSlot)
+                  }
+                  onUploadImage={(file) => uploadSlotAsset(selectedIndex, file)}
+                  onRemoveImage={() => removeSlotAsset(selectedIndex)}
+                  uploadLoading={
+                    actionLoading === `upload-${selectedIndex}` ||
+                    actionLoading === `remove-asset-${selectedIndex}`
                   }
                 />
               )
@@ -1481,6 +1670,17 @@ const SLOT_KIND_LABELS = {
 // Trimmed-down property editor. Just enough to nudge what's wrong.
 // Position + size for everything; fontSize for text.
 
+// Phase 50: slot kinds eligible for operator image upload override.
+// Mirrors server orderAssetOverrideService.ELIGIBLE_SLOT_KINDS — kept
+// in sync so the UI only shows the upload affordance on slots the
+// server will actually accept uploads for.
+const UPLOAD_ELIGIBLE_KINDS = [
+  'playerPhoto',
+  'teamPhoto',
+  'logo',
+  'playerBackground',
+];
+
 function QuickEditPanel({
   slot,
   baseSlot,
@@ -1488,8 +1688,13 @@ function QuickEditPanel({
   sheetWidth,
   sheetHeight,
   onChange,
+  onUploadImage,
+  onRemoveImage,
+  uploadLoading,
 }) {
   const isText = slot.kind === 'text';
+  const isImageEligible = UPLOAD_ELIGIBLE_KINDS.includes(slot.kind);
+  const hasOverrideImage = !!(slot.overrideImage && slot.overrideImage.url);
   // Phase 48: resolved value = what the slot will render to with the
   // current text + the order's real Sytist data. If slot.text is a
   // token template ("{subject.athleteName}"), this is the substituted
@@ -1690,6 +1895,165 @@ function QuickEditPanel({
           </FormRow>
         </>
       )}
+
+      {/* Phase 50: per-slot image upload override for image-kind slots.
+          Operator selects a file (or drops one onto the zone); the
+          parent's onUploadImage handler reads as base64, POSTs to the
+          asset endpoint, mutates slot.overrideImage in layout state,
+          and persists the snapshot. "Custom image" indicator + Remove
+          button mirror the text/color indicator pattern. Drop zone +
+          file input are paired so keyboard users get the same UX as
+          drag-and-drop users. */}
+      {isImageEligible && (
+        <ImageUploadSection
+          slot={slot}
+          hasOverrideImage={hasOverrideImage}
+          onUploadImage={onUploadImage}
+          onRemoveImage={onRemoveImage}
+          uploadLoading={uploadLoading}
+        />
+      )}
+    </div>
+  );
+}
+
+// Phase 50: image upload + override controls. Lifted out of
+// QuickEditPanel for readability — the drag-and-drop zone + file input
+// + state for hover-styling adds enough lines to deserve its own
+// component.
+function ImageUploadSection({
+  slot,
+  hasOverrideImage,
+  onUploadImage,
+  onRemoveImage,
+  uploadLoading,
+}) {
+  const [dragOver, setDragOver] = useState(false);
+  const fileInputRef = useRef(null);
+
+  function handleFile(file) {
+    if (!file || !onUploadImage) return;
+    if (uploadLoading) return;
+    onUploadImage(file);
+  }
+
+  function handleDrop(e) {
+    e.preventDefault();
+    setDragOver(false);
+    const file = e.dataTransfer?.files?.[0];
+    handleFile(file);
+  }
+
+  return (
+    <div
+      style={{
+        marginTop: 4,
+        paddingTop: 8,
+        borderTop: '1px solid var(--border-color)',
+      }}
+    >
+      <div
+        style={{
+          fontSize: 11,
+          color: 'var(--text-muted)',
+          marginBottom: 6,
+          fontWeight: 600,
+        }}
+      >
+        Image override
+      </div>
+
+      {hasOverrideImage && (
+        <div style={{ marginBottom: 8 }}>
+          <img
+            src={slot.overrideImage.url}
+            alt="Override preview"
+            style={{
+              maxWidth: '100%',
+              maxHeight: 120,
+              display: 'block',
+              border: '1px solid var(--border-color)',
+              borderRadius: 4,
+              background: '#000',
+            }}
+          />
+          <div
+            style={{
+              fontSize: 11,
+              color: '#d09030',
+              fontStyle: 'italic',
+              marginTop: 4,
+            }}
+            title={`Uploaded ${slot.overrideImage.uploadedAt} (${Math.round((slot.overrideImage.sizeBytes || 0) / 1024)} KB)`}
+          >
+            Custom image — overrides default for this slot
+          </div>
+        </div>
+      )}
+
+      <div
+        onDragOver={(e) => {
+          e.preventDefault();
+          setDragOver(true);
+        }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={handleDrop}
+        onClick={() => fileInputRef.current?.click()}
+        style={{
+          padding: 12,
+          border: dragOver
+            ? '2px dashed #4a7fc1'
+            : '2px dashed var(--border-color)',
+          borderRadius: 4,
+          background: dragOver
+            ? 'rgba(74,127,193,0.10)'
+            : 'var(--bg-input)',
+          color: 'var(--text-muted)',
+          fontSize: 11,
+          textAlign: 'center',
+          cursor: uploadLoading ? 'wait' : 'pointer',
+          opacity: uploadLoading ? 0.7 : 1,
+          transition: 'background 0.15s, border-color 0.15s',
+        }}
+      >
+        {uploadLoading
+          ? '⟳ Uploading…'
+          : hasOverrideImage
+            ? 'Drop a file or click to replace'
+            : 'Drop a file or click to upload (PNG, JPEG, WebP, max 10 MB)'}
+      </div>
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/png,image/jpeg,image/webp"
+        style={{ display: 'none' }}
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          handleFile(file);
+          // Reset so the same file can be picked again later if needed
+          e.target.value = '';
+        }}
+      />
+      {hasOverrideImage && (
+        <button
+          type="button"
+          onClick={onRemoveImage}
+          disabled={!!uploadLoading}
+          style={{
+            marginTop: 6,
+            padding: '4px 8px',
+            background: 'transparent',
+            color: 'var(--text-muted)',
+            border: '1px solid var(--border-color)',
+            borderRadius: 4,
+            fontSize: 11,
+            cursor: uploadLoading ? 'wait' : 'pointer',
+            opacity: uploadLoading ? 0.6 : 1,
+          }}
+        >
+          Remove override image
+        </button>
+      )}
     </div>
   );
 }
@@ -1760,6 +2124,11 @@ function getCustomFields(slot, baseSlot) {
   const fields = [];
   if ((slot.text || '') !== (baseSlot.text || '')) fields.push('text');
   if ((slot.color || '#000000') !== (baseSlot.color || '#000000')) fields.push('color');
+  // Phase 50: image override detection. Base layouts never carry
+  // overrideImage (it's per-order, only present on snapshots after an
+  // operator upload), so the existence of slot.overrideImage on the
+  // working slot is sufficient to flag this as customized.
+  if (slot.overrideImage && slot.overrideImage.url) fields.push('image');
   return fields;
 }
 

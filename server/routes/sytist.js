@@ -20,6 +20,7 @@ const compositeService = require('../services/compositeService');
 const compositeGraphicsService = require('../services/compositeGraphicsService');
 // Phase 11: per-order layout overrides
 const orderOverrideService = require('../services/orderOverrideService');
+const orderAssetOverrideService = require('../services/orderAssetOverrideService');
 const { requireAuth, requireRole } = require('../middleware/auth');
 
 // Phase 36: small helper to pull the audit context (display name +
@@ -219,6 +220,69 @@ router.get('/photo-thumb', async (req, res) => {
     res.status(500).send('');
   }
 });
+
+// ─── Phase 50 / 52: order-asset override image GET ─────────
+//
+// NO requireAuth on this route — deliberately, same reasoning as
+// the photo-thumb proxy above. The override image is consumed by
+// <img src> in the override editor canvas + QuickEditPanel preview,
+// which can't reliably carry the session cookie across the CRA
+// dev-proxy + SameSite (Phase 49 v1 hit this; Phase 50's first cut
+// hit it AGAIN by registering this route after router.use(requireAuth)
+// — 401 on every preview). MUST be registered before the global
+// requireAuth below, like photo-thumb.
+//
+// Threat model differs from photo-thumb: no SSRF surface (this reads
+// LOCAL files only, never fetches a remote URL). orderAssetOverrideService
+// enforces path safety internally — integer-only orderId/cartId/slotIndex
+// and path.resolve + startsWith(base) so nothing escapes the asset
+// root. Residual no-auth risk is ID-enumeration of override images on
+// a localhost-only server; consistent with photo-thumb's posture and
+// the underlying photos already being served unauthenticated.
+//
+// POST (upload) + DELETE stay auth-gated below — they go through
+// api.* (fetch with credentials), so requireRole works there and is
+// wanted. Only the <img>-driven GET needs to be auth-free.
+//
+// IF THIS DASHBOARD EVER MOVES TO A PUBLIC-FACING DEPLOYMENT: same
+// signed-URL treatment as the photo-thumb follow-up applies here.
+router.get(
+  '/order-overrides/:orderId/:cartId/assets/:slotIndex',
+  async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.orderId, 10);
+      const cartId = parseInt(req.params.cartId, 10);
+      const slotIndex = parseInt(req.params.slotIndex, 10);
+      if (!Number.isInteger(orderId) || !Number.isInteger(cartId) || !Number.isInteger(slotIndex)) {
+        return res.status(400).json({
+          error: 'orderId, cartId, and slotIndex must all be integers',
+        });
+      }
+      const opened = await orderAssetOverrideService.openAssetStream({
+        orderId,
+        cartId,
+        slotIndex,
+      });
+      if (!opened) {
+        return res.status(404).json({ error: 'Asset not found' });
+      }
+      res.setHeader('Content-Type', opened.mimeType);
+      res.setHeader('Content-Length', opened.sizeBytes);
+      // Short cache + revalidate. Override images can be replaced;
+      // immutable would poison clients (Phase 49 v2.3 lesson). The ?v=
+      // query in the URL changes on replace so the browser fetches the
+      // new bytes; for the same v= we let it cache for an hour.
+      res.setHeader(
+        'Cache-Control',
+        'public, max-age=3600, stale-while-revalidate=86400'
+      );
+      opened.stream.pipe(res);
+    } catch (err) {
+      console.error('[sytist/order-overrides asset GET]', err);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
 
 router.use(requireAuth);
 
@@ -3247,6 +3311,19 @@ router.delete(
       const before = orderOverrideService.get(orderId, cartId);
       const removed = orderOverrideService.remove(orderId, cartId);
 
+      // Phase 50: wipe any per-slot uploaded image assets for this
+      // (orderId, cartId). The service uses path.resolve + startsWith
+      // checks internally so this is safe against escape; ENOENT is
+      // tolerated (no assets uploaded). Non-fatal: a stale asset dir
+      // doesn't break anything but eats disk, so we log and continue.
+      try {
+        await orderAssetOverrideService.deleteCartAssets(orderId, cartId);
+      } catch (err) {
+        console.warn(
+          `[OrderAsset] delete-cart-assets failed for order=${orderId} cart=${cartId}: ${err.message} (non-fatal, override row already removed)`
+        );
+      }
+
       let restoreResult = null;
       if (removed && rerenderOriginal && before) {
         try {
@@ -3326,6 +3403,135 @@ router.post(
 );
 
 /**
+ * Phase 50 — per-order, per-cart, per-slot image upload overrides.
+ *
+ * POST   /api/sytist/order-overrides/:orderId/:cartId/assets/:slotIndex
+ * DELETE /api/sytist/order-overrides/:orderId/:cartId/assets/:slotIndex
+ *
+ * The matching GET (image fetch) is registered EARLIER, before
+ * router.use(requireAuth), because it's consumed by <img src> and
+ * can't carry the session cookie (Phase 50 Defect A). POST + DELETE
+ * stay auth-gated here — they go through api.* (fetch w/ credentials).
+ *
+ * Storage + path safety + magic-byte validation all live in
+ * orderAssetOverrideService. The routes are thin: validate ids, hand off
+ * to the service, return a structured response.
+ *
+ * Scoped 15 MB JSON parser on POST: a 10 MB image base64-encodes to
+ * ~13.4 MB, which exceeds the global 10 MB express.json limit at
+ * server/index.js:78. Mirrors the graphicUploadJsonParser pattern below
+ * at the composite/graphics route — keeps the higher cap scoped to just
+ * this endpoint instead of widening the global resource-exhaustion
+ * surface.
+ */
+const orderAssetUploadJsonParser = express.json({ limit: '15mb' });
+
+router.post(
+  '/order-overrides/:orderId/:cartId/assets/:slotIndex',
+  requireRole('admin', 'operator'),
+  orderAssetUploadJsonParser,
+  async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.orderId, 10);
+      const cartId = parseInt(req.params.cartId, 10);
+      const slotIndex = parseInt(req.params.slotIndex, 10);
+      if (!Number.isInteger(orderId) || !Number.isInteger(cartId) || !Number.isInteger(slotIndex)) {
+        return res.status(400).json({
+          error: 'orderId, cartId, and slotIndex must all be integers',
+        });
+      }
+      const { dataBase64, filename, slotKind } = req.body || {};
+      if (!dataBase64) {
+        return res.status(400).json({ error: 'dataBase64 is required' });
+      }
+
+      // Slot kind comes from the client (which has the layout in state).
+      // We don't peek at the override snapshot here — uploads work in
+      // mapping mode too, before any override row exists. The client
+      // is expected to call saveOverrideOnly() after upload so the
+      // snapshot references the new file; if it doesn't, the file
+      // orphans (cleaned up by the future storage-sweep follow-up).
+      const eligibleKinds = orderAssetOverrideService.ELIGIBLE_SLOT_KINDS;
+      if (!slotKind || !eligibleKinds.includes(slotKind)) {
+        return res.status(400).json({
+          error: `slotKind must be one of: ${eligibleKinds.join(', ')}`,
+        });
+      }
+
+      const fileBuffer = Buffer.from(dataBase64, 'base64');
+      console.log(
+        `[OrderAsset] POST order=${orderId} cart=${cartId} slot=${slotIndex} kind=${slotKind} base64Length=${dataBase64.length} decodedBytes=${fileBuffer.length} filename=${filename || '?'}`
+      );
+
+      const meta = await orderAssetOverrideService.saveAsset({
+        orderId,
+        cartId,
+        slotIndex,
+        fileBuffer,
+        uploadedBy: req.user?.username || null,
+      });
+
+      // The client mutates slot.overrideImage in its in-memory snapshot
+      // with this URL and re-POSTs the snapshot via the existing Save
+      // path. URL includes a version query (uploadedAt millis) so the
+      // browser doesn't serve a stale cached image after a re-upload
+      // overwrites the same on-disk filename.
+      const versionTs = Date.parse(meta.uploadedAt);
+      const url = `/api/sytist/order-overrides/${orderId}/${cartId}/assets/${slotIndex}?v=${versionTs}`;
+
+      res.json({
+        success: true,
+        overrideImage: {
+          filename: meta.filename,
+          url,
+          uploadedAt: meta.uploadedAt,
+          sizeBytes: meta.sizeBytes,
+          ext: meta.ext,
+          originalFilename: filename || null,
+        },
+      });
+    } catch (err) {
+      console.error('[sytist/order-overrides asset POST]', err);
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+// NOTE: GET /order-overrides/:orderId/:cartId/assets/:slotIndex is
+// registered EARLIER in this file, before router.use(requireAuth) —
+// it's <img>-driven and must be auth-free (Phase 50 Defect A fix).
+// See the comment block next to the photo-thumb route.
+
+router.delete(
+  '/order-overrides/:orderId/:cartId/assets/:slotIndex',
+  requireRole('admin', 'operator'),
+  async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.orderId, 10);
+      const cartId = parseInt(req.params.cartId, 10);
+      const slotIndex = parseInt(req.params.slotIndex, 10);
+      if (!Number.isInteger(orderId) || !Number.isInteger(cartId) || !Number.isInteger(slotIndex)) {
+        return res.status(400).json({
+          error: 'orderId, cartId, and slotIndex must all be integers',
+        });
+      }
+      const removed = await orderAssetOverrideService.deleteAsset({
+        orderId,
+        cartId,
+        slotIndex,
+      });
+      console.log(
+        `[OrderAsset] DELETE order=${orderId} cart=${cartId} slot=${slotIndex} removed=${removed}`
+      );
+      res.json({ success: true, removed });
+    } catch (err) {
+      console.error('[sytist/order-overrides asset DELETE]', err);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+/**
  * Shared renderer used by override save+render and override delete+restore.
  * Pulls the order, line item, photos, and layout (overridden or original);
  * runs the composite engine; writes outputs.
@@ -3385,11 +3591,17 @@ async function renderOverrideForOrder({
   }
 
   // ─── Fetch player photo, team photo, logo, background ──
+  // Phase 50: `let` (was `const`) so per-slot image overrides can replace
+  // the buffer after default resolution. The default fetch still happens
+  // even when an override exists — if the override file is missing on
+  // disk at render time, we fall back to the default that's already in
+  // hand. Trades a small amount of wasted bandwidth for a clean
+  // fallback path.
   const playerResp = await fetch(lineItem.photo.fullUrl);
   if (!playerResp.ok) {
     throw new Error(`Player photo fetch failed: HTTP ${playerResp.status}`);
   }
-  const playerPhoto = Buffer.from(await playerResp.arrayBuffer());
+  let playerPhoto = Buffer.from(await playerResp.arrayBuffer());
 
   const variant = compositeService.pickVariant(
     layout,
@@ -3433,6 +3645,52 @@ async function renderOverrideForOrder({
     } catch (err) {
       console.warn(
         `[Override render] background photo fetch: ${err.message}`
+      );
+    }
+  }
+
+  // ─── Phase 50: per-slot image overrides ─────────────────
+  // After default resolution, iterate the snapshot's slots and replace
+  // any image-kind slot's buffer with the operator's uploaded asset.
+  // Missing-on-disk → log warning and keep the default buffer (already
+  // fetched above); this protects against backup/restore mismatches and
+  // operator-side disk shenanigans without failing the render.
+  for (let i = 0; i < (variantDef.slots || []).length; i++) {
+    const slot = variantDef.slots[i];
+    if (!slot || !slot.overrideImage) continue;
+    if (
+      !orderAssetOverrideService.ELIGIBLE_SLOT_KINDS.includes(slot.kind)
+    ) {
+      continue;
+    }
+    try {
+      const got = await orderAssetOverrideService.readAssetBuffer({
+        orderId,
+        cartId,
+        slotIndex: i,
+        filename: slot.overrideImage.filename,
+      });
+      if (!got) {
+        console.warn(
+          `[OrderAsset] override missing for order=${orderId} cart=${cartId} slot=${i} kind=${slot.kind} — falling back to default`
+        );
+        continue;
+      }
+      if (slot.kind === 'playerPhoto') {
+        playerPhoto = got.buffer;
+      } else if (slot.kind === 'teamPhoto') {
+        teamPhotoBuffer = got.buffer;
+      } else if (slot.kind === 'logo') {
+        logoBuffer = got.buffer;
+      } else if (slot.kind === 'playerBackground') {
+        playerBackgroundBuffer = got.buffer;
+      }
+      console.log(
+        `[OrderAsset] applied override for order=${orderId} cart=${cartId} slot=${i} kind=${slot.kind} bytes=${got.buffer.length}`
+      );
+    } catch (err) {
+      console.warn(
+        `[OrderAsset] override read failed for order=${orderId} cart=${cartId} slot=${i}: ${err.message} (falling back to default)`
       );
     }
   }

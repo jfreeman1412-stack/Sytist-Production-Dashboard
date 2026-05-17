@@ -692,13 +692,23 @@ function SlotShape({
   // We render it always when a live URL is available for this
   // slot kind; the extra <image> over the backdrop's stale photo
   // is acceptable — it's the same image, just in the right place.
+  // Phase 50: per-slot image override takes precedence over the live
+  // default URL. If slot.overrideImage.url is set, the canvas preview
+  // shows the operator's uploaded asset instead of the default — same
+  // resolution rule the server-side renderer applies. Falls through
+  // to the default live URL when no override exists.
+  const overrideImageUrl =
+    slot.overrideImage && slot.overrideImage.url
+      ? slot.overrideImage.url
+      : null;
+
   const livePhotoForThisSlot =
     slot.kind === 'playerPhoto'
-      ? livePhotoUrl
+      ? overrideImageUrl || livePhotoUrl
       : slot.kind === 'playerBackground'
-      ? liveBackgroundUrl
+      ? overrideImageUrl || liveBackgroundUrl
       : slot.kind === 'teamPhoto'
-      ? liveTeamPhotoUrl
+      ? overrideImageUrl || liveTeamPhotoUrl
       : null;
 
   // Phase 11e: logo live overlay. When the override editor passes
@@ -706,8 +716,11 @@ function SlotShape({
   // the slot's coordinates so it correctly layers above a moving
   // player photo. Same pattern as graphics: only active when the
   // editor opts in via live overlays.
+  // Phase 50: override image takes precedence here too.
   const liveLogoForThisSlot =
-    slot.kind === 'logo' && logoUrl && liveOverlaysActive ? logoUrl : null;
+    slot.kind === 'logo' && liveOverlaysActive
+      ? overrideImageUrl || logoUrl || null
+      : null;
 
   return (
     <g
