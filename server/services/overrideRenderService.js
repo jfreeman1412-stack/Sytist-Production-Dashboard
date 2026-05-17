@@ -170,6 +170,21 @@ async function resolveLayoutAndVariant({
 async function applyImageOverrides({ orderId, cartId, layout, variant, buffers }) {
   const warnings = [];
   const out = { ...buffers };
+  // Coerce ids to Number at this shared boundary. The canonical order
+  // shape hands out orderId as a STRING (sytistDbService:
+  // `orderId: String(o.order_id)`), and cartId is a number for normal
+  // line items but a synthetic string ("<n>-addon-<id>" / "<n>-pkg-…")
+  // for package/addon carts. orderAssetOverrideService gates every
+  // read on Number.isInteger() as a path-escape guard and silently
+  // returns null for non-integers — so a string orderId made Process
+  // skip every image override (renderOverrideForOrder happened to pass
+  // parseInt'd numbers, which is why Apply worked and Process didn't).
+  // Coerce here, not by loosening the security gate. Synthetic cart
+  // ids → NaN → null → default fallback, which is correct: those
+  // carts can never have had an uploaded asset (saveAsset gates the
+  // same way), so there's nothing to apply.
+  const oid = Number(orderId);
+  const cid = Number(cartId);
   const slots = (layout && layout.variants && layout.variants[variant] && layout.variants[variant].slots) || [];
   for (let i = 0; i < slots.length; i++) {
     const slot = slots[i];
@@ -179,15 +194,15 @@ async function applyImageOverrides({ orderId, cartId, layout, variant, buffers }
     }
     try {
       const got = await orderAssetOverrideService.readAssetBuffer({
-        orderId,
-        cartId,
+        orderId: oid,
+        cartId: cid,
         slotIndex: i,
         filename: slot.overrideImage.filename,
       });
       if (!got) {
         warnings.push({
           type: 'override_image_missing',
-          message: `order=${orderId} cart=${cartId} slot=${i} kind=${slot.kind}: override file missing — using default`,
+          message: `order=${oid} cart=${cid} slot=${i} kind=${slot.kind}: override file missing — using default`,
         });
         continue;
       }
@@ -196,12 +211,12 @@ async function applyImageOverrides({ orderId, cartId, layout, variant, buffers }
       else if (slot.kind === 'logo') out.logo = got.buffer;
       else if (slot.kind === 'playerBackground') out.playerBackground = got.buffer;
       console.log(
-        `[OrderAsset] applied override order=${orderId} cart=${cartId} slot=${i} kind=${slot.kind} bytes=${got.buffer.length}`
+        `[OrderAsset] applied override order=${oid} cart=${cid} slot=${i} kind=${slot.kind} bytes=${got.buffer.length}`
       );
     } catch (err) {
       warnings.push({
         type: 'override_image_error',
-        message: `order=${orderId} cart=${cartId} slot=${i}: ${err.message} — using default`,
+        message: `order=${oid} cart=${cid} slot=${i}: ${err.message} — using default`,
       });
     }
   }
