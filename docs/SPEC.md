@@ -1787,6 +1787,14 @@ Client: `QuickEditPanel` drag-drop zone + file input + "Custom image" indicator 
 
 `server/services/orderAssetOverrideService.js` (new), `server/routes/sytist.js`, `client/src/pages/settings/OverrideEditorPage.js`, `client/src/components/LayoutCanvas.js`, `.gitignore`.
 
+### Hotfix: stale order-detail thumbnail after Apply Overwrite
+
+Browser verification surfaced a layer-5 bug independent of Phase 50's pipeline: after Apply Overwrite the order-detail line item thumbnail kept showing the pre-override composite. Diagnosis walked all five layers — `renderOverrideForOrder` ran, wrote the composite (override image confirmed present in the file), and Phase 47b published to S3 with `composed_thumbnails.updated_at` advancing. The composite in S3 was correct (incognito proved it). The failure was the **Phase 49 v2.3 cache lesson recurring in a different code path**: the composed-thumbnail S3 object lives at a *stable key* (`sytist-dashboard-composed/<orderId>/<cartId>.jpg`); Apply Overwrite replaces its bytes at the unchanged URL; the order-detail `<img src>` had no cache-buster, so the browser served the stale cached composite. Phase 47c's "⚠ Layout edited" staleness badge *cleared* correctly (cache newer than override), which masked the bug — the system believed it was fresh while the browser displayed stale bytes (exactly the v2.3 trap: server correct, browser cached).
+
+Fix is endpoint-level: `/orders/:orderId/composed-thumbnails` appends `?v=<updated_at-epoch>` to each thumbnail URL (the endpoint already had `updated_at` per row for the Phase 47c stale calc). One source of truth → every browser consumer (`<img src>` and the click-through `<a href>`) gets the cache-busted URL with zero OrderDetailPage changes; the `?v=` advances exactly when the composite is re-rendered. Deliberately **not** applied in the DB/service layer so server-side consumers (ShipStation payload, packing slip) keep the bare URL — they fetch server-side with no browser cache, and a query string can trip ShipStation's image-URL handling. The override editor switcher was checked and is not affected: it renders raw Sytist photo URLs (`li.photo.fullUrl`), not the stable composed S3 key.
+
+Files: `server/routes/sytist.js`.
+
 ---
 
 ## Open follow-ups
