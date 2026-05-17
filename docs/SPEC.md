@@ -1759,7 +1759,37 @@ Files: `server/routes/sytist.js`
 
 ---
 
-## 50+. Open follow-ups
+## 50. Operator-uploaded image override
+
+Operators occasionally need to replace the photo a composite slot renders — wrong subject tagged, customer requested a different pose. Before Phase 50 the only fixes were indirect (rename in Sytist, edit the base layout). Phase 50 adds a direct per-(orderId, cartId, slotIndex) image upload in the override editor.
+
+**Scope (read this):** the uploaded image takes effect via the override editor's **Apply (Overwrite) / Apply (Reprint)** path only. Normal **Process does NOT yet honor it** — that's a pre-existing gap affecting *all* override types (text/color/position/image), not Phase 50-specific, and it contradicts the Phase 40 docs which describe Process honoring overrides. Phase 52 delivers that uniformly. Until Phase 52, an operator who uploads an image then clicks Process (rather than Apply) gets the default photo.
+
+### Storage
+
+`server/config/order-asset-overrides/<orderId>/<cartId>/<slotIndex>.<ext>`, gitignored runtime data. `orderAssetOverrideService` owns all disk I/O: magic-byte sniff (PNG/JPEG/WebP only — SVG and everything else rejected regardless of filename), 10 MB cap, `.tmp`+rename atomic write, prior-extension orphan cleanup on re-upload. Path safety is internal: integer-only orderId/cartId/slotIndex plus `path.resolve` + `startsWith(base + sep)` on every read/write/unlink — nothing can escape the asset root. `deleteCartAssets` wipes the per-cart tree when the override row is DELETEd.
+
+Eligible slot kinds: `playerPhoto`, `teamPhoto`, `logo`, `playerBackground`. `staticGraphic`/`overlay` deferred (layout-fixed graphics, rarely per-order).
+
+### Endpoints + the auth split (Defect A)
+
+`POST` (upload) and `DELETE` (remove) are auth-gated (`requireRole('admin','operator')`) — they go through `api.*` (fetch with credentials). `GET` (image fetch) is consumed by `<img src>`, which **cannot carry the session cookie across the CRA dev-proxy + SameSite** — the exact Phase 49 v1 failure. Phase 50's first cut registered GET after `router.use(requireAuth)` and 401'd every preview (Defect A). Fix: the GET is registered *before* `router.use(requireAuth)` and is auth-free, mirroring the photo-thumb placement. Threat model differs from photo-thumb — no SSRF surface (local files only, no remote fetch) — so the residual no-auth risk is just ID-enumeration of override images on a localhost-only server, consistent with the existing posture. Same signed-URL caveat as photo-thumb if this ever goes public.
+
+POST scoped to a 15 MB `express.json` parser (10 MB binary → ~13.4 MB base64 > the global 10 MB limit), mirroring `graphicUploadJsonParser`.
+
+### Snapshot integration + render fallback
+
+Upload writes the file, returns `overrideImage` metadata; the client mutates `slot.overrideImage` in the in-memory snapshot and re-saves it via the existing override POST (URL carries `?v=<uploadedAt-ms>` so a re-upload busts the browser cache). `renderOverrideForOrder` resolves each image-kind slot's buffer from disk via `orderAssetOverrideService.readAssetBuffer`; **missing-on-disk falls back to the default image resolution for that slot** (protects against backup/restore mismatch and manual deletion — never fails the render).
+
+Client: `QuickEditPanel` drag-drop zone + file input + "Custom image" indicator + Remove control; `LayersList` `·custom` badge generalized via `getCustomFields` gaining `'image'`; `LayoutCanvas` previews `slot.overrideImage.url` over the default.
+
+### Files
+
+`server/services/orderAssetOverrideService.js` (new), `server/routes/sytist.js`, `client/src/pages/settings/OverrideEditorPage.js`, `client/src/components/LayoutCanvas.js`, `.gitignore`.
+
+---
+
+## Open follow-ups
 
 - ~~Identify the upstream "Sportsline UI" integration creating phantom SS orders.~~ **Identified during Phase 47 hotfix 2 diagnosis (2026-05-14)**: a separate processing tool used by operator Kirsten. Writes to Sytist directly (`note_who: "Kirsten"` with "Order Has been changed to Printing and Production" — distinct from our `"Sytist Dashboard: Order processed..."` prefix) and creates SS orders outside our pipeline. The ms_notes comparison showed our dashboard processed ~9 of 555 composite-mapped orders in the last 14 days; the other 546 went through Kirsten's tool. Phase 33's "adopt without push" already handles the coexistence pattern — no code change required. The remaining question is operational, not technical: should the dashboard become the primary tool, or stay a special-case path? Worth a conversation with Kirsten, not more code.
 - Distinguish dashboard-written vs Sytist-written log entries in our `OrderActivityCard` (currently only the `[Dashboard]` body prefix marks ours)
@@ -1769,3 +1799,4 @@ Files: `server/routes/sytist.js`
 - **Phase 49 v2 → public-facing deployment**: if this dashboard ever moves off localhost, the `/photo-thumb` proxy must switch from "no auth, SSRF-only" to signed URLs (HMAC over `src + width + expiry`) before deploy. See SPEC §49 for the rationale and the inline comment in `routes/sytist.js`.
 - **On-demand composite preview** before processing — currently the dashboard order detail page only shows composite thumbnails for orders that have already been processed. Adding a "preview what this will look like" requires calling the composite engine from a UI endpoint.
 - **S3 storage sweep** for orders shipped > N days. Decoupled from the poll cycle so the visibility race doesn't recur.
+- **Phase 50 follow-up: storage sweep for `server/config/order-asset-overrides/`** — delete subtrees for orders shipped > N days old. Uploaded override images accumulate indefinitely (and orphan if an operator uploads then closes the editor without Save). Manual cleanup script acceptable until then; the override-DELETE path already wipes per-cart assets so this only matters for never-deleted overrides on shipped orders.

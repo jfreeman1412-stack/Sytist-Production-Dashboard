@@ -263,6 +263,9 @@ The dashboard reads from and writes to Sytist's existing `ms_notes` table. Every
 | 48    | Text content editing in the override editor | ✅ |
 | 48a   | Text color editing + conditional Save auto-return | ✅ |
 | 49 v2 | Photo thumbnail proxy with disk cache (no auth, hardened SSRF) | ✅ |
+| 50    | Operator-uploaded image override (Apply-path; Process in Phase 52) | ✅ |
+| 51    | Settings cross-reference notes for the two output-path configs | ✅ |
+| 52    | Process honors saved overrides (delivers what Phase 40 promised) | ⏳ |
 
 See `CHANGELOG.md` for what each phase delivered and `SPEC.md` for the full design notes.
 
