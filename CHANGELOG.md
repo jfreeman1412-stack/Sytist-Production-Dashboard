@@ -157,6 +157,7 @@ Format: phase number → short title → what shipped → key files touched.
 - Phase 39 hotfix 1: removed the "package detected by config (cart_package=0)" UI banner since `cart_package=0` is the universal case now
 
 ## Phase 40 — Process/Reprint respect saved per-order layout overrides
+- **⚠ Correction (Phase 52): the pipeline half of Phase 40 was specified but never delivered** — only the "Save (no render)" UI shipped; Process ignored saved overrides until Phase 52 wired it (see canonical `docs/CHANGELOG.md` Phase 52). Bullets below describe the intended/now-Phase-52-delivered design.
 - `processingService` composite loop checks `orderOverrideService.get(orderId, cartId)` BEFORE falling through to the SKU-based composite layout lookup
 - When an override exists, that layout is used instead of the mapped layout; `subResult.composites[].layoutSource` is set to `'override'` or `'mapping'` so the operator can see which path was used
 - "Save (no render)" button added to `OverrideEditorPage` — stages overrides for the next Process/Reprint without immediately rendering anything

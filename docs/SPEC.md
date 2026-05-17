@@ -1184,6 +1184,8 @@ Files: `server/services/sytistDbService.js`, `client/src/pages/OrderDetailPage.j
 
 ## 40. Process/Reprint respect saved per-order overrides
 
+> **⚠ Correction (Phase 52):** The pipeline wiring described below was **specified but never delivered** in Phase 40. Only the UI half shipped (the "Save (no render)" button). `processingService` never called `orderOverrideService` — normal **Process silently ignored every saved override** (text, color, position, image) for months; overrides only took effect via the editor's *Apply (Overwrite/Reprint)*. **Phase 52 actually delivers what this section describes** (see §52). The design text below is retained because it is the correct design — Phase 52 implements it.
+
 Phase 11 introduced per-order composite layout overrides — operators can save a layout customization for a specific (orderId, cartId) so the composite engine uses the custom layout instead of the SKU's default mapping.
 
 Phase 40 wires that into the actual Process/Reprint flow:
@@ -1194,6 +1196,7 @@ Phase 40 wires that into the actual Process/Reprint flow:
 New UI: `OverrideEditorPage` now has a "Save (no render)" button alongside the existing "Save and render" — useful when an operator wants to stage an override for the next Process/Reprint without immediately producing files.
 
 Files: `server/services/processingService.js`, `client/src/pages/OverrideEditorPage.js`
+Files (Phase 52, actual delivery): `server/services/overrideRenderService.js` (new), `server/services/processingService.js`, `server/services/orderOverrideService.js`, `server/routes/sytist.js`
 
 ## 41. Per-item thumbnails in ShipStation
 
@@ -1794,6 +1797,38 @@ Browser verification surfaced a layer-5 bug independent of Phase 50's pipeline: 
 Fix is endpoint-level: `/orders/:orderId/composed-thumbnails` appends `?v=<updated_at-epoch>` to each thumbnail URL (the endpoint already had `updated_at` per row for the Phase 47c stale calc). One source of truth → every browser consumer (`<img src>` and the click-through `<a href>`) gets the cache-busted URL with zero OrderDetailPage changes; the `?v=` advances exactly when the composite is re-rendered. Deliberately **not** applied in the DB/service layer so server-side consumers (ShipStation payload, packing slip) keep the bare URL — they fetch server-side with no browser cache, and a query string can trip ShipStation's image-URL handling. The override editor switcher was checked and is not affected: it renders raw Sytist photo URLs (`li.photo.fullUrl`), not the stable composed S3 key.
 
 Files: `server/routes/sytist.js`.
+
+---
+
+## 52. Process honors saved overrides (delivers Phase 40)
+
+Phase 40 (§40) specified that normal Process/Reprint would consult `orderOverrideService` and render the operator's saved override instead of the SKU-mapped layout. Only the UI shipped; the pipeline wiring never did. For months, **every saved override — text (§48), color (§48a), position, image (§50) — was silently ignored by Process**. Overrides only took effect via the editor's *Apply (Overwrite/Reprint)* (`renderOverrideForOrder`). The gap was invisible because the two paths looked equivalent and nothing tested Process-with-override. Surfaced during Phase 50 image-override browser verification.
+
+Phase 52 delivers the real wiring, factored so the two render paths **cannot drift again**.
+
+### Shared module: `overrideRenderService`
+
+Both `processingService` (Process) and `renderOverrideForOrder` (Apply) now call one policy layer:
+
+- **`resolveLayoutAndVariant({ lineItem, override?, explicitLayout?, mapping? })`** → `{ layout, variant, layoutSource, mapping, warnings }`. Precedence: `explicitLayout` (override-DELETE restore) > usable `override.layoutSnapshot` (wholesale) > SKU mapping. Returns `layout:null` when nothing resolves — the caller decides fatality (`renderOverrideForOrder` throws; `processingService` warns + skips the item). Never throws itself. No DB access — the caller passes the loaded `override` in, so the module stays decoupled from `orderOverrideService`.
+- **`applyImageOverrides({ orderId, cartId, layout, variant, buffers })`** → `{ buffers, warnings }`. The verbatim lift of the Phase 50 inline image-override loop. Missing-on-disk → keeps the default buffer + a warning; never fails the render.
+
+### The variant bug, fixed as part of this (deliberate, documented)
+
+`renderOverrideForOrder` previously resolved the layout from the override snapshot but then **recomputed the variant via `pickVariant(playerPhoto w/h)`, ignoring `override.variant`**. The editor only populates the variant the operator edited; the other variant in the snapshot is empty. So an override saved against `vertical` rendered against an empty `horizontal` whenever the player photo was landscape — silently dropping *all* the operator's edits (and, post-Phase-50, the image override too). It didn't bite the Phase 50 test order only because that player photo was portrait, so `pickVariant` coincidentally returned the edited `vertical`. `resolveLayoutAndVariant` now uses `override.variant` (falling back to `pickVariant` only when that variant is absent/empty in the snapshot, with a warning). This **changes a previously-shipped path's behavior** (`renderOverrideForOrder` variant source), which is why the Apply (Overwrite/Reprint) paths were re-verified alongside Process, not assumed safe.
+
+### processingService wiring
+
+- One batched read per order before the composite loop: `orderOverrideService.listByOrderWithSnapshots(orderId)` → `Map<String(cartId), override>` (new method — `listByOrder` is deliberately light and omits `layout_snapshot`). One indexed query, not an N-line-item `.get()` fan-out; a read failure is non-fatal (falls back to SKU-mapped, i.e. pre-Phase-52 behavior).
+- Inside the loop, after the existing `findMapping` (which still gates the loop and still drives `chainToImposition`/specialty/green-screen unchanged), `resolveLayoutAndVariant` chooses layout+variant; `applyImageOverrides` runs just before `buildSheetBuffer`. `layoutSource` is logged when an override is used.
+
+### Degradation
+
+`isUsableSnapshot` gates the wholesale swap (object with a non-empty `variants` map). Unusable snapshot → fall through to SKU-mapped + a warning. `override.variant` missing/empty-in-snapshot → `pickVariant` fallback + a warning. Override image file missing on disk → that slot keeps its default buffer + a warning. An override can degrade an item to default output; it can never abort the order or throw out of the loop.
+
+### Files
+
+`server/services/overrideRenderService.js` (new), `server/services/processingService.js`, `server/services/orderOverrideService.js` (`listByOrderWithSnapshots`), `server/routes/sytist.js` (`renderOverrideForOrder` refactor — variant-bug fix lands here).
 
 ---
 

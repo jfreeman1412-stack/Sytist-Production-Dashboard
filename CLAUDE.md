@@ -141,6 +141,7 @@ sytist-dashboard/
 - **Routes are thin**: parse input, call a service, return JSON. No business logic in route handlers.
 - **Services own state**: cache reads/writes, database calls, external API calls all live in services.
 - **Failure modes for audit-style writes are non-blocking**: `ms_notes`, `order_status_audit`, thumbnail cache upserts. The action succeeds even if the audit write fails. The operator just doesn't see the side-effect entry.
+- **Override-feature verification must test BOTH the editor's Apply paths AND normal Process picking up Save-(no-render) overrides.** The two render paths are independent and one can silently regress — Phase 40 shipped the override UI without the pipeline wiring and Process ignored every saved override for months, unnoticed. Phase 52 unified them behind `overrideRenderService`; keep them on the shared helper so they can't drift again.
 
 ### Cross-platform notes
 

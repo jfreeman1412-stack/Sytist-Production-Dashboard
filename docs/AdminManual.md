@@ -1105,11 +1105,11 @@ What changed admin-wise:
 
 **No admin action required.** This works automatically as long as the Settings → Packages config is current.
 
-## 40. Per-order overrides during Process/Reprint (Phase 40)
+## 40. Per-order overrides during Process/Reprint (Phase 40, delivered in Phase 52)
 
-Phase 11 added the override editor (Settings-style page per (orderId, cartId)). Phase 40 makes those overrides actually take effect during Process/Reprint:
-- Process and Reprint check `orderOverrideService.get(orderId, cartId)` before falling through to the SKU mapping
-- Override editor page now has a "Save (no render)" button alongside "Save and render" — stages the override for a future Process/Reprint without producing files right now
+Phase 11 added the override editor (Settings-style page per (orderId, cartId)). Phase 40 was *supposed* to make those overrides take effect during normal Process/Reprint — but **only the UI shipped in Phase 40; the pipeline wiring was not delivered until Phase 52.** Between Phase 40 and Phase 52, a saved override only took effect if the operator used the editor's **Apply (Overwrite/Reprint)** button; clicking the order's normal **Process** silently rendered the SKU-mapped layout and ignored the override. As of **Phase 52** the behavior below is real:
+- Process and Reprint check the saved override (batch-loaded per order) before falling through to the SKU mapping; the override's snapshot is used wholesale, including the variant the operator edited
+- Override editor page has a "Save (no render)" button alongside "Save and render" — stages the override; **now** the next normal Process picks it up (pre-Phase-52 it did not)
 - The `subResult.composites[].layoutSource` field shows `'override'` or `'mapping'` so operators (and logs) can see which path was taken
 
 ## 41–44. Composed/composite thumbnail pipeline

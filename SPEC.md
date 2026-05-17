@@ -1184,6 +1184,8 @@ Files: `server/services/sytistDbService.js`, `client/src/pages/OrderDetailPage.j
 
 ## 40. Process/Reprint respect saved per-order overrides
 
+> **⚠ Correction (Phase 52):** The pipeline wiring below was specified but **never delivered in Phase 40** — only the "Save (no render)" UI shipped. `processingService` never called `orderOverrideService`; normal Process silently ignored every saved override for months. **Phase 52 delivers this** (see the canonical `docs/SPEC.md` §52). Design text retained because it is the correct design.
+
 Phase 11 introduced per-order composite layout overrides — operators can save a layout customization for a specific (orderId, cartId) so the composite engine uses the custom layout instead of the SKU's default mapping.
 
 Phase 40 wires that into the actual Process/Reprint flow:

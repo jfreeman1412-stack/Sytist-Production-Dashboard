@@ -1096,8 +1096,8 @@ What changed admin-wise:
 
 ## 40. Per-order overrides during Process/Reprint (Phase 40)
 
-Phase 11 added the override editor (Settings-style page per (orderId, cartId)). Phase 40 makes those overrides actually take effect during Process/Reprint:
-- Process and Reprint check `orderOverrideService.get(orderId, cartId)` before falling through to the SKU mapping
+Phase 11 added the override editor (Settings-style page per (orderId, cartId)). **⚠ Correction (Phase 52): only the UI shipped in Phase 40 — normal Process ignored saved overrides until Phase 52 delivered the pipeline wiring (see canonical `docs/AdminManual.md` §40).** As of Phase 52 those overrides take effect during normal Process/Reprint:
+- Process and Reprint check the saved override before falling through to the SKU mapping
 - Override editor page now has a "Save (no render)" button alongside "Save and render" — stages the override for a future Process/Reprint without producing files right now
 - The `subResult.composites[].layoutSource` field shows `'override'` or `'mapping'` so operators (and logs) can see which path was taken
 

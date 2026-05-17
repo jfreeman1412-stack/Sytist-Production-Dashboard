@@ -483,12 +483,14 @@ export default function OverrideEditorPage() {
     }
   }
 
-  // Phase 40: save the override WITHOUT triggering an immediate render.
-  // Used when staging multiple tweaks: open editor → fix → Save → close
-  // → fix another item → Save → ... → Process or Reprint the whole
-  // order. The pipeline's composite-render loop picks up saved
-  // overrides on the cart_ids that have them and uses the original
-  // template for those that don't.
+  // Phase 40 / 52: save the override WITHOUT triggering an immediate
+  // render. Used when staging multiple tweaks: open editor → fix →
+  // Save → close → fix another item → Save → ... → Process the whole
+  // order. As of Phase 52 the pipeline's composite-render loop
+  // genuinely picks up saved overrides on the cart_ids that have them
+  // and uses the SKU-mapped layout for those that don't (Phase 40
+  // specified this but only the UI shipped — Process ignored overrides
+  // until Phase 52 wired `overrideRenderService` into processingService).
   async function saveOverrideOnly() {
     if (!layout) return;
     setActionLoading('save');
