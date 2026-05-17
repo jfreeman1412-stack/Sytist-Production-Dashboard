@@ -1830,6 +1830,12 @@ Both `processingService` (Process) and `renderOverrideForOrder` (Apply) now call
 
 `server/services/overrideRenderService.js` (new), `server/services/processingService.js`, `server/services/orderOverrideService.js` (`listByOrderWithSnapshots`), `server/routes/sytist.js` (`renderOverrideForOrder` refactor — variant-bug fix lands here).
 
+### Post-ship fix + verification
+
+First Process verification of an *image* override failed (#3) while text/color/position passed — the diagnostic key: those live in the snapshot (returned wholesale by `resolveLayoutAndVariant`) and never touch the integer-gated `orderAssetOverrideService`, but the image path does, and the canonical order shape supplies `orderId` as a String (`sytistDbService: String(o.order_id)`). `Number.isInteger()` is false for strings → `readAssetBuffer` silently returned null → Process kept the default photo. `renderOverrideForOrder` had passed `parseInt`'d numbers, which is why Apply worked and Process didn't. Fixed by coercing `Number(orderId)`/`Number(cartId)` at the `applyImageOverrides` shared boundary (not by loosening the path-escape guard, which is a security control). Synthetic addon/pkg cartIds → NaN → null → default fallback, which is correct: `saveAsset` gates identically so such carts can never have a stored asset.
+
+Verified by a real Process/Reprint run (order 111118 cart 483792): `[Processing] … using SAVED OVERRIDE layout (variant=vertical)` then `[OrderAsset] applied override order=111118 cart=483792 slot=2 kind=teamPhoto bytes=5132331` (numeric id), S3 thumbnail re-published. Matrix #1–#6 + #3 + #8 browser-confirmed; #7 (deleted-asset graceful fallback) covered by the 24/24 offline smoke suite only.
+
 ---
 
 ## Open follow-ups
