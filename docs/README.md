@@ -266,6 +266,7 @@ The dashboard reads from and writes to Sytist's existing `ms_notes` table. Every
 | 50    | Operator-uploaded image override (Apply-path; Process in Phase 52) | ✅ |
 | 51    | Settings cross-reference notes for the two output-path configs | ✅ |
 | 52    | Process honors saved overrides (delivers what Phase 40 promised) | ✅ |
+| 53    | "Save & next item" + in-editor line-item prev/next (batch-staging UX) | 📋 planned |
 
 See `CHANGELOG.md` for what each phase delivered and `SPEC.md` for the full design notes.
 

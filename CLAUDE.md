@@ -262,7 +262,7 @@ For deeper detail, see:
 - **`docs/AdminManual.md`** — Settings UI walkthrough, AWS S3 setup, troubleshooting (sections 38–44 are the most recent)
 - **`docs/OperatorManual.md`** — what end users see and do
 
-## Open follow-ups (as of Phase 49 v2.3)
+## Open follow-ups (as of Phase 52)
 
 These aren't urgent but are worth knowing about:
 
@@ -274,6 +274,7 @@ These aren't urgent but are worth knowing about:
 - **On-demand composite preview** before processing — currently you have to Process to populate the thumbnail cache. A preview endpoint that calls composite engine without writing files would let operators see "what will this look like" before committing
 - **Audit downstream effects of `flags.digital` propagation in canonical order shape** (rejected Phase 45 alternative). The narrower Phase 45 fix only teaches the SS filter about packaging-config category=digital. A broader fix would set `flags.download = true` at `sytistDbService.getOrderById` time for any digital-by-config SKU so every downstream consumer (slip, Darkroom .txt, composite engine, imposition) gets the same behavior automatically. Rejected for Phase 45 because of regression risk on slip display, the Darkroom .txt's skip-if-download logic, and Phase 43 hotfix 1's careful work to keep `flags.download` from propagating incorrectly to package constituents. Worth revisiting once we want symmetric "digital is digital everywhere" handling.
 - **Linux portability — `path.win32` usage in operator-output code paths** (deferred from Phase 49 cross-platform notes revival). Many output-path call sites use `path.win32.join`, which emits backslashes unconditionally — fine Windows-to-Windows today, breaks on Linux. Grep for `path.win32` before adding more sites; address holistically before any Linux migration.
+- **Phase 53 (planned, decided this session): "Save & next item" + in-editor line-item prev/next.** Phase 52 made Save (no render) → Process actually honor staged overrides, so the batch loop (stage fixes across an order's items, Process once) is functionally real but ergonomically hidden — the editor has no prev/next; advancing means the order-page round-trip or the switcher panel, and Save (no render) gives no confirmation until Process. Phase 53 adds in-editor line-item prev/next + a combined "Save & next item" (persist override, no render, advance). Apply (Overwrite) keeps its render-now-with-thumbnail role for the single-fix case. Depends on Phase 52. See `docs/SPEC.md` Open follow-ups for the full rationale.
 
 ## How to ask me for things
 
