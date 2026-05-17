@@ -60,6 +60,19 @@ The line-item filter in `shipstationService.buildOrderFromSytist` skips an item 
 
 If you ever see a "digital" or "non-shippable" SKU bypass the filter, the fix is usually a missing `packaging-config.json` entry rather than a code change. Add the SKU with `category: 'digital'` (uppercased key) and the next process call picks it up — `packagingService.getConfig` reads from disk each call, no restart needed.
 
+### Output path configuration
+
+There are **two independent operator-configurable output roots**, sourced from different config files and resolved by different services. They do **not** cascade — changing one does not move the other.
+
+| Output | Operator control | Config file / key | Resolved by |
+|---|---|---|---|
+| Regular pipeline (download, darkroom `.txt`, packing slip, imposition) | Settings → Paths → *mode* templates | `path-overrides.json` → `downloadBase` (per active `mode`) | `pathsService.resolveFullPath` / `resolveBase` at runtime |
+| Specialty products (per-SKU routing) | Settings → Specialty → Base path | `specialty-products.json` → `basePath` | `specialtyService.getBasePath()`; blank → fallback `downloadBase\Specialty` |
+
+Do **not** describe a specific drive (`Z:\Photo Day\…`, `Z:\Sytist\…`) as a code fact — those are current operator settings, not invariants. The invariant is the *mechanism*: two knobs, two files, no linkage. The production setup at time of writing deliberately points them at different drive roots (specialty on its own root for lab-bin / drop-ship separation). The blank-`basePath` fallback (`downloadBase\Specialty`) is the *designed default*; an explicit `basePath` is a deliberate operator override, not an accident — do not "fix" the divergence by deriving one from the other without operator sign-off.
+
+Soft-failure note: if the specialty root is unreachable at process time, the raw specialty download fails into `subResult.photosFailed` and processing continues (`processingService.js` ~L1143-1158). It's recorded but easy to miss — a "missing specialty file" is more likely a stale `specialty-products.json` `basePath` or an unmounted share than true data loss. Check the configured `basePath` against the filesystem before assuming files were dropped (this was the root of the order 111297 false alarm — files were at the deliberately-separate specialty root, not lost).
+
 ## Repo layout
 
 ```
