@@ -136,6 +136,21 @@ function BasePathSection({ basePath, onChange, onStatus }) {
       >
         <TextInput value={value} onChange={setValue} monospace placeholder="(use default downloadBase\\Specialty)" />
       </FormRow>
+      {/* Phase 51: cross-reference so operators don't assume this
+          cascades from the regular production path. The two roots are
+          independent — see CLAUDE.md "Output path configuration". */}
+      <div
+        style={{
+          fontSize: 12,
+          color: 'var(--text-muted)',
+          fontStyle: 'italic',
+          marginTop: 8,
+        }}
+      >
+        Regular production output is configured separately and does not
+        follow this path. See{' '}
+        <strong>Settings → Paths → production templates</strong>.
+      </div>
     </Section>
   );
 }

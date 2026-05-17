@@ -151,6 +151,23 @@ export default function PathsSettings() {
         />
       )}
 
+      {/* Phase 51: cross-reference so operators don't assume specialty
+          output follows downloadBase. The two roots are independent —
+          see CLAUDE.md "Output path configuration". */}
+      <div
+        style={{
+          fontSize: 12,
+          color: 'var(--text-muted)',
+          fontStyle: 'italic',
+          marginBottom: 16,
+          paddingLeft: 2,
+        }}
+      >
+        Specialty product output is configured separately and does not
+        follow these templates. See{' '}
+        <strong>Settings → Specialty → Base path</strong>.
+      </div>
+
       <Section
         title="Active mode"
         description="The mode determines whether files land in the test sandbox or on the production share. Switching to production requires confirmation."
