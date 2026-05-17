@@ -952,7 +952,26 @@ router.get('/orders/:orderId/composed-thumbnails', async (req, res) => {
     const rows = composedThumbnailCacheService.listByOrder(orderId);
     const thumbnails = {};
     for (const r of rows) {
-      thumbnails[r.cart_id] = r.public_url;
+      // Phase 50 hotfix: cache-bust the composed-thumbnail URL with the
+      // cache row's updated_at. The S3 object lives at a STABLE key
+      // (sytist-dashboard-composed/<orderId>/<cartId>.jpg) whose bytes
+      // are replaced on every Apply Overwrite / Process re-render.
+      // Without a version query the browser keeps serving the stale
+      // cached composite for that unchanged URL — operator sees the OLD
+      // image though S3 has the new one (same failure class as Phase 49
+      // v2.3). ?v= advances exactly when the composite changes.
+      // Endpoint-level (NOT in the DB/service) on purpose: server-side
+      // consumers — ShipStation payload, packing slip — fetch
+      // server-side with no browser cache and must keep the bare URL
+      // (a query string can trip SS's image-URL handling).
+      const ts =
+        Date.parse(r.updated_at || r.created_at || '') || 0;
+      const sep =
+        r.public_url && r.public_url.includes('?') ? '&' : '?';
+      thumbnails[r.cart_id] =
+        ts && r.public_url
+          ? `${r.public_url}${sep}v=${ts}`
+          : r.public_url;
     }
 
     // Phase 47c: compute stale set. An override row whose updated_at
