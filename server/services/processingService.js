@@ -55,7 +55,8 @@ const fsp = require('fs').promises;
 const path = require('path');
 
 const pathsService = require('./pathsService');
-const folderSortService = require('./folderSortService');
+// Phase 56b: folderSortService require removed — its only uses here
+// (sort-segment resolution) moved into printOutputService.resolveOutputDir.
 const darkroomService = require('./darkroomService');
 const packingSlipService = require('./packingSlipService');
 const teamDividerService = require('./teamDividerService');
@@ -77,6 +78,10 @@ const composedThumbnailCacheService = require('./composedThumbnailCacheService')
 // paths can't drift.
 const orderOverrideService = require('./orderOverrideService');
 const overrideRenderService = require('./overrideRenderService');
+// Phase 56b: shared output dir/filename/reprint-N (narrow extraction —
+// the loop stays here; Process keeps its own Step 2 imposition). These
+// values now come from one module so Apply and Process can't drift.
+const printOutputService = require('./printOutputService');
 const sharp = require('sharp');
 
 const SETTINGS_PATH = path.join(
@@ -491,51 +496,15 @@ class ProcessingService {
    * either is sufficient evidence that a reprint already happened.
    */
   async _nextReprintNumber(order) {
-    try {
-      const orderNum = order.orderNumber || order.orderId;
-      const sortLevels = await folderSortService.getSortLevels();
-      const sortSegments = folderSortService.buildOrderPathSync(order, sortLevels);
-      const downloadDir = pathsService.resolveFullPath(
-        'downloadBase',
-        order,
-        sortSegments
-      );
-
-      let existing;
-      try {
-        existing = await fsp.readdir(downloadDir);
-      } catch {
-        // Dir doesn't exist yet — no prior reprints.
-        return 1;
-      }
-
-      // Match: {orderNum}_REPRINT.txt, {orderNum}_REPRINT_2.txt, etc.
-      // Or matching packing_slip variants. The pattern is permissive:
-      // anything starting with `{orderNum}_REPRINT` counts.
-      const prefix = `${orderNum}_REPRINT`;
-      let maxN = 0;
-      for (const name of existing) {
-        if (!name.startsWith(prefix)) continue;
-        // _REPRINT (no number) = treat as N=1
-        // _REPRINT_2, _REPRINT_3, etc.
-        const after = name.slice(prefix.length);
-        const m = after.match(/^_(\d+)/);
-        if (m) {
-          const n = parseInt(m[1], 10);
-          if (n > maxN) maxN = n;
-        } else {
-          // _REPRINT followed by anything other than _N (e.g. _packing_slip)
-          // counts as N=1.
-          if (maxN < 1) maxN = 1;
-        }
-      }
-      return maxN + 1;
-    } catch (err) {
-      console.warn(
-        `[Processing] _nextReprintNumber failed for ${order.orderId} — defaulting to 1: ${err.message}`
-      );
-      return 1;
-    }
+    // Phase 56b: delegate to the shared module. Body (dir resolution +
+    // scan) lifted verbatim into printOutputService so Apply and
+    // Process compute the SAME next-N against the SAME folder-sort
+    // dir — was the divergence behind the Apply reprint-collision
+    // (bug #3/A) and the root-vs-subdir mismatch (bug #4/C). Process's
+    // whole-batch-shares-one-N invariant is preserved: processOrder
+    // still calls this exactly once per run and threads the value.
+    const { dir } = await printOutputService.resolveOutputDir(order);
+    return printOutputService.nextReprintNumber(order, dir);
   }
 
   /**
@@ -1086,13 +1055,13 @@ class ProcessingService {
       return subResult;
     }
 
-    const sortLevels = await folderSortService.getSortLevels();
-    const sortSegments = folderSortService.buildOrderPathSync(order, sortLevels);
-    const downloadDir = pathsService.resolveFullPath(
-      'downloadBase',
-      order,
-      sortSegments
-    );
+    // Phase 56b: single-sourced via printOutputService.resolveOutputDir
+    // (a verbatim extraction of this exact resolution). resolveOutputDir
+    // is now THE definition of the per-item output dir; Apply calls the
+    // same function so root-vs-subdir can't diverge again (bug #4/C).
+    // sortSegments is still returned — slip/divider/.txt below use it.
+    const { dir: downloadDir, sortSegments } =
+      await printOutputService.resolveOutputDir(order);
 
     try {
       await fsp.mkdir(downloadDir, { recursive: true });
@@ -2036,21 +2005,16 @@ class ProcessingService {
   }
 
   _buildPhotoFilename(order, lineItem, reprintSuffix = '') {
-    const orderNum = order.orderNumber || order.orderId;
-    const cartId = lineItem.cartId;
-    const originalName =
-      lineItem.photo?.originalFilename ||
-      `cart${cartId}.jpg`;
-    // Sanitize
-    const safe = String(originalName).replace(/[<>:"/\\|?*\x00-\x1F]/g, '_');
-    // Phase 35: reprint suffix goes between the cartId and the
-    // original filename (before the dot). For an _REPRINT_2 reprint
-    // of order 110685 / cart 481629:
-    //   110685_481629_REPRINT_2_JV_Baseball-0016.png
-    if (reprintSuffix) {
-      return `${orderNum}_${cartId}${reprintSuffix}_${safe}`;
-    }
-    return `${orderNum}_${cartId}_${safe}`;
+    // Phase 56b: delegate to the shared name builder (this is the
+    // photo-derived name = the chainToImposition branch). Logic lifted
+    // verbatim; single-sourced so Apply can't diverge from Process.
+    return printOutputService.buildOutputFilename({
+      order,
+      lineItem,
+      layout: null,
+      chainToImposition: true,
+      reprintSuffix,
+    });
   }
 
   /**
@@ -2068,11 +2032,16 @@ class ProcessingService {
    * from the originals.
    */
   _buildCompositeFilename(order, lineItem, layout, reprintSuffix = '') {
-    const orderNum = order.orderNumber || order.orderId;
-    const cartId = lineItem.cartId;
-    const layoutId = (layout && layout.id) || 'composite';
-    const safeLayoutId = String(layoutId).replace(/[<>:"/\\|?*\x00-\x1F\s]/g, '_');
-    return `${orderNum}_${cartId}_composite_${safeLayoutId}${reprintSuffix}.jpg`;
+    // Phase 56b: delegate to the shared name builder (composite-final
+    // branch). Logic lifted verbatim; single-sourced so Apply can't
+    // diverge from Process.
+    return printOutputService.buildOutputFilename({
+      order,
+      lineItem,
+      layout,
+      chainToImposition: false,
+      reprintSuffix,
+    });
   }
 
   /**

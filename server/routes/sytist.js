@@ -24,6 +24,10 @@ const orderAssetOverrideService = require('../services/orderAssetOverrideService
 // Phase 52: shared layout/variant + image-override resolution, also
 // used by processingService so Process and Apply can't drift.
 const overrideRenderService = require('../services/overrideRenderService');
+// Phase 56b: shared output dir/filename/reprint-N + impose-in-place,
+// also used by processingService — single source so Apply and Process
+// produce byte/path-identical print-ready files.
+const printOutputService = require('../services/printOutputService');
 const { requireAuth, requireRole } = require('../middleware/auth');
 
 // Phase 36: small helper to pull the audit context (display name +
@@ -3408,15 +3412,18 @@ router.delete(
       let restoreResult = null;
       if (removed && rerenderOriginal && before) {
         try {
+          // Phase 56b: no forcedOutputFilename. Re-rendering with
+          // layout:null uses the SKU's mapped (original) layout, and
+          // produceFinalOutput derives the SAME canonical sort-subdir
+          // path Process/Apply use — so this overwrites and reverts
+          // the correct file. Passing before.originalCompositeFilename
+          // would re-inject the pre-56 root-based name (bug #4) and
+          // restore to the wrong place for folder-sorted orders.
           restoreResult = await renderOverrideForOrder({
             orderId,
             cartId,
             layout: null, // null → use SKU's mapped layout (original)
             mode: 'overwrite',
-            // Use the captured original filename so we overwrite the
-            // right file, not whatever the renderer would compute.
-            forcedOutputFilename:
-              before.originalCompositeFilename || null,
           });
         } catch (err) {
           // The override IS removed at this point — surface the
@@ -3669,7 +3676,13 @@ async function renderOverrideForOrder({
   cartId,
   layout: explicitLayout = null,
   mode,
-  forcedOutputFilename = null,
+  // Phase 56b: `forcedOutputFilename` removed. It existed so the
+  // override-DELETE restore could re-write the exact original file,
+  // but it carried the pre-56 root-based name and would re-introduce
+  // bug #4. printOutputService.produceFinalOutput now derives the
+  // canonical sort-subdir path deterministically (same as Process),
+  // so re-rendering the original layout lands on — and reverts — the
+  // correct file with no forced name needed.
 }) {
   const path = require('path');
   const fsp = require('fs').promises;
@@ -3827,30 +3840,56 @@ async function renderOverrideForOrder({
     tokens,
   });
 
-  // ─── Determine output path + filename ─────────────────
-  // Use the SAME path resolver that the production pipeline uses.
-  // This way overrides land in the same place as normal output.
-  const outputDir = pathsService.resolveFullPath(
-    'downloadBase',
+  // ─── Phase 56b: produce the final print-ready output ──────
+  // Shared with Process via printOutputService so Apply and Process
+  // produce byte/path-identical output:
+  //   • resolveOutputDir → the folder-sort subdir (was [] / order
+  //     root — bug #4/C; for folder-sorted orders Apply never
+  //     overwrote the file the .txt/lab actually print)
+  //   • nextReprintNumber against that same dir (bug #3/A — Apply had
+  //     hardcoded "_REPRINT", so a 2nd Apply Reprint silently
+  //     overwrote the 1st)
+  //   • produceFinalOutput writes the composite atomically
+  //     (.tmp+rename) and, for chainToImposition SKUs, imposes IN
+  //     PLACE — Apply never imposed before (bug #2, the 56b core)
+  //
+  // The override snapshot only changes the LAYOUT, never whether the
+  // SKU chains to imposition — that's the SKU's composite mapping —
+  // so resolve the mapping regardless of override (resolved.mapping
+  // is null on the override branch by design).
+  const mapping =
+    resolved.mapping ||
+    (await compositeService.findMapping(lineItem.sku));
+  const { dir: outputDir } =
+    await printOutputService.resolveOutputDir(order);
+  let reprintNumber = 0;
+  if (mode === 'reprint') {
+    reprintNumber = await printOutputService.nextReprintNumber(
+      order,
+      outputDir
+    );
+  }
+  const produced = await printOutputService.produceFinalOutput({
     order,
-    [] // no folder-sort segments — overrides go to the order's root output
-  );
-  await fsp.mkdir(outputDir, { recursive: true });
-
-  // Compute filenames.
-  const baseFilename =
-    forcedOutputFilename ||
-    `${orderId}_${cartId}_composite_${layout.id}.jpg`;
-  const compositeFilename =
-    mode === 'reprint'
-      ? baseFilename.replace(/\.jpg$/i, '_REPRINT.jpg')
-      : baseFilename;
-  const compositePath = path.win32.join(outputDir, compositeFilename);
-
-  // Write image atomically
-  const tmpPath = compositePath + '.tmp';
-  await fsp.writeFile(tmpPath, result.buffer);
-  await fsp.rename(tmpPath, compositePath);
+    lineItem,
+    mapping,
+    layout,
+    compositeBuffer: result.buffer,
+    dir: outputDir,
+    reprintNumber,
+  });
+  const compositeFilename = produced.finalFilename;
+  const compositePath = produced.finalPath;
+  // Imposition warnings (esp. imposition_rule_missing) — surface BOTH
+  // in the returned warnings AND the server log so a chainToImposition
+  // misconfig is visible, never buried in a return value (your
+  // review point #1).
+  for (const w of produced.warnings || []) {
+    result.warnings = [...(result.warnings || []), w];
+    console.warn(
+      `[Override render] order ${order.orderId} cart ${cartId}: ${w.type}: ${w.message}`
+    );
+  }
 
   // ─── For reprint mode, also write a single-item .txt ───
   let txtPath = null;
