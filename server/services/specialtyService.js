@@ -36,6 +36,30 @@ const DEFAULT_HIGHLIGHT_COLORS = {
   quantity: '#fff0f0',
 };
 
+// Make an operator-entered string safe to use as a single filesystem
+// path segment. The specialty `subfolder` becomes a real directory
+// under basePath; operators type human names like `12" Wall Cling`
+// and the `"` (also < > : / \ | ? * and control chars) is illegal in
+// Windows paths — mkdir/write throws EINVAL and the whole specialty
+// download soft-fails into photosFailed, invisibly. Root cause of the
+// order 110924 "missing Wall Cling" investigation.
+//
+// Strategy: reserved chars → space, collapse whitespace, trim, strip
+// leading/trailing dots+spaces (Windows also rejects trailing dot or
+// space on a dir name). Returns '' if nothing usable survives so the
+// caller can fall back to the SKU. NOT handled (rare, out of scope
+// for photo-product subfolders): reserved DOS device names like CON /
+// PRN / NUL — flagged here so it's a known, deliberate non-goal.
+function sanitizePathSegment(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/^[ .]+/, '')
+    .replace(/[ .]+$/, '')
+    .trim();
+}
+
 class SpecialtyService {
   constructor() {
     this._ensureConfig();
@@ -238,9 +262,17 @@ class SpecialtyService {
   async getSpecialtySubfolder(externalId) {
     const product = await this.getProduct(externalId);
     if (!product) return null;
-    return product.subfolder || product.productName || product.externalId;
+    const raw =
+      product.subfolder || product.productName || product.externalId;
+    // Sanitize at the single use-point. The stored config keeps the
+    // operator's original text (display/productName unaffected); only
+    // the value that becomes a real directory is made filesystem-safe.
+    // Fall back to the SKU (always path-safe) if sanitizing wipes it.
+    const safe = sanitizePathSegment(raw);
+    return safe || String(product.externalId);
   }
 }
 
 module.exports = new SpecialtyService();
 module.exports.DEFAULT_HIGHLIGHT_COLORS = DEFAULT_HIGHLIGHT_COLORS;
+module.exports.sanitizePathSegment = sanitizePathSegment;

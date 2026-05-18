@@ -1140,8 +1140,16 @@ class ProcessingService {
 
       try {
         await fsp.mkdir(targetDir, { recursive: true });
-      } catch {
-        /* continue — write below will fail with a clearer error */
+      } catch (mkdirErr) {
+        // Don't swallow this silently (was an empty catch). The
+        // download below will still fail with its own error, but a
+        // mkdir failure is the earliest, clearest signal that the
+        // targetDir is bad — e.g. an illegal Windows path char in a
+        // specialty subfolder (order 110924 root cause). Continue;
+        // the download catch records the per-item failure.
+        console.warn(
+          `[Processing] Order ${order.orderNumber || order.orderId} cart ${li.cartId} sku=${li.sku}: mkdir failed for ${isSpecialty ? 'specialty ' : ''}targetDir "${targetDir}": ${mkdirErr.message} (continuing — download will record the per-item failure)`
+        );
       }
 
       const filename = this._buildPhotoFilename(order, li, reprintSuffix);
@@ -1162,6 +1170,15 @@ class ProcessingService {
           sku: li.sku,
           error: err.message,
         });
+        // Surface in the server log, not just subResult.photosFailed
+        // (which only shows in the result UI). Specialty failures in
+        // particular were invisible here — the CLAUDE.md "easy to
+        // miss" specialty soft-failure landmine. A photo that doesn't
+        // download means a product that won't print; that deserves a
+        // log line regardless of regular-vs-specialty.
+        console.warn(
+          `[Processing] Order ${order.orderNumber || order.orderId} cart ${li.cartId} sku=${li.sku}${isSpecialty ? ' (SPECIALTY)' : ''}: photo download FAILED → ${filePath}: ${err.message}`
+        );
       }
     }
 
