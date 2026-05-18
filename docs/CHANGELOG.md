@@ -298,6 +298,17 @@ Format: phase number → short title → what shipped → key files touched.
 - Empty mkdir `catch {}` → `console.warn`; `photosFailed` download failures now `console.warn` flagging `(SPECIALTY)` — this whole class is no longer invisible in logs
 - 11/11 offline unit cases pass. Files: `server/services/specialtyService.js`, `server/services/processingService.js`
 
+## Phase 56 — Synthetic-cart-ID override keying + Apply→imposition parity
+- Root-caused from order 110969 (ship_to_league, siblings, Bronze Package constituents): package/addon overrides not applying; the sibling/league per-team split was confirmed by-design, not a bug. Four pre-existing bugs fixed:
+- **Bug 1 (56a + addendum):** every override/asset/imposition-preview route `parseInt(req.params.cartId)` — synthetic IDs (`483036-pkg-27`, `…-addon-…`) truncated to the parent int, collapsing constituents onto one key. cartId is now an opaque string end-to-end: routes `String(req.params.cartId)`; `orderOverrideService` binds `cart_id` String (SQLite affinity — no migration; pre-56 collided rows are unmigratable orphans); `orderAssetOverrideService` `isSafeCartId` replaces the integer gate; `overrideRenderService` dropped its now-re-truncating `Number(cartId)`. Zero cartId numeric-coercion left in `server/`. orderId stays integer
+- **Bug 2 (56b core):** `renderOverrideForOrder` never imposed — Apply produced the bare composite for chainToImposition SKUs instead of the imposed sheet the lab prints
+- **Bug 3:** Apply Reprint hardcoded `_REPRINT` → 2nd Apply Reprint silently overwrote the 1st (Process used `_nextReprintNumber`)
+- **Bug 4:** Apply wrote the order ROOT, not the folder-sort subdir → for folder-sorted orders Apply Overwrite/Reprint + DELETE-restore never overwrote the file the .txt/lab print (even non-imposed items)
+- Fix: new shared `printOutputService` (resolveOutputDir / nextReprintNumber / reprintSuffix / buildOutputFilename / produceFinalOutput) used by both Apply and Process so they can't drift (Phase 52 `overrideRenderService` precedent). Narrow extraction (decision B): Process loop + its own Step 2 imposition untouched, only naming/dir/N delegate; `renderOverrideForOrder` rewired onto `produceFinalOutput`; `forcedOutputFilename` removed; orphaned `folderSortService` require dropped
+- Parity-plus-warning: chainToImposition with no rule → bare composite (Process behavior unchanged) + `imposition_rule_missing` warning, returned AND `console.warn`'d
+- **Operator action:** package/addon overrides created before Phase 56 are inert orphans (unmigratable) — re-create them in the editor. Apply output now lands in the folder-sort subdir (was order root for folder-sorted orders)
+- 19/19 + regression offline assertions (incl. the reprint-collision case). Files: `server/services/printOutputService.js` (new), `orderOverrideService.js`, `orderAssetOverrideService.js`, `overrideRenderService.js`, `processingService.js`, `server/routes/sytist.js`
+
 ---
 
 ## Reversed / removed

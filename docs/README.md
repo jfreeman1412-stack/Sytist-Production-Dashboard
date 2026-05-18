@@ -269,6 +269,7 @@ The dashboard reads from and writes to Sytist's existing `ms_notes` table. Every
 | 53    | "Save & next item" + in-editor line-item prev/next (batch-staging UX) | 📋 planned |
 | 54    | Orders-list selection fix + shift-range + order-detail quick lookup | ✅ |
 | 55    | Specialty subfolder filesystem-safety + visible download failures | ✅ |
+| 56    | Synthetic-cart-ID override keying + Apply→imposition parity | ✅ |
 
 See `CHANGELOG.md` for what each phase delivered and `SPEC.md` for the full design notes.
 

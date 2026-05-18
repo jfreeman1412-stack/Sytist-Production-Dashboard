@@ -281,6 +281,13 @@ The button appears in two places that show the same line item:
 1. Main Items list (top of page, on each line item row)
 2. Imposition section (deeper on page, next to the per-item Render Preview button)
 
+### Phase 56 — override editor output location changed (read this if you use Edit Layout)
+
+Two operator-facing changes from the Phase 56 fixes:
+
+- **Override-editor output now lands in the same folder as Process output.** Previously, **Apply Overwrite** / **Apply Reprint** in the layout override editor wrote to the *order root* folder. Process writes into the order's folder-sort subfolder. For orders that use folder-sort, the override output was therefore landing in the wrong place — it never overwrote the file the `.txt`/lab actually print, so layout edits silently didn't reach the print. As of Phase 56, Apply writes to the **same folder-sort subfolder as Process**. If you've been habituated to looking for override output at the order root, look in the sort subfolder now (same place Process puts everything).
+- **Package / addon overrides made before this update no longer apply — re-create them.** A bug keyed package-constituent and addon overrides incorrectly (both constituents of a package collided onto one entry). Those old saved overrides can't be recovered and now have no effect. If you had layout overrides on packaged items or addons, **re-open the editor for those items and re-save them.** Plain single-item overrides are unaffected. Also: Apply on a package/addon item now correctly produces the imposed sheet (it previously produced only the bare composite for items that get imposed).
+
 Both go to the same endpoint; pick whichever is closer to where you're looking.
 
 ### Why reprints don't touch Sytist or ShipStation
