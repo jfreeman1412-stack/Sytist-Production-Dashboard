@@ -34,6 +34,12 @@ server/config/specialty-products.json
 server/config/template-mappings.json
 server/config/sytist-status-map.json
 server/config/filename-config.json
+# Operator-authored via the Settings UI — same class as imposition-layouts.json
+# above. Were tracked by oversight, which caused recurring working-tree
+# "churn" and a near-miss git-checkout discard of real layouts (this session).
+# Last good state is preserved in commit history; back up with server/config.
+server/config/composite-layouts.json
+server/config/composite-mappings.json
 
 # Uploaded assets (user content, not source)
 server/assets/overlays/*
