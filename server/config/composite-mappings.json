@@ -24,6 +24,21 @@
       "externalId": "27",
       "layoutId": "Magnet",
       "chainToImposition": true
+    },
+    {
+      "externalId": "11",
+      "layoutId": "5x7Team",
+      "chainToImposition": true
+    },
+    {
+      "externalId": "45",
+      "layoutId": "5x7Team",
+      "chainToImposition": true
+    },
+    {
+      "externalId": "14",
+      "layoutId": "MM",
+      "chainToImposition": true
     }
   ]
 }

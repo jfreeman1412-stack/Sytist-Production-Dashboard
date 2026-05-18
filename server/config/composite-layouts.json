@@ -213,6 +213,118 @@
           "slots": []
         }
       }
+    },
+    {
+      "id": "5x7Team",
+      "name": "5x7 Team Photo",
+      "sheetWidth": 7,
+      "sheetHeight": 5,
+      "dpi": 300,
+      "backgroundColor": "#ffffff",
+      "variants": {
+        "vertical": {
+          "slots": [
+            {
+              "kind": "teamPhoto",
+              "x": 0,
+              "y": 0,
+              "w": 7,
+              "h": 5,
+              "fit": "cover"
+            }
+          ]
+        },
+        "horizontal": {
+          "slots": [
+            {
+              "kind": "teamPhoto",
+              "x": 0,
+              "y": 0,
+              "w": 7,
+              "h": 5,
+              "fit": "cover"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "8x10Team",
+      "name": "8x10 Team",
+      "sheetWidth": 10,
+      "sheetHeight": 8,
+      "dpi": 300,
+      "backgroundColor": "#ffffff",
+      "variants": {
+        "vertical": {
+          "slots": [
+            {
+              "kind": "teamPhoto",
+              "x": 0,
+              "y": 0,
+              "w": 10,
+              "h": 8,
+              "fit": "cover"
+            }
+          ]
+        },
+        "horizontal": {
+          "slots": [
+            {
+              "kind": "teamPhoto",
+              "x": 0,
+              "y": 0,
+              "w": 10,
+              "h": 8,
+              "fit": "cover"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "MM",
+      "name": "Mini Magents",
+      "sheetWidth": 2.5,
+      "sheetHeight": 3.5,
+      "dpi": 300,
+      "backgroundColor": "#ffffff",
+      "variants": {
+        "vertical": {
+          "slots": [
+            {
+              "kind": "text",
+              "x": 1.75,
+              "y": 3.0500000000000003,
+              "w": 0.5,
+              "h": 0.19999999999999996,
+              "text": "{year}",
+              "fontSize": 24,
+              "fontFamily": "Arial",
+              "color": "#FFFFFF",
+              "align": "center",
+              "weight": "normal"
+            }
+          ]
+        },
+        "horizontal": {
+          "slots": [
+            {
+              "kind": "text",
+              "x": 2.95,
+              "y": 2.1,
+              "w": 0.35,
+              "h": 0.19999999999999996,
+              "text": "{year}",
+              "fontSize": 24,
+              "fontFamily": "Arial",
+              "color": "#ffffff",
+              "align": "center",
+              "weight": "normal"
+            }
+          ]
+        }
+      }
     }
   ]
 }
