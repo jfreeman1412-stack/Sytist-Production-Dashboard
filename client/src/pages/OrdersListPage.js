@@ -62,6 +62,11 @@ export default function OrdersListPage() {
   // automatically whenever filters change (so a filter-then-process
   // workflow doesn't accidentally include orders from a prior view).
   const [selectedOrderIds, setSelectedOrderIds] = useState(() => new Set());
+  // Phase 54 — anchor row index for shift+click range selection. Null
+  // when there's no anchor yet or the list reloaded/filtered (a stale
+  // index across a different `orders` array would select the wrong
+  // range). Set to the row index on every plain (non-shift) toggle.
+  const [lastSelectedIndex, setLastSelectedIndex] = useState(null);
   // Modal visibility for the batch confirm dialog
   const [batchModalOpen, setBatchModalOpen] = useState(false);
   // "Process all filtered" mode — when true, the modal will pull every
@@ -158,6 +163,7 @@ export default function OrdersListPage() {
   // never accidentally batch-processes orders from a prior filter view.
   useEffect(() => {
     setSelectedOrderIds(new Set());
+    setLastSelectedIndex(null); // Phase 54: drop the stale range anchor
   }, [workflow, productionStatus, galleryId, subGalleryId, shippingOption]);
 
   // Phase 4.6 — poll the active batch job for progress every 2s.
@@ -362,13 +368,41 @@ export default function OrdersListPage() {
   }
 
   // ─── Phase 4.6 — selection helpers ─────────────────────
-  function toggleOrderSelected(orderId) {
+  // Phase 54: `index` is the row's position in the currently-rendered
+  // `orders` array; `shiftKey` is read from the checkbox change event.
+  // Plain toggle (no shift) flips one order and sets the range anchor.
+  // Shift+toggle selects the inclusive range between the anchor and the
+  // clicked row (file-explorer model) — it always *adds* the range
+  // (doesn't deselect), which is the predictable behavior for "select
+  // a block to act on". A shift+click with no prior anchor degrades to
+  // a plain single toggle. Stale anchor (index out of range after a
+  // reload) also degrades to single toggle.
+  function toggleOrderSelected(orderId, index = null, shiftKey = false) {
+    if (
+      shiftKey &&
+      lastSelectedIndex !== null &&
+      typeof index === 'number' &&
+      index >= 0 &&
+      index < orders.length &&
+      lastSelectedIndex < orders.length
+    ) {
+      const lo = Math.min(lastSelectedIndex, index);
+      const hi = Math.max(lastSelectedIndex, index);
+      setSelectedOrderIds((prev) => {
+        const next = new Set(prev);
+        for (let i = lo; i <= hi; i++) next.add(orders[i].orderId);
+        return next;
+      });
+      setLastSelectedIndex(index);
+      return;
+    }
     setSelectedOrderIds((prev) => {
       const next = new Set(prev);
       if (next.has(orderId)) next.delete(orderId);
       else next.add(orderId);
       return next;
     });
+    if (typeof index === 'number') setLastSelectedIndex(index);
   }
 
   function selectAllOnPage() {
@@ -1202,13 +1236,15 @@ function OrdersTable({
           </tr>
         </thead>
         <tbody>
-          {orders.map((o) => (
+          {orders.map((o, index) => (
             <OrderRow
               key={o.orderId}
               order={o}
               subGalleryFilter={subGalleryFilter}
               isSelected={selectedOrderIds?.has(o.orderId) || false}
-              onToggleSelected={() => onToggleSelected(o.orderId)}
+              onToggleSelected={(shiftKey) =>
+                onToggleSelected(o.orderId, index, shiftKey)
+              }
               onClick={() => onRowClick(o.orderId)}
             />
           ))}
@@ -1279,21 +1315,23 @@ function OrderRow({ order, subGalleryFilter, isSelected, onToggleSelected, onCli
         if (!isSelected) e.currentTarget.style.background = '';
       }}
     >
-      {/* Checkbox cell — clicks don't propagate to the row */}
+      {/* Checkbox cell. Phase 54 fix: the input's own onChange now
+          drives selection. Previously onChange was a no-op delegating
+          to the td's onClick, but the input ALSO called
+          stopPropagation, which severed that delegation — clicking the
+          actual box did nothing; only the thin td padding around it
+          toggled. The td still stops click propagation so the checkbox
+          never triggers the row's open-order navigation; onChange is a
+          separate synthetic event so it still fires.
+          e.nativeEvent.shiftKey carries the modifier for range select. */}
       <td
         style={{ padding: '10px 12px', textAlign: 'center' }}
-        onClick={(e) => {
-          e.stopPropagation();
-          onToggleSelected();
-        }}
+        onClick={(e) => e.stopPropagation()}
       >
         <input
           type="checkbox"
           checked={isSelected}
-          onChange={() => {
-            /* handled via td click */
-          }}
-          onClick={(e) => e.stopPropagation()}
+          onChange={(e) => onToggleSelected(e.nativeEvent.shiftKey)}
           style={{ cursor: 'pointer' }}
         />
       </td>

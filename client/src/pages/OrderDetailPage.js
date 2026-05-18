@@ -379,6 +379,21 @@ function BackLink({ filterParamsKey }) {
 
 function NavStrip({ neighbors, onNavigate, filterParamsKey }) {
   const navigate = useNavigate();
+  // Phase 54: jump straight to any order by number without going back
+  // to the list. Deliberately a FRESH lookup — no filterParamsKey
+  // appended — because typing an explicit order # is a context switch,
+  // not navigation within the current filtered set (the prev/next
+  // pager already covers in-set movement). Same one-liner the
+  // not-found view has always had, just surfaced on every order.
+  const [lookup, setLookup] = useState('');
+
+  function handleLookup(e) {
+    e.preventDefault();
+    const trimmed = lookup.trim();
+    if (!trimmed) return;
+    navigate(`/orders/${encodeURIComponent(trimmed)}`);
+    setLookup('');
+  }
 
   const hasNeighbors = neighbors && !neighbors.error;
   const prevId = hasNeighbors ? neighbors.previousOrderId : null;
@@ -399,6 +414,32 @@ function NavStrip({ neighbors, onNavigate, filterParamsKey }) {
       }}
     >
       <BackLink filterParamsKey={filterParamsKey} />
+
+      <form
+        onSubmit={handleLookup}
+        style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+      >
+        <input
+          type="text"
+          value={lookup}
+          onChange={(e) => setLookup(e.target.value)}
+          placeholder="Go to order #"
+          inputMode="numeric"
+          style={{
+            width: 130,
+            padding: '5px 8px',
+            fontSize: 12,
+            fontFamily: 'var(--font-mono, monospace)',
+            background: 'var(--bg-input)',
+            color: 'var(--text-primary)',
+            border: '1px solid var(--border-color)',
+            borderRadius: 4,
+          }}
+        />
+        <button type="submit" style={navButtonStyle(false)}>
+          Go
+        </button>
+      </form>
 
       {hasNeighbors && !outOfSet && total > 0 && (
         <div
