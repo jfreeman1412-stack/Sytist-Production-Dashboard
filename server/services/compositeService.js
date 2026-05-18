@@ -397,9 +397,22 @@ class CompositeService {
       );
     }
 
-    const dpi = layout.dpi || 300;
-    const sheetWidthPx = Math.round(layout.sheetWidth * dpi);
-    const sheetHeightPx = Math.round(layout.sheetHeight * dpi);
+    // Phase 57A (variant split): layout-level props resolve
+    // variant-first, then fall back to the (now deprecated) layout-root
+    // value, then the original hardcoded default. When the variant has
+    // no own key these expressions reduce exactly to the pre-57 form, so
+    // render output is byte-identical until an operator deliberately
+    // diverges a variant (Phase 57B). Graphics resolution is NOT here —
+    // it is read outside compositeService and is deferred to Phase 57B.
+    const dpi = variantDef.dpi || layout.dpi || 300;
+    const sheetWidthIn =
+      variantDef.sheetWidth != null ? variantDef.sheetWidth : layout.sheetWidth;
+    const sheetHeightIn =
+      variantDef.sheetHeight != null
+        ? variantDef.sheetHeight
+        : layout.sheetHeight;
+    const sheetWidthPx = Math.round(sheetWidthIn * dpi);
+    const sheetHeightPx = Math.round(sheetHeightIn * dpi);
 
     const composites = [];
     const warnings = [];
@@ -571,7 +584,9 @@ class CompositeService {
       }
     }
 
-    const bgColor = parseHexColor(layout.backgroundColor || '#ffffff');
+    const bgColor = parseHexColor(
+      variantDef.backgroundColor || layout.backgroundColor || '#ffffff'
+    );
     const buffer = await sharp({
       create: {
         width: sheetWidthPx,
