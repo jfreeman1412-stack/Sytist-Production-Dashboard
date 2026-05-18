@@ -1852,6 +1852,22 @@ Files: `client/src/pages/OrdersListPage.js`, `client/src/pages/OrderDetailPage.j
 
 ---
 
+## 55. Specialty subfolder filesystem-safety + visible download failures
+
+Diagnosing a "missing Wall Cling" report on order 110924 (a 3-item order; the 2 composite Magnets reprinted fine, the specialty item produced nothing — no file, no log line). Root cause: SKU 29's specialty `subfolder` in `specialty-products.json` is `12" Wall Cling`. The `"` is a Windows-reserved path character (`< > : " / \ | ? *`); `path.win32.join(specialtyBase, '12" Wall Cling')` builds the string fine, but `fs.mkdir`/write throws `EINVAL`. The mkdir error was swallowed by an empty `catch {}`; the download error went into `subResult.photosFailed` — which only surfaces in the result UI, **not the server log** — so the whole specialty item vanished silently. This is exactly the CLAUDE.md "specialty soft-failure is easy to miss" landmine, and **not a reprint bug** — the shared Step 1 download loop would fail identically on a first Process; reprint was a red herring.
+
+**Fix — three parts, no behavior change for healthy configs:**
+
+1. **Sanitize the subfolder at its single use-point.** New `sanitizePathSegment()` in `specialtyService`: reserved chars + control chars → space, collapse whitespace, trim, strip leading/trailing dots+spaces (Windows also rejects a trailing dot/space on a directory). Applied in `getSpecialtySubfolder` (its only caller is the path construction in `processingService`); falls back to the SKU if sanitizing leaves nothing. The **stored config stays raw** — `productName`/display are untouched; only the value that becomes a real directory is made safe. Clean existing subfolders (Acrylic Ornament 3.5x5, Key Chain, …) are a no-op; SKU 29 now routes to `…\Specialty\12 Wall Cling`. Deliberate non-goal (flagged in code): reserved DOS device names (CON/PRN/NUL) — rare for photo-product subfolders.
+2. **mkdir failure no longer swallowed** — the empty `catch {}` becomes a `console.warn` with the bad targetDir (earliest, clearest signal).
+3. **Download failures are logged** — the `photosFailed` catch now also `console.warn`s, flagging `(SPECIALTY)`. A photo that won't download is a product that won't print; it gets a server-log line regardless of regular-vs-specialty, instead of being visible only in the result UI.
+
+`sanitizePathSegment` is exported; 11/11 offline unit cases pass (inch-quote, slash/backslash, all-reserved→empty→SKU fallback, trailing dot, null/number coercion).
+
+Files: `server/services/specialtyService.js`, `server/services/processingService.js`.
+
+---
+
 ## Open follow-ups
 
 - ~~Identify the upstream "Sportsline UI" integration creating phantom SS orders.~~ **Identified during Phase 47 hotfix 2 diagnosis (2026-05-14)**: a separate processing tool used by operator Kirsten. Writes to Sytist directly (`note_who: "Kirsten"` with "Order Has been changed to Printing and Production" — distinct from our `"Sytist Dashboard: Order processed..."` prefix) and creates SS orders outside our pipeline. The ms_notes comparison showed our dashboard processed ~9 of 555 composite-mapped orders in the last 14 days; the other 546 went through Kirsten's tool. Phase 33's "adopt without push" already handles the coexistence pattern — no code change required. The remaining question is operational, not technical: should the dashboard become the primary tool, or stay a special-case path? Worth a conversation with Kirsten, not more code.

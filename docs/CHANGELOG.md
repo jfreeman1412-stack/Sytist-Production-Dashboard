@@ -292,6 +292,12 @@ Format: phase number → short title → what shipped → key files touched.
 - **2 (enhancement):** "Go to order #" form added to `NavStrip` so operators can jump to any order from any order-detail page without returning to the list. Reuses the not-found view's `navigate('/orders/<id>')`; deliberately a fresh lookup (no inherited filter params — explicit order # is a context switch, not in-set movement)
 - No server changes. Files: `client/src/pages/OrdersListPage.js`, `client/src/pages/OrderDetailPage.js`
 
+## Phase 55 — Specialty subfolder filesystem-safety + visible download failures
+- Root cause of order 110924's "missing Wall Cling": SKU 29's specialty `subfolder` is `12" Wall Cling`; `"` is illegal in Windows paths → mkdir/download threw `EINVAL`, the item soft-failed into `photosFailed` with **no server log line** (CLAUDE.md "easy to miss" specialty landmine). Not a reprint bug — would fail identically on first Process
+- New `specialtyService.sanitizePathSegment()` (reserved `<>:"/\|?*` + control chars → space, collapse, trim, strip leading/trailing dots+spaces; empty → caller falls back to SKU), applied in `getSpecialtySubfolder` (single use-point). Stored config stays raw — only the directory segment is sanitized. Clean subfolders unchanged; SKU 29 → `…\Specialty\12 Wall Cling`
+- Empty mkdir `catch {}` → `console.warn`; `photosFailed` download failures now `console.warn` flagging `(SPECIALTY)` — this whole class is no longer invisible in logs
+- 11/11 offline unit cases pass. Files: `server/services/specialtyService.js`, `server/services/processingService.js`
+
 ---
 
 ## Reversed / removed
