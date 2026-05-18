@@ -91,11 +91,25 @@ function mimeForExtension(ext) {
   return null;
 }
 
-// Strict integer validation — orderId, cartId, slotIndex must all be
-// non-negative integers. Reject anything else BEFORE any path
-// construction so a malicious "../" or null-byte string can't sneak in.
+// Strict integer validation — orderId & slotIndex must be non-negative
+// integers. Reject anything else BEFORE any path construction so a
+// malicious "../" or null-byte string can't sneak in.
 function isPositiveInt(n) {
   return Number.isInteger(n) && n >= 0 && n < 1e12;
+}
+
+// Phase 56: cartId is an OPAQUE string, not an integer — package
+// constituents and addons have synthetic IDs ("483036-pkg-27",
+// "483036-addon-69516"). It still must be safe as a SINGLE directory
+// segment under order-asset-overrides/, so allow only [A-Za-z0-9_-]
+// (which covers plain ints, -pkg-, -addon- and nothing path-escaping:
+// no dots, slashes, colons, null bytes). Bounded length. This is the
+// per-segment guard; _safeResolve still does the resolve+startsWith
+// containment check as defense in depth.
+function isSafeCartId(c) {
+  if (c == null) return false;
+  const s = String(c);
+  return s.length >= 1 && s.length <= 64 && /^[A-Za-z0-9_-]+$/.test(s);
 }
 
 class OrderAssetOverrideService {
@@ -124,7 +138,7 @@ class OrderAssetOverrideService {
   }
 
   _cartDir(orderId, cartId) {
-    if (!isPositiveInt(orderId) || !isPositiveInt(cartId)) {
+    if (!isPositiveInt(orderId) || !isSafeCartId(cartId)) {
       throw new Error('Invalid orderId or cartId');
     }
     return this._safeResolve(String(orderId), String(cartId));
@@ -214,7 +228,7 @@ class OrderAssetOverrideService {
   async readAssetBuffer({ orderId, cartId, slotIndex, filename }) {
     if (
       !isPositiveInt(orderId) ||
-      !isPositiveInt(cartId) ||
+      !isSafeCartId(cartId) ||
       !isPositiveInt(slotIndex)
     ) {
       return null;
@@ -244,7 +258,7 @@ class OrderAssetOverrideService {
   async openAssetStream({ orderId, cartId, slotIndex, filename }) {
     if (
       !isPositiveInt(orderId) ||
-      !isPositiveInt(cartId) ||
+      !isSafeCartId(cartId) ||
       !isPositiveInt(slotIndex)
     ) {
       return null;
@@ -282,7 +296,7 @@ class OrderAssetOverrideService {
   async deleteAsset({ orderId, cartId, slotIndex }) {
     if (
       !isPositiveInt(orderId) ||
-      !isPositiveInt(cartId) ||
+      !isSafeCartId(cartId) ||
       !isPositiveInt(slotIndex)
     ) {
       return false;
@@ -308,7 +322,7 @@ class OrderAssetOverrideService {
   // DELETE handler so a removed override doesn't leave orphan files.
   // Best-effort: ENOENT is fine (nothing to clean up).
   async deleteCartAssets(orderId, cartId) {
-    if (!isPositiveInt(orderId) || !isPositiveInt(cartId)) return false;
+    if (!isPositiveInt(orderId) || !isSafeCartId(cartId)) return false;
     const dir = this._cartDir(orderId, cartId);
     try {
       await fsp.rm(dir, { recursive: true, force: true });

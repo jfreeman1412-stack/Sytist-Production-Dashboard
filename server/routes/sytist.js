@@ -254,11 +254,26 @@ router.get(
   async (req, res) => {
     try {
       const orderId = parseInt(req.params.orderId, 10);
-      const cartId = parseInt(req.params.cartId, 10);
+      // Phase 56: cartId is an OPAQUE STRING, never parseInt'd. Package
+      // constituents and addons have synthetic IDs ("483036-pkg-27",
+      // "483036-addon-69516"); parseInt truncated them to the parent
+      // integer, collapsing both constituents onto one key and breaking
+      // every override save/lookup/render for packaged items. orderId
+      // stays an integer (always numeric).
+      const cartId = String(req.params.cartId);
       const slotIndex = parseInt(req.params.slotIndex, 10);
-      if (!Number.isInteger(orderId) || !Number.isInteger(cartId) || !Number.isInteger(slotIndex)) {
+      // Phase 56: cartId is an opaque string (may be a synthetic
+      // package/addon ID). It still must be a safe single path segment
+      // — [A-Za-z0-9_-] only — since it becomes a directory name under
+      // order-asset-overrides/. orderId & slotIndex remain integers.
+      if (
+        !Number.isInteger(orderId) ||
+        !Number.isInteger(slotIndex) ||
+        !/^[A-Za-z0-9_-]+$/.test(cartId)
+      ) {
         return res.status(400).json({
-          error: 'orderId, cartId, and slotIndex must all be integers',
+          error:
+            'orderId & slotIndex must be integers; cartId must be a safe path segment ([A-Za-z0-9_-], e.g. "482864" or "483036-pkg-27")',
         });
       }
       const opened = await orderAssetOverrideService.openAssetStream({
@@ -3244,7 +3259,12 @@ router.post('/composite/preview', async (req, res) => {
 router.get('/overrides/:orderId/:cartId', async (req, res) => {
   try {
     const orderId = parseInt(req.params.orderId, 10);
-    const cartId = parseInt(req.params.cartId, 10);
+    // Phase 56: cartId is an OPAQUE STRING (synthetic package/addon IDs
+    // like "483036-pkg-27"). parseInt truncated it to the parent int,
+    // so loading a constituent's saved override returned the wrong row
+    // (or null). This is the editor's "load existing override" path —
+    // it must use the same string key the save/render paths now use.
+    const cartId = String(req.params.cartId);
     const override = orderOverrideService.get(orderId, cartId);
     res.json({ override });
   } catch (err) {
@@ -3283,7 +3303,13 @@ router.post(
   async (req, res) => {
     try {
       const orderId = parseInt(req.params.orderId, 10);
-      const cartId = parseInt(req.params.cartId, 10);
+      // Phase 56: cartId is an OPAQUE STRING, never parseInt'd. Package
+      // constituents and addons have synthetic IDs ("483036-pkg-27",
+      // "483036-addon-69516"); parseInt truncated them to the parent
+      // integer, collapsing both constituents onto one key and breaking
+      // every override save/lookup/render for packaged items. orderId
+      // stays an integer (always numeric).
+      const cartId = String(req.params.cartId);
       const {
         layoutId,
         variant,
@@ -3325,7 +3351,13 @@ router.delete(
   async (req, res) => {
     try {
       const orderId = parseInt(req.params.orderId, 10);
-      const cartId = parseInt(req.params.cartId, 10);
+      // Phase 56: cartId is an OPAQUE STRING, never parseInt'd. Package
+      // constituents and addons have synthetic IDs ("483036-pkg-27",
+      // "483036-addon-69516"); parseInt truncated them to the parent
+      // integer, collapsing both constituents onto one key and breaking
+      // every override save/lookup/render for packaged items. orderId
+      // stays an integer (always numeric).
+      const cartId = String(req.params.cartId);
       const { rerenderOriginal } = req.body || {};
 
       // Capture the override before deleting so we know what filename
@@ -3404,7 +3436,13 @@ router.post(
   async (req, res) => {
     try {
       const orderId = parseInt(req.params.orderId, 10);
-      const cartId = parseInt(req.params.cartId, 10);
+      // Phase 56: cartId is an OPAQUE STRING, never parseInt'd. Package
+      // constituents and addons have synthetic IDs ("483036-pkg-27",
+      // "483036-addon-69516"); parseInt truncated them to the parent
+      // integer, collapsing both constituents onto one key and breaking
+      // every override save/lookup/render for packaged items. orderId
+      // stays an integer (always numeric).
+      const cartId = String(req.params.cartId);
       const { mode } = req.body || {};
       if (mode !== 'overwrite' && mode !== 'reprint') {
         return res.status(400).json({
@@ -3455,11 +3493,26 @@ router.post(
   async (req, res) => {
     try {
       const orderId = parseInt(req.params.orderId, 10);
-      const cartId = parseInt(req.params.cartId, 10);
+      // Phase 56: cartId is an OPAQUE STRING, never parseInt'd. Package
+      // constituents and addons have synthetic IDs ("483036-pkg-27",
+      // "483036-addon-69516"); parseInt truncated them to the parent
+      // integer, collapsing both constituents onto one key and breaking
+      // every override save/lookup/render for packaged items. orderId
+      // stays an integer (always numeric).
+      const cartId = String(req.params.cartId);
       const slotIndex = parseInt(req.params.slotIndex, 10);
-      if (!Number.isInteger(orderId) || !Number.isInteger(cartId) || !Number.isInteger(slotIndex)) {
+      // Phase 56: cartId is an opaque string (may be a synthetic
+      // package/addon ID). It still must be a safe single path segment
+      // — [A-Za-z0-9_-] only — since it becomes a directory name under
+      // order-asset-overrides/. orderId & slotIndex remain integers.
+      if (
+        !Number.isInteger(orderId) ||
+        !Number.isInteger(slotIndex) ||
+        !/^[A-Za-z0-9_-]+$/.test(cartId)
+      ) {
         return res.status(400).json({
-          error: 'orderId, cartId, and slotIndex must all be integers',
+          error:
+            'orderId & slotIndex must be integers; cartId must be a safe path segment ([A-Za-z0-9_-], e.g. "482864" or "483036-pkg-27")',
         });
       }
       const { dataBase64, filename, slotKind } = req.body || {};
@@ -3530,11 +3583,26 @@ router.delete(
   async (req, res) => {
     try {
       const orderId = parseInt(req.params.orderId, 10);
-      const cartId = parseInt(req.params.cartId, 10);
+      // Phase 56: cartId is an OPAQUE STRING, never parseInt'd. Package
+      // constituents and addons have synthetic IDs ("483036-pkg-27",
+      // "483036-addon-69516"); parseInt truncated them to the parent
+      // integer, collapsing both constituents onto one key and breaking
+      // every override save/lookup/render for packaged items. orderId
+      // stays an integer (always numeric).
+      const cartId = String(req.params.cartId);
       const slotIndex = parseInt(req.params.slotIndex, 10);
-      if (!Number.isInteger(orderId) || !Number.isInteger(cartId) || !Number.isInteger(slotIndex)) {
+      // Phase 56: cartId is an opaque string (may be a synthetic
+      // package/addon ID). It still must be a safe single path segment
+      // — [A-Za-z0-9_-] only — since it becomes a directory name under
+      // order-asset-overrides/. orderId & slotIndex remain integers.
+      if (
+        !Number.isInteger(orderId) ||
+        !Number.isInteger(slotIndex) ||
+        !/^[A-Za-z0-9_-]+$/.test(cartId)
+      ) {
         return res.status(400).json({
-          error: 'orderId, cartId, and slotIndex must all be integers',
+          error:
+            'orderId & slotIndex must be integers; cartId must be a safe path segment ([A-Za-z0-9_-], e.g. "482864" or "483036-pkg-27")',
         });
       }
       const removed = await orderAssetOverrideService.deleteAsset({

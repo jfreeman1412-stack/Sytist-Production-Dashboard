@@ -80,6 +80,19 @@ class OrderOverrideService {
     this._db.pragma('journal_mode = WAL');
     this._db.pragma('foreign_keys = ON');
 
+    // Phase 56: `cart_id` is declared INTEGER but is bound as a STRING
+    // everywhere (get/upsert/delete/setReprintFilename). Cart IDs are
+    // NOT always integers — package constituents and addons have
+    // synthetic IDs like "483036-pkg-27" / "483036-addon-69516". We
+    // rely on SQLite column affinity: an INTEGER-affinity column stores
+    // a non-numeric string ("483036-pkg-27") as TEXT and normalizes a
+    // numeric string ("482864") to the integer 482864 on BOTH store and
+    // compare — so plain-int carts stay backward-compatible with rows
+    // written before Phase 56, and synthetic carts now key correctly.
+    // `order_id` is always a real integer and stays Number()-bound.
+    // (Pre-Phase-56, routes parseInt()'d cartId → synthetic IDs were
+    // truncated to the parent int, collapsing both constituents onto
+    // one row. Those old rows are unmigratable orphans — see SPEC §56.)
     this._db.exec(`
       CREATE TABLE IF NOT EXISTS order_overrides (
         order_id INTEGER NOT NULL,
@@ -157,7 +170,7 @@ class OrderOverrideService {
     this.init();
     const row = this._stmts.get.get(
       Number(orderId),
-      Number(cartId)
+      String(cartId)
     );
     if (!row) return null;
     return {
@@ -226,10 +239,10 @@ class OrderOverrideService {
   }) {
     this.init();
     const now = new Date().toISOString();
-    const existing = this._stmts.get.get(Number(orderId), Number(cartId));
+    const existing = this._stmts.get.get(Number(orderId), String(cartId));
     this._stmts.upsert.run({
       order_id: Number(orderId),
-      cart_id: Number(cartId),
+      cart_id: String(cartId),
       layout_id: String(layoutId),
       variant: String(variant),
       layout_snapshot: JSON.stringify(layoutSnapshot),
@@ -285,12 +298,12 @@ class OrderOverrideService {
   setReprintFilename(orderId, cartId, filename, { username = null } = {}) {
     this.init();
     const now = new Date().toISOString();
-    const existing = this._stmts.get.get(Number(orderId), Number(cartId));
+    const existing = this._stmts.get.get(Number(orderId), String(cartId));
     this._stmts.setReprintFilename.run(
       filename,
       now,
       Number(orderId),
-      Number(cartId)
+      String(cartId)
     );
     if (existing) {
       this._recordHistory({
@@ -320,10 +333,10 @@ class OrderOverrideService {
    */
   remove(orderId, cartId, { username = null } = {}) {
     this.init();
-    const existing = this._stmts.get.get(Number(orderId), Number(cartId));
+    const existing = this._stmts.get.get(Number(orderId), String(cartId));
     const result = this._stmts.delete.run(
       Number(orderId),
-      Number(cartId)
+      String(cartId)
     );
     if (result.changes > 0 && existing) {
       this._recordHistory({
