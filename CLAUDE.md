@@ -142,6 +142,7 @@ sytist-dashboard/
 - **Services own state**: cache reads/writes, database calls, external API calls all live in services.
 - **Failure modes for audit-style writes are non-blocking**: `ms_notes`, `order_status_audit`, thumbnail cache upserts. The action succeeds even if the audit write fails. The operator just doesn't see the side-effect entry.
 - **Override-feature verification must test BOTH the editor's Apply paths AND normal Process picking up Save-(no-render) overrides.** The two render paths are independent and one can silently regress — Phase 40 shipped the override UI without the pipeline wiring and Process ignored every saved override for months, unnoticed. Phase 52 unified layout/variant + image-override resolution behind `overrideRenderService`; Phase 56b unified output dir/filename/reprint-N + impose-in-place behind `printOutputService`. **Keep Apply and Process on these shared helpers — never reintroduce inline produce-output logic in `renderOverrideForOrder`.** Every divergence found this way (Process ignored overrides; Apply never imposed; Apply reprint-N collided; Apply wrote order-root not the folder-sort subdir) was an Apply-vs-Process drift.
+- **Verification plans must include at least one folder-sorted order AND at least one package order.** These exercise code paths that plain-integer single-photo orders don't, and have historically hidden bugs in cartId handling, output paths, and reprint numbering (Phase 56's four bugs all hid behind that gap). A green run on a simple order is not evidence the change is safe.
 - **`cartId` is an opaque string end-to-end — never `parseInt`/`Number` it.** Package constituents and addons have synthetic IDs (`483036-pkg-27`, `483036-addon-69516`); numeric coercion truncates them to the parent int and collapses/ misroutes everything keyed by cart. `orderId` is always a real integer (coerce that). `order_overrides.cart_id` is declared INTEGER but **bound as String** — SQLite affinity normalizes numeric strings to int (old plain-int rows still resolve) and stores synthetic IDs as TEXT; do not "fix" the column type or re-add coercion. `orderAssetOverrideService` gates cartId with `isSafeCartId` (`[A-Za-z0-9_-]`), not an integer check. (Phase 56a; pre-56 package/addon override rows are unmigratable orphans.)
 - **If a SKU's composite mapping has `chainToImposition`, the printed file is the imposed sheet — Apply must impose, not stop at the composite.** `printOutputService.produceFinalOutput` handles this for Apply; Process's Step 1.5/2 still does its own. A `chainToImposition` SKU with no imposition rule yields the bare composite at the photo-derived path (parity with Process) **plus** an `imposition_rule_missing` warning (returned and `console.warn`'d) — deliberate parity-plus-warning, not a hard-fail.
 
@@ -194,6 +195,8 @@ npm run dev
 Starts both server (port 3011) and client (port 3010) via `concurrently`. nodemon watches the server side. After installing new npm packages, a **full restart** (Ctrl+C, then `npm run dev`) is required — nodemon doesn't reliably reload newly-installed modules.
 
 The browser reloads on client changes; for full state reset use **Ctrl+Shift+R** (hard refresh).
+
+**For sessions involving real-order testing**, start the dev server with output teed to a log file so the agent can tail it. The plain `npm run dev` terminal has no log file — server stdout goes only to that interactive console, so the agent cannot follow it and is limited to log excerpts the operator pastes by hand. Instead run it so stdout+stderr land in `server.live.log` (e.g. `npm run dev *> server.live.log` in PowerShell, or pipe through `tee`), and add `server.live.log` to `.gitignore`. Set this up at the start of any session where the operator will process real orders for the agent to watch.
 
 ### Git on Windows
 
@@ -249,6 +252,10 @@ Reprints:
 - Skip ShipStation auto-create
 - Skip packing slip generation for single-item reprints
 - Insert `order_status_audit` row with `source='reprint'`
+
+### `Cache-Control: immutable` on mutable URLs
+
+`Cache-Control: immutable` is wrong for any URL whose bytes can change across deploys — composite/composed thumbnails, proxied photos, anything served from a stable key. `immutable` tells the browser never to revalidate, so a hotfix that changes the underlying image leaves operators staring at the stale one with no in-app way to bust it. Use `max-age` with revalidation instead (`public, max-age=3600, stale-while-revalidate=86400`). `immutable` is only safe when the URL itself changes whenever the content does (content-hashed or signed URLs). Phase 49 lost an afternoon to this.
 
 ### Smoke-test artifacts leak into output
 
