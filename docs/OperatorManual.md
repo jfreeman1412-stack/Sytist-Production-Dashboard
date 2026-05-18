@@ -102,7 +102,7 @@ Each row is one order with order number, date, customer, items summary, workflow
 
 ### Selecting orders
 
-Check the box on the left to multi-select. The action toolbar above the table activates when you have a selection — including **bulk Mark Shipped** for selected orders.
+Check the box on the left to multi-select. **Shift+click** a checkbox to select every row between it and the last one you checked (a whole block at once). The header checkbox selects/clears the whole page. The action toolbar above the table activates when you have a selection — including **bulk Mark Shipped** for selected orders.
 
 ---
 
@@ -194,6 +194,7 @@ Once on an order detail page:
 - Buttons stay within your current filter context
 - "Order N of M" indicator
 - **Back to list** preserves all filters
+- **Go to order #** box near the top — type any order number and press Go (or Enter) to jump straight there without going back to the list. This is a direct lookup, so it ignores the current filter (use Prev/Next to move within the filtered set)
 
 ---
 

@@ -1838,6 +1838,20 @@ Verified by a real Process/Reprint run (order 111118 cart 483792): `[Processing]
 
 ---
 
+## 54. Orders-list selection fix + shift-range + order-detail quick lookup
+
+Three small operator-UX items, no server changes. (§53 is intentionally absent here — Phase 53 is logged as a planned follow-up, not yet built; section numbers track shipped phases.)
+
+**1a — row checkbox was dead on direct click.** `OrderRow`'s checkbox had a no-op `onChange` that delegated selection to the wrapping `<td onClick>`, but the input *also* called `e.stopPropagation()` — which severed that delegation for the most common interaction (clicking the box itself). Net: only the thin `<td>` padding *around* the box toggled; clicking the checkbox did nothing. The header "select all" worked because it's a normal controlled checkbox (`onChange={onTogglePageSelection}`), which is why the operator could check the top one but no individual rows. Fix: make the row input a proper controlled checkbox — `onChange` drives selection directly; the `<td>` keeps `stopPropagation` so the checkbox still never triggers the row's open-order navigation (the click and change synthetic events are independent, so stopping the click bubble doesn't suppress the change).
+
+**1b — shift+click range select (new).** Was never implemented (`shiftKey` appeared nowhere). `toggleOrderSelected` now takes `(orderId, index, shiftKey)`; the input reads `e.nativeEvent.shiftKey`. A plain toggle flips one order and sets a row anchor (`lastSelectedIndex`); a shift+toggle selects the inclusive range between the anchor and the clicked row (file-explorer model — always *adds* the block, never deselects). The anchor is dropped on filter change and guarded against a stale/out-of-range index (degrades to a single toggle), so a range can never be computed across a different `orders` array.
+
+**2 — "Go to order #" on every order-detail page.** The order-lookup mechanism already existed but only on the not-found view. `NavStrip` now carries a small lookup form (same `navigate('/orders/<id>')` one-liner) so operators can jump to any order from any order-detail page without returning to the list. Deliberately a *fresh* lookup — no `filterParamsKey` appended — because typing an explicit order number is a context switch, not movement within the current filtered set (the prev/next pager already covers in-set movement).
+
+Files: `client/src/pages/OrdersListPage.js`, `client/src/pages/OrderDetailPage.js`.
+
+---
+
 ## Open follow-ups
 
 - ~~Identify the upstream "Sportsline UI" integration creating phantom SS orders.~~ **Identified during Phase 47 hotfix 2 diagnosis (2026-05-14)**: a separate processing tool used by operator Kirsten. Writes to Sytist directly (`note_who: "Kirsten"` with "Order Has been changed to Printing and Production" — distinct from our `"Sytist Dashboard: Order processed..."` prefix) and creates SS orders outside our pipeline. The ms_notes comparison showed our dashboard processed ~9 of 555 composite-mapped orders in the last 14 days; the other 546 went through Kirsten's tool. Phase 33's "adopt without push" already handles the coexistence pattern — no code change required. The remaining question is operational, not technical: should the dashboard become the primary tool, or stay a special-case path? Worth a conversation with Kirsten, not more code.
