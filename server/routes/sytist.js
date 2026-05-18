@@ -2028,8 +2028,17 @@ router.get('/imposition/preview/:orderId/:cartId', async (req, res) => {
     const order = await sytistDb.getOrderById(req.params.orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
-    const cartId = parseInt(req.params.cartId, 10);
-    const lineItem = (order.lineItems || []).find((li) => li.cartId === cartId);
+    // Phase 56a-addendum: cartId is an OPAQUE STRING (synthetic
+    // package/addon IDs like "483036-pkg-27"). parseInt truncated it to
+    // the parent int, then `li.cartId === cartId` strict-equality
+    // ("483036-pkg-27" === 483036) was always false → "line item not
+    // found", so the editor's imposition Preview/info/save was broken
+    // for every packaged item. Same root cause + fix as 56a's override
+    // & asset routes; this is the 3rd route family.
+    const cartId = String(req.params.cartId);
+    const lineItem = (order.lineItems || []).find(
+      (li) => String(li.cartId) === cartId
+    );
     if (!lineItem) {
       return res.status(404).json({ error: `Line item ${cartId} not found in order` });
     }
@@ -2138,8 +2147,17 @@ router.get('/imposition/preview/:orderId/:cartId/info', async (req, res) => {
     const order = await sytistDb.getOrderById(req.params.orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
-    const cartId = parseInt(req.params.cartId, 10);
-    const lineItem = (order.lineItems || []).find((li) => li.cartId === cartId);
+    // Phase 56a-addendum: cartId is an OPAQUE STRING (synthetic
+    // package/addon IDs like "483036-pkg-27"). parseInt truncated it to
+    // the parent int, then `li.cartId === cartId` strict-equality
+    // ("483036-pkg-27" === 483036) was always false → "line item not
+    // found", so the editor's imposition Preview/info/save was broken
+    // for every packaged item. Same root cause + fix as 56a's override
+    // & asset routes; this is the 3rd route family.
+    const cartId = String(req.params.cartId);
+    const lineItem = (order.lineItems || []).find(
+      (li) => String(li.cartId) === cartId
+    );
     if (!lineItem) {
       return res.status(404).json({ error: `Line item ${cartId} not found in order` });
     }
@@ -2220,8 +2238,17 @@ router.post('/imposition/preview/:orderId/:cartId/save', async (req, res) => {
     const order = await sytistDb.getOrderById(req.params.orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
-    const cartId = parseInt(req.params.cartId, 10);
-    const lineItem = (order.lineItems || []).find((li) => li.cartId === cartId);
+    // Phase 56a-addendum: cartId is an OPAQUE STRING (synthetic
+    // package/addon IDs like "483036-pkg-27"). parseInt truncated it to
+    // the parent int, then `li.cartId === cartId` strict-equality
+    // ("483036-pkg-27" === 483036) was always false → "line item not
+    // found", so the editor's imposition Preview/info/save was broken
+    // for every packaged item. Same root cause + fix as 56a's override
+    // & asset routes; this is the 3rd route family.
+    const cartId = String(req.params.cartId);
+    const lineItem = (order.lineItems || []).find(
+      (li) => String(li.cartId) === cartId
+    );
     if (!lineItem) {
       return res.status(404).json({ error: `Line item ${cartId} not found in order` });
     }

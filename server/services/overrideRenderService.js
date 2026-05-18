@@ -170,21 +170,21 @@ async function resolveLayoutAndVariant({
 async function applyImageOverrides({ orderId, cartId, layout, variant, buffers }) {
   const warnings = [];
   const out = { ...buffers };
-  // Coerce ids to Number at this shared boundary. The canonical order
-  // shape hands out orderId as a STRING (sytistDbService:
-  // `orderId: String(o.order_id)`), and cartId is a number for normal
-  // line items but a synthetic string ("<n>-addon-<id>" / "<n>-pkg-…")
-  // for package/addon carts. orderAssetOverrideService gates every
-  // read on Number.isInteger() as a path-escape guard and silently
-  // returns null for non-integers — so a string orderId made Process
-  // skip every image override (renderOverrideForOrder happened to pass
-  // parseInt'd numbers, which is why Apply worked and Process didn't).
-  // Coerce here, not by loosening the security gate. Synthetic cart
-  // ids → NaN → null → default fallback, which is correct: those
-  // carts can never have had an uploaded asset (saveAsset gates the
-  // same way), so there's nothing to apply.
+  // orderId: the canonical order shape hands it out as a STRING
+  // (sytistDbService `orderId: String(o.order_id)`) but it's always
+  // numeric, and orderAssetOverrideService gates it with isPositiveInt
+  // — so coerce to Number.
+  //
+  // cartId: Phase 56a-addendum — do NOT Number() this. The Phase 52
+  // version coerced cartId to Number because the asset service then
+  // integer-gated it; 56a replaced that gate with isSafeCartId, which
+  // accepts synthetic package/addon IDs ("483036-pkg-27"). Number()ing
+  // it now would re-truncate `483036-pkg-27` → NaN and silently skip
+  // the image override on the Process path — the exact 56a bug, just
+  // moved one layer in. Pass it through as the opaque string the rest
+  // of Phase 56 uses end-to-end.
   const oid = Number(orderId);
-  const cid = Number(cartId);
+  const cid = String(cartId);
   const slots = (layout && layout.variants && layout.variants[variant] && layout.variants[variant].slots) || [];
   for (let i = 0; i < slots.length; i++) {
     const slot = slots[i];
