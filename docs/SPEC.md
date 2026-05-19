@@ -1951,6 +1951,20 @@ Operational rate-savings change. Package weights are now **floored** to whole ou
 
 **No tests/fixtures asserted the old behavior**, so nothing to update. Verification path is the `[Packaging Trace]` server log — process any order with fractional weight; the trace now shows `Pre-rounding total: 3.7 oz` / `Floor rounding: -0.7 oz` / `FINAL: 3 oz` instead of the old ceiling output. Files: `server/services/packagingService.js`, `server/services/shipstationService.js`.
 
+### Hotfix: round-trip ounces ↔ grams must reverse-display ≥ the floor
+
+Caught in real-order verification (order 111920, processed against Phase 58 as originally shipped): the packaging trace correctly produced `FINAL: 4 oz`, but the ShipStation payload sent **113 g** and SS reverse-displayed it as **3.99 oz** and billed at the **3 oz tier**. That is the *exact failure mode* Phase 58's floor was meant to prevent — a real 4.6 oz package labelled 3.99 oz exceeds USPS's 1 oz grace at the 3 oz tier, surcharging the very order the floor was supposed to keep tier-safe. Phase 58 was undermining its own goal at the wire.
+
+**Root cause: the oz → g conversion used `Math.round`.** `4 × 28.3495 = 113.398` → `Math.round` = **113** g. Reversing for display: `113 / 28.3495 = 3.9859` → "3.99 oz". `Math.round` drops ~0.5 g at the whole-oz values where `oz × 28.3495` lands just over a half-gram boundary going up. Those values: **1, 4, 7, 10, 13, 15** oz — each reverse-displays as `.99` oz. The other whole-oz values (2, 3, 5, 6, 8, 9, 11, 12, 14 oz) happen to round identically under `Math.round` and `Math.ceil`, which is **why the offline verification harness missed it**: the SPEC §58 worked-example used `8 oz → 227 g`, which is one of the values where round and ceil agree. Real-order verification with a 4 oz order was what surfaced it.
+
+**Contract that must hold (now documented explicitly).** Phase 58's promise is "floor to whole ounces, bill at that tier." For that to survive the SS payload boundary the conversion direction must be: `oz → g` such that `g / OZ_TO_G >= oz_floor`. That is exactly `Math.ceil(oz × OZ_TO_G)`. `Math.round` violates the contract; `Math.floor` would as well; only `Math.ceil` guarantees the round-trip never undershoots.
+
+**Fix.** `Math.round` → `Math.ceil` at **both** `shipstationService` grams sites: per-item L585 (per-unit weight in grams) and order-level L660 (final order weight). Both sites also gained inline comments documenting the round-trip contract so future-me reading either call sees the rationale without digging here. The packaging-engine path is untouched — Phase 58's whole-oz floor in `packagingService._buildResult` already worked correctly; only the cross-unit boundary was wrong.
+
+**Tradeoff (bounded, conservative).** `Math.ceil` over-states each gram conversion by at most ~1 g. The per-item sum can exceed the order-level grams ceil by up to (N−1) g (~0.04 oz per item) for an N-item order; SS uses the per-item sum (it replaces the order weight with the line-item sum when any SKU has Product Defaults). For realistic orders this stays well within a whole-oz rate tier (a 6-item order would over-state by ~0.18 oz; the tier boundaries are whole oz). And the direction is the *correct* conservative side — SS sees slightly more than intended, never less. The alternative (proportional distribution so item sum equals order ceil exactly) is more code for sub-gram precision and isn't worth it.
+
+**Verification path.** Process any order whose floored total is one of `{1, 4, 7, 10, 13, 15}` oz and confirm ShipStation displays ≥ that value (e.g. 4.02 oz for a 4 oz floor, 15.03 oz for 15). Process an 8 oz order to confirm no regression at the round/ceil-agree values (grams stays 227, oz display stays 8). Files: `server/services/shipstationService.js`.
+
 ---
 
 ## 58a. Orders-list "Missing Logo" badge + Settings preselect

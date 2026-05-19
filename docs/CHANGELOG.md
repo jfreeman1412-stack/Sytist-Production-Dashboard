@@ -343,6 +343,15 @@ Format: phase number → short title → what shipped → key files touched.
 - Phase 57B per-variant composite-layout graphics doesn't interact — gallery logos are a separate per-gallery asset (`galleryAssetsService`). ESLint clean (3 pre-existing warnings unchanged)
 - Files: `client/src/pages/OrdersListPage.js`, `client/src/pages/settings/GalleryAssetsSettings.js`
 
+## Phase 58 hotfix — oz→g conversion must be `Math.ceil`, not `Math.round`
+- **Real-order regression caught processing order 111920.** Packaging trace correctly produced `FINAL: 4 oz`, but ShipStation sent `113 g` (= `Math.round(4 × 28.3495) = round(113.398)`) and SS reverse-displayed `113 / 28.3495 = 3.99 oz`, billing at the **3 oz tier** — the exact failure Phase 58's floor was meant to prevent (a real 4.6 oz package labelled 3.99 oz exceeds USPS's 1 oz grace at 3 oz tier)
+- **Whole-oz values affected:** 1, 4, 7, 10, 13, 15 oz (`Math.round` drops ~0.5 g, reverses to `.99`). 2/3/5/6/8/9/11/12/14 oz round identically under round and ceil — which is why the SPEC §58 worked-example (`8 oz → 227 g`) coincidentally passed and the offline harness missed this. Real-order verification surfaced it
+- **Contract now documented explicitly:** the `oz → g → oz` round-trip must reverse to **≥** the original whole-oz floor. Only `Math.ceil(oz × OZ_TO_G)` satisfies that; round/floor both violate it
+- **Fix:** `Math.round` → `Math.ceil` at both `shipstationService` grams sites (per-item L585 + order-level L660), with inline comments at each site documenting the round-trip contract so the rationale is visible at the call site
+- **Bounded overshoot tradeoff (acceptable):** per-item sum can exceed the order-level grams ceil by up to (N−1) g ≈ 0.04 oz/item; never crosses a whole-oz rate tier in practice; direction is conservative (SS sees slightly more than intended, never less). Proportional distribution would be more code for sub-gram precision — not worth it
+- **Verification:** process an order whose floored total is one of `{1, 4, 7, 10, 13, 15}` oz; SS should display ≥ that value (e.g. 4.02 oz / 15.03 oz). Process an 8 oz order to confirm no regression at the round/ceil-agree values (227 g, 8 oz display)
+- Files: `server/services/shipstationService.js`
+
 ---
 
 ## Reversed / removed
