@@ -24,6 +24,28 @@ export default function OrdersListPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
 
+  // Phase 58a: gallery-logo registry for the per-row "Missing Logo"
+  // badge. ONE fetch on mount; per-row checks are local against the
+  // map (the existing /gallery-assets/logos endpoint returns the full
+  // map — zero per-row HTTP, no API change). Soft-fail on error → no
+  // badges anywhere (matches the detail-page LogoWarningBanner's
+  // posture: false positives are worse than missed warnings).
+  const [galleryLogos, setGalleryLogos] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .get('/api/sytist/gallery-assets/logos')
+      .then((r) => {
+        if (!cancelled) setGalleryLogos(r?.logos || {});
+      })
+      .catch(() => {
+        if (!cancelled) setGalleryLogos(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Read filter state from URL with defaults.
   const workflow = searchParams.get('workflow') || 'all';
   const productionStatus = searchParams.get('productionStatus') || '0';
@@ -1062,6 +1084,7 @@ export default function OrdersListPage() {
 
           <OrdersTable
             orders={orders}
+            galleryLogos={galleryLogos}
             subGalleryFilter={subGalleryId ? parseInt(subGalleryId, 10) : null}
             selectedOrderIds={selectedOrderIds}
             onToggleSelected={toggleOrderSelected}
@@ -1175,6 +1198,7 @@ const selectStyle = {
 
 function OrdersTable({
   orders,
+  galleryLogos,
   subGalleryFilter,
   selectedOrderIds,
   onToggleSelected,
@@ -1240,6 +1264,7 @@ function OrdersTable({
             <OrderRow
               key={o.orderId}
               order={o}
+              galleryLogos={galleryLogos}
               subGalleryFilter={subGalleryFilter}
               isSelected={selectedOrderIds?.has(o.orderId) || false}
               onToggleSelected={(shiftKey) =>
@@ -1270,7 +1295,7 @@ function Th({ children, align = 'left' }) {
   );
 }
 
-function OrderRow({ order, subGalleryFilter, isSelected, onToggleSelected, onClick }) {
+function OrderRow({ order, galleryLogos, subGalleryFilter, isSelected, onToggleSelected, onClick }) {
   // Subject = first non-empty subject field (typically athlete name)
   const subjectName =
     (order.subject?.fields || []).find((f) => f.value)?.value || '—';
@@ -1346,8 +1371,27 @@ function OrderRow({ order, subGalleryFilter, isSelected, onToggleSelected, onCli
       </td>
       <td style={{ padding: '10px 12px' }}>{subjectName}</td>
       <td style={{ padding: '10px 12px' }}>
-        <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-          {order.galleryName || '—'}
+        <div
+          style={{
+            fontSize: 12,
+            color: 'var(--text-muted)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            flexWrap: 'wrap',
+          }}
+        >
+          <span>{order.galleryName || '—'}</span>
+          {/* Phase 58a: "Missing Logo" badge — same detection as the
+              order-detail LogoWarningBanner, surfaced earlier so the
+              operator catches it before clicking into detail. Soft-fail:
+              no badge when galleryId === 0 (no primary gallery) or the
+              registry hasn't loaded / failed to load. */}
+          {galleryLogos &&
+            order.galleryId > 0 &&
+            !galleryLogos[order.galleryId] && (
+              <MissingLogoBadge galleryId={order.galleryId} />
+            )}
         </div>
         <div style={{ fontSize: 13, display: 'flex', alignItems: 'center', gap: 6 }}>
           <span>{order.subGalleryName || '—'}</span>
@@ -1405,6 +1449,48 @@ function OrderRow({ order, subGalleryFilter, isSelected, onToggleSelected, onCli
         ${(order.totals?.total || 0).toFixed(2)}
       </td>
     </tr>
+  );
+}
+
+// Phase 58a: per-row badge that surfaces the same "no logo set for
+// this gallery" condition the order-detail LogoWarningBanner shows —
+// earlier in the workflow so operators catch it during batch-
+// processing decisions. Clicking jumps to Settings → Gallery Assets
+// with ?galleryId=<id> so LogosSection pre-selects this gallery in the
+// uploader (one click to the right control instead of manual scroll).
+function MissingLogoBadge({ galleryId }) {
+  const navigate = useNavigate();
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        // Stop the row's onClick (which navigates to order detail).
+        e.stopPropagation();
+        navigate(
+          `/settings/gallery-assets?galleryId=${encodeURIComponent(galleryId)}`
+        );
+      }}
+      title="No logo set for this gallery — click to upload"
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 4,
+        padding: '2px 8px',
+        background: 'rgba(220,53,69,0.12)',
+        color: '#dc3545',
+        border: '1px solid rgba(220,53,69,0.4)',
+        borderRadius: 10,
+        fontSize: 11,
+        fontWeight: 600,
+        whiteSpace: 'nowrap',
+        cursor: 'pointer',
+        fontFamily: 'inherit',
+        lineHeight: 1.2,
+      }}
+    >
+      <span>⚠</span>
+      <span>Missing Logo</span>
+    </button>
   );
 }
 

@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import api from '../../services/api';
 import {
   PageHeader,
@@ -519,6 +520,24 @@ function LogosSection({ galleries, galleriesLoading }) {
   const [file, setFile] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [status, setStatus] = useState(null);
+
+  // Phase 58a: honour ?galleryId=<id> in the URL (e.g. from the orders-
+  // list "Missing Logo" badge click) — preselect that gallery in the
+  // uploader dropdown so the operator lands at the upload control for
+  // that specific gallery instead of the empty default. Gated on
+  // `galleryId === ''` so we only auto-apply while the dropdown is
+  // still untouched; manual operator selection is never overridden.
+  const [searchParams] = useSearchParams();
+  useEffect(() => {
+    if (galleriesLoading || galleries.length === 0) return;
+    if (galleryId !== '') return;
+    const paramId = searchParams.get('galleryId');
+    if (!paramId) return;
+    const exists = galleries.some(
+      (g) => String(g.galleryId) === String(paramId)
+    );
+    if (exists) setGalleryId(String(paramId));
+  }, [galleries, galleriesLoading, searchParams, galleryId]);
 
   async function loadLogos() {
     setLoadingLogos(true);
