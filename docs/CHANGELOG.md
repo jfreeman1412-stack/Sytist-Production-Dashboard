@@ -309,6 +309,14 @@ Format: phase number → short title → what shipped → key files touched.
 - **Operator action:** package/addon overrides created before Phase 56 are inert orphans (unmigratable) — re-create them in the editor. Apply output now lands in the folder-sort subdir (was order root for folder-sorted orders)
 - 19/19 + regression offline assertions (incl. the reprint-collision case). Files: `server/services/printOutputService.js` (new), `orderOverrideService.js`, `orderAssetOverrideService.js`, `overrideRenderService.js`, `processingService.js`, `server/routes/sytist.js`
 
+## Phase 57A — Composite-layout variant split: foundation (schema migration + render fallback + verification)
+- Goal: vertical/horizontal become fully independent designs (own canvas/dpi/background/graphics/slots), not shared-root variants. Option Y (copy props into variants; root retained as deprecated fallback) chosen over Option X (first-class split layouts) — Y leaves the Phase 52/56 override-snapshot contract untouched and keeps existing layouts/overrides byte-identical until intentionally diverged
+- `compositeService.buildSheetBuffer`: `dpi`/`sheetWidth`/`sheetHeight`/`backgroundColor` resolve `variantDef.X` → deprecated `layout.X` root → original default; fallback operators preserved so un-diverged variants render byte-identical to pre-57. Graphics-map read deferred to 57B (it lives outside compositeService on the Phase-56 render path)
+- New `scripts/migrate-layout-variant-copydown.js`: pure transform + CLI (`--dry-run`/`--check`); copies the 5 root keys into each ≥1-slot variant only if not already owned; non-destructive, idempotent, atomic (tmp+rename), never fabricates an empty/absent variant (preserves pickVariant vertical-only fallback)
+- New `scripts/verify-layout-variant-copydown.js` (ship gate): 13/13 populated (layout,variant) render cases byte-identical pre vs post + structural invariants + per-layout & doc-level double-run idempotency; exit-coded. 13 = 10 vertical-only + 3 both-variant×2; empty/absent variants aren't renderable by design and are structurally asserted untouched — no scope reduction (an earlier "16" was an arithmetic slip in scoping prose)
+- Invisible to operators. Live migration is a separate operator step run right after push so the soak exercises the migrated path. Phase 57B (planned): designer write-target flip + copy-on-write UX + own/inherit badges + banner with both counts + graphics-read switch + operator docs
+- Files: `server/services/compositeService.js`, `server/scripts/migrate-layout-variant-copydown.js` (new), `server/scripts/verify-layout-variant-copydown.js` (new)
+
 ---
 
 ## Reversed / removed
