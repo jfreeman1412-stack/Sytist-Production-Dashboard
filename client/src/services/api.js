@@ -147,8 +147,14 @@ const api = {
   put(path, body) {
     return _fetch(path, { method: 'PUT', body: JSON.stringify(body) });
   },
-  del(path) {
-    return _fetch(path, { method: 'DELETE' });
+  del(path, body) {
+    // Phase 57B: optional JSON body on DELETE (per-variant graphic
+    // delete sends { variant }). Backward-compatible — existing
+    // bodyless del(path) calls are unchanged.
+    return _fetch(path, {
+      method: 'DELETE',
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
   },
 
   /**

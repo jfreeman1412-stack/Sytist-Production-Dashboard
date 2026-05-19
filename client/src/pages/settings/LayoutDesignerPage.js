@@ -104,15 +104,21 @@ export default function LayoutDesignerPage() {
   // refresh so <img> URLs include a cache-busting suffix and re-uploads
   // at the same key show fresh.
   const [graphicsLibrary, setGraphicsLibrary] = useState([]);
+  // Phase 57B: graphics are per-variant. graphicsLibrary holds the
+  // ACTIVE variant's own (namespaced) graphics; legacyGraphics holds
+  // the deprecated root map the server returns separately so we can
+  // render the read-only "Shared (legacy)" group.
+  const [legacyGraphics, setLegacyGraphics] = useState([]);
   const [graphicsBust, setGraphicsBust] = useState(0);
   const [graphicsError, setGraphicsError] = useState(null);
 
   async function loadGraphicsLibrary() {
     try {
       const r = await api.get(
-        `/api/sytist/composite/layouts/${encodeURIComponent(layoutId)}/graphics`
+        `/api/sytist/composite/layouts/${encodeURIComponent(layoutId)}/graphics?variant=${encodeURIComponent(variant)}`
       );
       setGraphicsLibrary(r.graphics || []);
+      setLegacyGraphics(r.legacyShared || []);
       setGraphicsBust((b) => b + 1);
       setGraphicsError(null);
     } catch (err) {
@@ -193,6 +199,10 @@ export default function LayoutDesignerPage() {
   // Reset selection when variant changes (slot indices are per-variant)
   useEffect(() => {
     setSelectedIndex(null);
+    // Phase 57B: graphics are per-variant — reload the library scoped to
+    // the now-active variant (and its legacy/shared group).
+    if (layoutId) loadGraphicsLibrary().catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [variant]);
 
   // ─── Dirty tracking + beforeunload guard ────────────────
@@ -554,31 +564,52 @@ export default function LayoutDesignerPage() {
   // via the library section.
 
   async function handleUploadGraphic({ key, filename, dataBase64 }) {
+    // Phase 57B: graphics are per-variant. Namespace the key so the
+    // active variant owns it and it can't collide with the other
+    // variant's same-named asset in the shared on-disk bucket. The
+    // server validates this prefix and writes variants[variant].graphics.
+    const namespacedKey = key.startsWith(variant + '__')
+      ? key
+      : `${variant}__${key}`;
     const r = await api.post(
-      `/api/sytist/composite/layouts/${encodeURIComponent(layoutId)}/graphics/${encodeURIComponent(key)}`,
-      { dataBase64, filename }
+      `/api/sytist/composite/layouts/${encodeURIComponent(layoutId)}/graphics/${encodeURIComponent(namespacedKey)}`,
+      { dataBase64, filename, variant }
     );
-    // The server already updated layout.graphics — refresh the layout
-    // so our in-memory copy includes the new entry. We MERGE rather
-    // than replace so any unsaved slot edits aren't blown away.
+    // Decision A: adopt ONLY the active variant's graphics map from the
+    // server, preserving local slot/meta edits and EVERY other variant.
+    // Same "uploads aren't unsaved changes, slot edits are" contract,
+    // scoped to the variant.
     try {
       const fresh = await api.get(
         `/api/sytist/composite/layouts/${encodeURIComponent(layoutId)}`
       );
+      const freshVarGraphics =
+        (fresh.variants &&
+          fresh.variants[variant] &&
+          fresh.variants[variant].graphics) ||
+        {};
       setLayout((prev) => {
         if (!prev) return fresh;
-        // Keep the local slots/variants/meta — only adopt the new
-        // graphics map from the server
-        return { ...prev, graphics: fresh.graphics || {} };
+        const prevVar = (prev.variants && prev.variants[variant]) || {
+          slots: [],
+        };
+        return {
+          ...prev,
+          variants: {
+            ...(prev.variants || {}),
+            [variant]: { ...prevVar, graphics: freshVarGraphics },
+          },
+        };
       });
-      // The originalJson should reflect the post-upload state of the
-      // graphics map. Otherwise, isDirty would flip true just because
-      // the graphics entry got added.
       setOriginalJson((prev) => {
         if (!prev) return JSON.stringify(fresh);
         try {
           const o = JSON.parse(prev);
-          o.graphics = fresh.graphics || {};
+          o.variants = o.variants || {};
+          o.variants[variant] = {
+            ...(o.variants[variant] || { slots: [] }),
+            graphics: freshVarGraphics,
+          };
           return JSON.stringify(o);
         } catch {
           return JSON.stringify(fresh);
@@ -588,34 +619,57 @@ export default function LayoutDesignerPage() {
       // Non-fatal — library list refresh below still works
     }
     await loadGraphicsLibrary();
-    return r;
+    return { ...r, namespacedKey };
   }
 
   async function handleDeleteGraphic(key) {
     if (
       !window.confirm(
-        `Delete graphic "${key}" from this layout? Any slots that reference it will show a "missing graphic" warning until updated.`
+        `Delete graphic "${key}" from the ${variant} variant? Slots that reference it will show a "missing graphic" warning until updated.`
       )
     ) {
       return;
     }
+    // Phase 57B: per-variant delete. key is the variant's own namespaced
+    // key (from the library list / slot picker); the server validates
+    // the prefix and removes only variants[variant].graphics[key].
     await api.del(
-      `/api/sytist/composite/layouts/${encodeURIComponent(layoutId)}/graphics/${encodeURIComponent(key)}`
+      `/api/sytist/composite/layouts/${encodeURIComponent(layoutId)}/graphics/${encodeURIComponent(key)}`,
+      { variant }
     );
-    // Same merge pattern — adopt the server's graphics map, keep local
-    // slot edits
+    // Decision A: same per-variant adopt as upload — keep local slot/meta
+    // edits and every other variant.
     try {
       const fresh = await api.get(
         `/api/sytist/composite/layouts/${encodeURIComponent(layoutId)}`
       );
-      setLayout((prev) =>
-        prev ? { ...prev, graphics: fresh.graphics || {} } : fresh
-      );
+      const freshVarGraphics =
+        (fresh.variants &&
+          fresh.variants[variant] &&
+          fresh.variants[variant].graphics) ||
+        {};
+      setLayout((prev) => {
+        if (!prev) return fresh;
+        const prevVar = (prev.variants && prev.variants[variant]) || {
+          slots: [],
+        };
+        return {
+          ...prev,
+          variants: {
+            ...(prev.variants || {}),
+            [variant]: { ...prevVar, graphics: freshVarGraphics },
+          },
+        };
+      });
       setOriginalJson((prev) => {
         if (!prev) return JSON.stringify(fresh);
         try {
           const o = JSON.parse(prev);
-          o.graphics = fresh.graphics || {};
+          o.variants = o.variants || {};
+          o.variants[variant] = {
+            ...(o.variants[variant] || { slots: [] }),
+            graphics: freshVarGraphics,
+          };
           return JSON.stringify(o);
         } catch {
           return JSON.stringify(fresh);
@@ -718,8 +772,13 @@ export default function LayoutDesignerPage() {
   // ones, breaking React's internal hook tracking.
   const graphicsUrls = useMemo(() => {
     const out = {};
-    for (const g of graphicsLibrary || []) {
+    // Phase 57B: include the legacy/shared (root) graphics too so slots
+    // still referencing a legacy key keep rendering their thumbnail.
+    // Variant-own entries take precedence on key collision.
+    const all = [...(graphicsLibrary || []), ...(legacyGraphics || [])];
+    for (const g of all) {
       if (g.onDisk === false) continue;
+      if (out[g.key]) continue;
       // Use uploadedAt + size as the buster; fall back to graphicsBust
       // counter if the metadata isn't present
       const bust = g.uploadedAt
@@ -729,7 +788,23 @@ export default function LayoutDesignerPage() {
         `/api/sytist/composite/layouts/${encodeURIComponent(layoutId)}/graphics/${encodeURIComponent(g.key)}/preview?v=${bust}`;
     }
     return out;
-  }, [graphicsLibrary, graphicsBust, layoutId]);
+  }, [graphicsLibrary, legacyGraphics, graphicsBust, layoutId]);
+
+  // Phase 57B (decision B — per-key divergence): a legacy/shared graphic
+  // is hidden from the active variant's library ONLY when that variant
+  // has its own entry with the same BASE name (the variant key minus
+  // the `${variant}__` prefix). Replacing one legacy asset never hides
+  // the others the operator is still using.
+  const visibleLegacyGraphics = useMemo(() => {
+    const ownBaseNames = new Set(
+      (graphicsLibrary || []).map((g) =>
+        g.key.startsWith(variant + '__')
+          ? g.key.slice(variant.length + 2)
+          : g.key
+      )
+    );
+    return (legacyGraphics || []).filter((g) => !ownBaseNames.has(g.key));
+  }, [graphicsLibrary, legacyGraphics, variant]);
 
   // Phase 26: responsive canvas sizing. The ref + state + effect
   // MUST be declared before any early returns below, otherwise
@@ -918,7 +993,9 @@ export default function LayoutDesignerPage() {
           />
           <GraphicsLibrarySection
             layoutId={layoutId}
+            variant={variant}
             graphicsLibrary={graphicsLibrary}
+            legacyGraphics={visibleLegacyGraphics}
             graphicsBust={graphicsBust}
             graphicsError={graphicsError}
             onUpload={handleUploadGraphic}
@@ -941,7 +1018,9 @@ export default function LayoutDesignerPage() {
             onAdd={handleAddSlot}
             disabled={!variantDef}
             layoutId={layoutId}
+            variant={variant}
             graphicsLibrary={graphicsLibrary}
+            legacyGraphics={legacyGraphics}
             onUploadGraphic={handleUploadGraphic}
             graphicsBust={graphicsBust}
             hiddenSlots={hiddenSlots}
@@ -1393,7 +1472,9 @@ function SlotEditorBody({
   onChange,
   // Phase 9c: graphics library context for staticGraphic slots
   layoutId,
+  variant,
   graphicsLibrary,
+  legacyGraphics,
   onUploadGraphic,
   graphicsBust,
 }) {
@@ -1503,7 +1584,9 @@ function SlotEditorBody({
         <StaticGraphicSlotEditor
           slot={slot}
           layoutId={layoutId}
+          variant={variant}
           graphicsLibrary={graphicsLibrary}
+          legacyGraphics={legacyGraphics}
           onUploadGraphic={onUploadGraphic}
           onChange={update}
           graphicsBust={graphicsBust}
@@ -1789,7 +1872,9 @@ function TextSlotContent({ slot, update }) {
 function StaticGraphicSlotEditor({
   slot,
   layoutId,
+  variant,
   graphicsLibrary,
+  legacyGraphics,
   onUploadGraphic,
   onChange,
   graphicsBust,
@@ -1852,14 +1937,15 @@ function StaticGraphicSlotEditor({
         r.readAsDataURL(file);
       });
 
-      await onUploadGraphic({
+      // Phase 57B: the server stores under a variant-namespaced key;
+      // point the slot at THAT key so render resolution finds it.
+      const up = await onUploadGraphic({
         key,
         filename: file.name,
         dataBase64,
       });
 
-      // Set the slot's graphic key to whatever we just uploaded
-      onChange('graphicKey', key);
+      onChange('graphicKey', (up && up.namespacedKey) || key);
       if (slot.overlayId) onChange('overlayId', undefined);
     } catch (err) {
       setUploadError(err.message || 'Upload failed');
@@ -1873,9 +1959,12 @@ function StaticGraphicSlotEditor({
   // Build the preview URL for the currently-referenced graphic.
   // Phase 9e-hotfix2: cache-bust with the file's uploadedAt+size from
   // the library entry, falling back to the graphicsBust counter.
-  const currentLibEntry = (graphicsLibrary || []).find(
-    (g) => g.key === currentKey
-  );
+  // Phase 57B: a slot may reference a variant-own (namespaced) key or a
+  // legacy/shared key — search both for the preview cache-buster.
+  const currentLibEntry = [
+    ...(graphicsLibrary || []),
+    ...(legacyGraphics || []),
+  ].find((g) => g.key === currentKey);
   const previewBust =
     currentLibEntry && currentLibEntry.uploadedAt
       ? encodeURIComponent(currentLibEntry.uploadedAt) +
@@ -1887,11 +1976,13 @@ function StaticGraphicSlotEditor({
       ? `/api/sytist/composite/layouts/${encodeURIComponent(layoutId)}/graphics/${encodeURIComponent(currentKey)}/preview?v=${previewBust}`
       : null;
 
-  // Library entries — exclude the currently-selected one from the
-  // dropdown options for clarity (but show it as "current" if set)
+  // Phase 57B: the picker offers this variant's own graphics first,
+  // then a labelled "shared (legacy)" group (decision C — legacy stays
+  // selectable so an existing slot can still point at a root graphic).
   const libraryEntries = (graphicsLibrary || []).filter(
     (g) => g.onDisk !== false
   );
+  const legacyEntries = legacyGraphics || [];
 
   return (
     <div
@@ -1928,10 +2019,10 @@ function StaticGraphicSlotEditor({
         />
       </FormRow>
 
-      {libraryEntries.length > 0 && (
+      {(libraryEntries.length > 0 || legacyEntries.length > 0) && (
         <FormRow
           label="Pick from library"
-          hint="Quickly reference an already-uploaded graphic in this layout."
+          hint={`This ${variant || ''} variant's graphics, then shared (legacy) ones.`}
         >
           <Select
             value=""
@@ -1942,6 +2033,19 @@ function StaticGraphicSlotEditor({
                 value: g.key,
                 label: `${g.key} (${g.mimeType?.replace('image/', '') || '?'}, ${formatBytes(g.sizeBytes)})`,
               })),
+              ...(legacyEntries.length > 0
+                ? [
+                    {
+                      value: '',
+                      label: '──── shared (legacy) ────',
+                      disabled: true,
+                    },
+                    ...legacyEntries.map((g) => ({
+                      value: g.key,
+                      label: `(legacy) ${g.key} (${g.mimeType?.replace('image/', '') || '?'}, ${formatBytes(g.sizeBytes)})`,
+                    })),
+                  ]
+                : []),
             ]}
           />
         </FormRow>
@@ -2070,7 +2174,9 @@ function fmt(n) {
 
 function GraphicsLibrarySection({
   layoutId,
+  variant,
   graphicsLibrary,
+  legacyGraphics,
   graphicsBust,
   graphicsError,
   onUpload,
@@ -2122,11 +2228,11 @@ function GraphicsLibrarySection({
 
   return (
     <Section
-      title={`Graphics library (${(graphicsLibrary || []).length})`}
+      title={`Graphics library — ${variant || ''} (${(graphicsLibrary || []).length})`}
       description={
         collapsed
           ? null
-          : 'Uploaded graphics for this layout. Slots reference them by key.'
+          : `This ${variant || ''} variant's own graphics. Uploads land in this variant; shared (legacy) graphics below are read-only and disappear here once this variant has its own version.`
       }
       actions={
         <Button variant="ghost" onClick={() => setCollapsed((v) => !v)}>
@@ -2217,7 +2323,7 @@ function GraphicsLibrarySection({
                 fontSize: 12,
               }}
             >
-              No graphics uploaded yet.
+              No graphics for this {variant || ''} variant yet.
             </div>
           ) : (
             <div
@@ -2239,13 +2345,53 @@ function GraphicsLibrarySection({
               ))}
             </div>
           )}
+
+          {/* Phase 57B (decision B+C): read-only shared/legacy group —
+              root graphics not yet replaced for THIS variant. Each entry
+              disappears individually once this variant uploads its own
+              same-base-name version. Never deletable from here. */}
+          {(legacyGraphics || []).length > 0 && (
+            <div style={{ marginTop: 14 }}>
+              <div
+                style={{
+                  fontSize: 10,
+                  fontWeight: 600,
+                  textTransform: 'uppercase',
+                  letterSpacing: 0.5,
+                  color: 'var(--text-muted)',
+                  marginBottom: 6,
+                }}
+              >
+                Shared (legacy) — read-only
+              </div>
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns:
+                    'repeat(auto-fill, minmax(120px, 1fr))',
+                  gap: 8,
+                  opacity: 0.85,
+                }}
+              >
+                {legacyGraphics.map((g) => (
+                  <GraphicLibraryThumb
+                    key={`legacy-${g.key}`}
+                    layoutId={layoutId}
+                    graphic={g}
+                    bust={graphicsBust}
+                    readOnly
+                  />
+                ))}
+              </div>
+            </div>
+          )}
         </>
       )}
     </Section>
   );
 }
 
-function GraphicLibraryThumb({ layoutId, graphic, bust, onDelete }) {
+function GraphicLibraryThumb({ layoutId, graphic, bust, onDelete, readOnly }) {
   // Phase 9e-hotfix2: prefer uploadedAt+size as cache buster — changes
   // only when the file changes. Falls back to the bust counter.
   const effectiveBust = graphic.uploadedAt
@@ -2302,9 +2448,21 @@ function GraphicLibraryThumb({ layoutId, graphic, bust, onDelete }) {
       >
         {graphic.mimeType?.replace('image/', '') || '?'} · {formatBytes(graphic.sizeBytes)}
       </div>
-      <Button variant="danger" onClick={onDelete}>
-        Delete
-      </Button>
+      {readOnly ? (
+        <div
+          style={{
+            fontSize: 9,
+            color: 'var(--text-muted)',
+            fontStyle: 'italic',
+          }}
+        >
+          shared (legacy)
+        </div>
+      ) : (
+        <Button variant="danger" onClick={onDelete}>
+          Delete
+        </Button>
+      )}
     </div>
   );
 }
@@ -2553,7 +2711,9 @@ function LayersPanel({
   disabled,
   // Phase 9c: graphics library for staticGraphic slot editing
   layoutId,
+  variant,
   graphicsLibrary,
+  legacyGraphics,
   onUploadGraphic,
   graphicsBust,
   // Phase 9e: per-slot hide/lock state + togglers
@@ -2757,7 +2917,9 @@ function LayersPanel({
                 onDragEnd={handleDragEnd}
                 onDrop={(e) => handleDrop(e, jsonIndex)}
                 layoutId={layoutId}
+                variant={variant}
                 graphicsLibrary={graphicsLibrary}
+                legacyGraphics={legacyGraphics}
                 onUploadGraphic={onUploadGraphic}
                 graphicsBust={graphicsBust}
                 isHidden={!!(hiddenSlots && hiddenSlots[jsonIndex])}
@@ -2801,7 +2963,9 @@ function LayerCard({
   onDrop,
   // Phase 9c
   layoutId,
+  variant,
   graphicsLibrary,
+  legacyGraphics,
   onUploadGraphic,
   graphicsBust,
   // Phase 9e
@@ -3083,7 +3247,9 @@ function LayerCard({
               sheetHeight={sheetHeight}
               onChange={onChange}
               layoutId={layoutId}
+              variant={variant}
               graphicsLibrary={graphicsLibrary}
+              legacyGraphics={legacyGraphics}
               onUploadGraphic={onUploadGraphic}
               graphicsBust={graphicsBust}
             />
