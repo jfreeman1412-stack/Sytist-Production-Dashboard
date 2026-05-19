@@ -580,9 +580,19 @@ class ShipStationService {
       // Per-unit weight in grams. Engine gives us LINE total (qty×unit)
       // so divide back out first. Use grams because SS truncates
       // fractional ounces per line when summing.
+      //
+      // Phase 58 hotfix: `Math.ceil`, not `Math.round`. The round-trip
+      // contract is "oz → g → oz must reverse to ≥ the original oz"
+      // (otherwise Phase 58's floor is silently undone: e.g. 4 oz ×
+      // 28.3495 = 113.398 → round 113 → SS reverse 113 / 28.3495 =
+      // 3.99 oz, bills at the 3 oz tier — the opposite of what the
+      // floor was for). Ceil guarantees the reverse direction at the
+      // cost of ≤1 g per item; the per-item sum can exceed the order-
+      // level grams ceil by up to (N-1) g (~0.04 oz/item), bounded
+      // well within whole-oz rate tiers.
       if (lineWeightOz !== undefined && qty > 0) {
         const unitWeightOz = lineWeightOz / qty;
-        const unitWeightG = Math.max(1, Math.round(unitWeightOz * OZ_TO_G));
+        const unitWeightG = Math.max(1, Math.ceil(unitWeightOz * OZ_TO_G));
         payload.weight = { value: unitWeightG, units: 'grams' };
       }
 
@@ -656,8 +666,15 @@ class ShipStationService {
     // floored upstream; this idempotently re-floors there and catches
     // the operator-override and no-engine fallback so the rule really
     // is universal at the SS payload boundary.
+    //
+    // Phase 58 hotfix: `Math.ceil`, not `Math.round`, for the grams
+    // conversion. Round-trip contract: oz → g → oz must reverse to ≥
+    // the original whole-oz floor. With round, values like 4 / 7 / 10
+    // / 13 / 15 oz undershoot by ~0.5 g and SS reverse-displayed them
+    // as 3.99 / 6.99 / 9.99 / 12.99 / 14.99 — billing at the LOWER
+    // tier, the exact failure Phase 58's floor was meant to prevent.
     weightOz = Math.max(1, Math.floor(weightOz));
-    const weightG = Math.max(1, Math.round(weightOz * OZ_TO_G));
+    const weightG = Math.max(1, Math.ceil(weightOz * OZ_TO_G));
 
     // Dimensions resolution: overrides > engine > app-settings.
     let dimensions;
