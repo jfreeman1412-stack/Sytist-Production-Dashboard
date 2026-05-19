@@ -43,8 +43,16 @@
 // with that sum when any line-item SKU has Product Defaults stored
 // in SS. To stay correct in that case, the engine emits per-item
 // weights (in oz) totaling exactly the order weight. The packaging
-// baseWeight + ceiling-rounding remainder gets rolled onto the
-// first non-digital line item so the math works out exactly.
+// baseWeight + the floor-rounding delta gets rolled onto the first
+// non-digital line item so the math works out exactly.
+//
+// Phase 58: weights are FLOORED to whole oz (Math.max(1, Math.floor)),
+// not ceiled. USPS gives a 1oz grace per package, so an 8.7oz package
+// labeled 8oz is safe and saves a rate tier. The delta is negative
+// (we shed the fractional bit) — the absorbing item gets
+// `+baseWeight − |fraction|` instead of `+baseWeight + |fraction|`.
+// `_buildItemWeights` clamps the absorbing item to ≥1oz so a
+// degenerate baseWeight=0 config can't drive it negative.
 
 const fs = require('fs');
 const fsp = fs.promises;
@@ -445,7 +453,7 @@ class PackagingService {
     // Phase 13b hotfix #2: also build a structured weightBreakdown
     // so the operator can audit the math. The engine reports both
     // the final total AND every component that went into it — items,
-    // slip, mailer baseWeight, ceiling rounding. This is the data
+    // slip, mailer baseWeight, rounding delta. This is the data
     // backing the Test Calculator's "Weight breakdown" panel and
     // the [Packaging Trace] server log.
     const weightBreakdown = {
@@ -455,8 +463,8 @@ class PackagingService {
       packagingBaseWeightOz: 0,
       packagingTypeId: null,   // populated by _buildResult
       packagingTypeName: null, // populated by _buildResult
-      preCeilingOz: 0,         // populated by _buildResult
-      ceilingRemainderOz: 0,   // populated by _buildResult
+      preRoundingOz: 0,        // populated by _buildResult
+      roundingDeltaOz: 0,      // populated by _buildResult — sign-carrying (negative under Phase 58 floor)
       finalOz: 0,              // populated by _buildResult
     };
 
@@ -881,10 +889,18 @@ class PackagingService {
     }
 
     // Sum mismatch → roll the remainder onto the first physical item.
+    // Phase 58 (floor): the remainder can be NEGATIVE — we floored the
+    // target below items+baseWeight — so the absorber loses the
+    // fractional bit. Clamp to ≥1oz so a degenerate baseWeight=0
+    // config can't drive a single-item order negative. With realistic
+    // baseWeights (≥1.5oz for flat_6x8, larger for boxes) the
+    // negative-remainder magnitude is bounded by ~1oz and the absorber
+    // stays well above 1.
     if (firstPhysicalIndex >= 0) {
       const remainder = targetTotalOz - physicalSubtotal;
-      if (remainder > 0) {
-        result[firstPhysicalIndex].weightOz += remainder;
+      if (Math.abs(remainder) > 0.0001) {
+        const next = result[firstPhysicalIndex].weightOz + remainder;
+        result[firstPhysicalIndex].weightOz = Math.max(1, next);
       }
     }
 
@@ -904,8 +920,8 @@ class PackagingService {
         packagingBaseWeightOz: 0,
         packagingTypeId: null,
         packagingTypeName: null,
-        preCeilingOz: itemWeight,
-        ceilingRemainderOz: 0,
+        preRoundingOz: itemWeight,
+        roundingDeltaOz: 0,
         finalOz: 0,
       };
     }
@@ -914,7 +930,8 @@ class PackagingService {
     if (!pkgType) {
       // Unknown packaging type — emit a safe fallback (9x11 flat)
       // rather than throw. Notes record the situation.
-      const fallbackTotal = Math.ceil(itemWeight + 2);
+      // Phase 58: floor to whole oz (min 1) — USPS 1oz grace.
+      const fallbackTotal = Math.max(1, Math.floor(itemWeight + 2));
       const itemWeightInfo = this._buildItemWeights(
         order,
         config,
@@ -923,8 +940,8 @@ class PackagingService {
       weightBreakdown.packagingTypeId = 'flat_9x11';
       weightBreakdown.packagingTypeName = 'Default 9x11 Flat (fallback)';
       weightBreakdown.packagingBaseWeightOz = 2;
-      weightBreakdown.preCeilingOz = itemWeight + 2;
-      weightBreakdown.ceilingRemainderOz = fallbackTotal - (itemWeight + 2);
+      weightBreakdown.preRoundingOz = itemWeight + 2;
+      weightBreakdown.roundingDeltaOz = fallbackTotal - (itemWeight + 2);
       weightBreakdown.finalOz = fallbackTotal;
       return {
         packageType: 'flat_9x11',
@@ -944,8 +961,9 @@ class PackagingService {
     }
 
     const baseWeight = pkgType.baseWeight || 0;
-    const preCeilingOz = itemWeight + baseWeight;
-    const totalWeight = Math.ceil(preCeilingOz);
+    const preRoundingOz = itemWeight + baseWeight;
+    // Phase 58: floor to whole oz (min 1) — USPS 1oz grace.
+    const totalWeight = Math.max(1, Math.floor(preRoundingOz));
     const carrierCode = this._getCarrierCode(totalWeight, packageTypeId);
     const serviceCode = this._getServiceCode(
       totalWeight,
@@ -962,8 +980,8 @@ class PackagingService {
     weightBreakdown.packagingTypeId = packageTypeId;
     weightBreakdown.packagingTypeName = pkgType.name;
     weightBreakdown.packagingBaseWeightOz = baseWeight;
-    weightBreakdown.preCeilingOz = preCeilingOz;
-    weightBreakdown.ceilingRemainderOz = totalWeight - preCeilingOz;
+    weightBreakdown.preRoundingOz = preRoundingOz;
+    weightBreakdown.roundingDeltaOz = totalWeight - preRoundingOz;
     weightBreakdown.finalOz = totalWeight;
 
     return {

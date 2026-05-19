@@ -80,10 +80,10 @@ function normalizeCountry(raw) {
 //     Items subtotal:    1.8 oz
 //     Packing slip:     +0.4 oz
 //     Packaging (6x8 Flat Mailer): +1.5 oz
-//     Pre-ceiling total: 3.7 oz
-//     Ceiling rounding: +0.3 oz
+//     Pre-rounding total: 3.7 oz
+//     Floor rounding: -0.7 oz
 //     ────────────────────────────
-//     FINAL:             4 oz  →  carrier=stamps_com service=usps_first_class_mail
+//     FINAL:             3 oz  →  carrier=stamps_com service=usps_first_class_mail
 function _logPackagingTrace(orderId, packaging) {
   const wb = packaging.weightBreakdown;
   if (!wb) return;
@@ -116,9 +116,11 @@ function _logPackagingTrace(orderId, packaging) {
       )} oz`
     );
   }
-  lines.push(`  Pre-ceiling total: ${_fmt(wb.preCeilingOz)} oz`);
-  if (wb.ceilingRemainderOz > 0.001) {
-    lines.push(`  Ceiling rounding: +${_fmt(wb.ceilingRemainderOz)} oz`);
+  lines.push(`  Pre-rounding total: ${_fmt(wb.preRoundingOz)} oz`);
+  if (Math.abs(wb.roundingDeltaOz) > 0.001) {
+    // Phase 58: floor-to-whole-oz. roundingDeltaOz is sign-carrying;
+    // negative is the dropped fraction. _fmt produces the leading "-".
+    lines.push(`  Floor rounding: ${_fmt(wb.roundingDeltaOz)} oz`);
   }
   lines.push('  ────────────────────────────');
   lines.push(
@@ -647,6 +649,14 @@ class ShipStationService {
     } else {
       weightOz = defaultWeightOz;
     }
+    // Phase 58: floor to whole oz (min 1) BEFORE the grams conversion —
+    // USPS gives a 1oz grace per package, so an 8.7oz package labelled
+    // 8oz is safe and saves a rate tier. Applies universally (all
+    // packages, all carriers). The packaging-engine branch is already
+    // floored upstream; this idempotently re-floors there and catches
+    // the operator-override and no-engine fallback so the rule really
+    // is universal at the SS payload boundary.
+    weightOz = Math.max(1, Math.floor(weightOz));
     const weightG = Math.max(1, Math.round(weightOz * OZ_TO_G));
 
     // Dimensions resolution: overrides > engine > app-settings.
