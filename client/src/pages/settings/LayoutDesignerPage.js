@@ -327,8 +327,14 @@ export default function LayoutDesignerPage() {
 
   function handleAddSlot(kind) {
     if (!layout) return;
-    const w = layout.sheetWidth;
-    const h = layout.sheetHeight;
+    // Phase 57B: place the new slot within the ACTIVE variant's canvas
+    // (variant-first, root fallback), not the shared root — a slot added
+    // on a 5×3.5 horizontal shouldn't be centered for a 3.5×5 sheet.
+    const vd = layout.variants?.[variant];
+    const w =
+      vd && vd.sheetWidth != null ? vd.sheetWidth : layout.sheetWidth;
+    const h =
+      vd && vd.sheetHeight != null ? vd.sheetHeight : layout.sheetHeight;
     // Default size: 30% of sheet. Centered. Big enough to click but
     // not so big it occludes everything.
     const defaultW = w * 0.3;
@@ -452,8 +458,47 @@ export default function LayoutDesignerPage() {
     });
   }
 
+  // Phase 57B: `name` is the only layout-meta field that stays at the
+  // layout root (one identity across orientations). Canvas/dpi/background
+  // are per-variant — see handleVariantMetaChange.
   function handleLayoutMetaChange(updates) {
     setLayout((prev) => (prev ? { ...prev, ...updates } : prev));
+  }
+
+  // Phase 57B: write a layout-meta scalar (sheetWidth/sheetHeight/dpi/
+  // backgroundColor) into the ACTIVE variant, creating that variant if
+  // it doesn't exist yet (same immutable pattern as updateVariantSlots).
+  // This is the copy-on-write promotion: editing an inheriting field
+  // gives the active variant its own value (no extra click).
+  function handleVariantMetaChange(updates) {
+    setLayout((prev) => {
+      if (!prev) return prev;
+      const variantDef = prev.variants?.[variant] || { slots: [] };
+      return {
+        ...prev,
+        variants: {
+          ...prev.variants,
+          [variant]: { ...variantDef, ...updates },
+        },
+      };
+    });
+  }
+
+  // Phase 57B: "Use shared default" — drop the active variant's own
+  // copy of one meta key so it reverts to inheriting the (deprecated)
+  // root value. Never touches slots or removes the variant itself.
+  function handleVariantMetaReset(key) {
+    setLayout((prev) => {
+      if (!prev) return prev;
+      const variantDef = prev.variants?.[variant];
+      if (!variantDef || !(key in variantDef)) return prev;
+      const nextVariant = { ...variantDef };
+      delete nextVariant[key];
+      return {
+        ...prev,
+        variants: { ...prev.variants, [variant]: nextVariant },
+      };
+    });
   }
 
   // ─── Save / discard ──────────────────────────────────────
@@ -727,10 +772,25 @@ export default function LayoutDesignerPage() {
   const variantDef = layout.variants?.[variant];
   const slots = variantDef?.slots || [];
 
+  // Phase 57B: the editing canvas/preview must reflect the ACTIVE
+  // variant's own canvas (variant-first, deprecated-root fallback) —
+  // same resolution as compositeService (57A), LayoutCanvas and the
+  // meta editor — so setting Horizontal to 5×3.5 re-orients the editor
+  // surface instead of staying on the vertical canvas.
+  const effSheetWidth =
+    variantDef && variantDef.sheetWidth != null
+      ? variantDef.sheetWidth
+      : layout.sheetWidth;
+  const effSheetHeight =
+    variantDef && variantDef.sheetHeight != null
+      ? variantDef.sheetHeight
+      : layout.sheetHeight;
+  const effDpi = (variantDef && variantDef.dpi) || layout.dpi || 300;
+
   // Phase 26: canvas dimensions derived from leftColWidth (measured
   // above by ResizeObserver). Canvas height bumped 50% vs natural
   // aspect fit so there's more vertical room for bleed area work.
-  const aspect = layout.sheetWidth / layout.sheetHeight;
+  const aspect = effSheetWidth / effSheetHeight;
   // Canvas width: use the full left column. Then bump height by 50%
   // compared to natural aspect fit so the canvas is taller — operator
   // requested ~50% more vertical room for bleed work.
@@ -834,7 +894,7 @@ export default function LayoutDesignerPage() {
             height={canvasHeight}
             sampleTokens={{
               ...PLACEHOLDER_TOKENS,
-              __dpi: layout.dpi || 300,
+              __dpi: effDpi,
             }}
             snapEnabled={snapEnabled}
             backgroundImageDataUrl={
@@ -850,7 +910,10 @@ export default function LayoutDesignerPage() {
         <div>
           <LayoutMetaEditor
             layout={layout}
-            onChange={handleLayoutMetaChange}
+            variant={variant}
+            onNameChange={(name) => handleLayoutMetaChange({ name })}
+            onVariantChange={handleVariantMetaChange}
+            onVariantReset={handleVariantMetaReset}
             collapsed={selectedIndex !== null}
           />
           <GraphicsLibrarySection
@@ -867,8 +930,8 @@ export default function LayoutDesignerPage() {
             slots={slots}
             selectedIndex={selectedIndex}
             variantName={variant}
-            sheetWidth={layout.sheetWidth}
-            sheetHeight={layout.sheetHeight}
+            sheetWidth={effSheetWidth}
+            sheetHeight={effSheetHeight}
             onSelect={setSelectedIndex}
             onChange={handleSlotChange}
             onDelete={handleSlotDelete}
@@ -2246,7 +2309,14 @@ function GraphicLibraryThumb({ layoutId, graphic, bust, onDelete }) {
   );
 }
 
-function LayoutMetaEditor({ layout, onChange, collapsed: collapsedDefault }) {
+function LayoutMetaEditor({
+  layout,
+  variant,
+  onNameChange,
+  onVariantChange,
+  onVariantReset,
+  collapsed: collapsedDefault,
+}) {
   // Local state, but seeded from the prop so the parent can hint at
   // initial collapse state (collapsed=true when a slot is selected and
   // we want to give the layers panel visual priority).
@@ -2261,15 +2331,50 @@ function LayoutMetaEditor({ layout, onChange, collapsed: collapsedDefault }) {
     setCollapsed(!!collapsedDefault);
   }, [collapsedDefault]);
 
+  // Phase 57B: canvas/dpi/background are per-variant. A field "owns" a
+  // value if the active variant has its own key; otherwise it inherits
+  // the (deprecated) layout-root value — the same variant-first /
+  // root-fallback resolution compositeService uses at render time (57A).
+  const variantDef =
+    (layout.variants && layout.variants[variant]) || null;
+
+  const META = [
+    { key: 'sheetWidth', label: 'Sheet width (in)', step: '0.25', def: 0, kind: 'num' },
+    { key: 'sheetHeight', label: 'Sheet height (in)', step: '0.25', def: 0, kind: 'num' },
+    {
+      key: 'dpi',
+      label: 'DPI',
+      step: '50',
+      def: 300,
+      kind: 'num',
+      hint: '300 is typical for print',
+    },
+    { key: 'backgroundColor', label: 'Background', def: '#ffffff', kind: 'text' },
+  ];
+
+  const owns = (k) =>
+    !!variantDef && Object.prototype.hasOwnProperty.call(variantDef, k);
+  const effective = (k, def) => {
+    if (owns(k)) return variantDef[k];
+    if (layout[k] !== undefined && layout[k] !== null) return layout[k];
+    return def;
+  };
+
+  const ownCount = META.filter((m) => owns(m.key)).length;
+  const inheritCount = META.length - ownCount;
+  const variantLabel =
+    variant.charAt(0).toUpperCase() + variant.slice(1);
+
   return (
     <Section
-      title="Layout properties"
-      description={collapsed ? null : 'Layout-wide settings. These apply to both variants.'}
+      title={`Layout properties — ${variantLabel}`}
+      description={
+        collapsed
+          ? null
+          : `Canvas / DPI / background for the ${variant} variant — independent per orientation. Name is shared across both variants.`
+      }
       actions={
-        <Button
-          variant="ghost"
-          onClick={() => setCollapsed((v) => !v)}
-        >
+        <Button variant="ghost" onClick={() => setCollapsed((v) => !v)}>
           {collapsed ? 'Expand' : 'Collapse'}
         </Button>
       }
@@ -2286,20 +2391,49 @@ function LayoutMetaEditor({ layout, onChange, collapsed: collapsedDefault }) {
         >
           <span>{layout.name || '(unnamed)'}</span>
           <span>·</span>
+          <span style={{ textTransform: 'capitalize' }}>{variant}</span>
+          <span>·</span>
           <span>
-            {layout.sheetWidth}″ × {layout.sheetHeight}″
+            {effective('sheetWidth', 0)}″ × {effective('sheetHeight', 0)}″
           </span>
           <span>·</span>
-          <span>{layout.dpi || 300}dpi</span>
+          <span>{effective('dpi', 300)}dpi</span>
+          <span>·</span>
+          <span>
+            {ownCount}/{META.length} own
+          </span>
         </div>
       ) : (
         <>
-          <FormRow label="Name">
+          <div
+            style={{
+              fontSize: 11,
+              marginBottom: 10,
+              display: 'flex',
+              gap: 8,
+              alignItems: 'center',
+              flexWrap: 'wrap',
+              color: 'var(--text-muted)',
+            }}
+          >
+            <strong
+              style={{ color: 'var(--text)', textTransform: 'capitalize' }}
+            >
+              {variant}
+            </strong>
+            <span>
+              {ownCount} independent · {inheritCount} inheriting shared
+              default
+            </span>
+          </div>
+
+          <FormRow label="Name" hint="Shared across both variants">
             <TextInput
               value={layout.name || ''}
-              onChange={(v) => onChange({ name: v })}
+              onChange={(v) => onNameChange(v)}
             />
           </FormRow>
+
           <div
             style={{
               display: 'grid',
@@ -2307,34 +2441,79 @@ function LayoutMetaEditor({ layout, onChange, collapsed: collapsedDefault }) {
               gap: 8,
             }}
           >
-            <FormRow label="Sheet width (in)">
-              <NumberInput
-                value={layout.sheetWidth || 0}
-                onChange={(v) => onChange({ sheetWidth: Number(v) || 0 })}
-                step="0.25"
-              />
-            </FormRow>
-            <FormRow label="Sheet height (in)">
-              <NumberInput
-                value={layout.sheetHeight || 0}
-                onChange={(v) => onChange({ sheetHeight: Number(v) || 0 })}
-                step="0.25"
-              />
-            </FormRow>
-            <FormRow label="DPI" hint="300 is typical for print">
-              <NumberInput
-                value={layout.dpi || 300}
-                onChange={(v) => onChange({ dpi: Number(v) || 300 })}
-                step="50"
-              />
-            </FormRow>
-            <FormRow label="Background">
-              <TextInput
-                value={layout.backgroundColor || '#ffffff'}
-                onChange={(v) => onChange({ backgroundColor: v })}
-                monospace
-              />
-            </FormRow>
+            {META.map((m) => {
+              const isOwn = owns(m.key);
+              const val = effective(m.key, m.def);
+              return (
+                <FormRow key={m.key} label={m.label} hint={m.hint}>
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      marginBottom: 4,
+                    }}
+                  >
+                    {isOwn ? (
+                      <span
+                        style={{
+                          fontSize: 10,
+                          fontWeight: 600,
+                          color: '#1d4ed8',
+                          background: 'rgba(29,78,216,0.12)',
+                          padding: '1px 6px',
+                          borderRadius: 999,
+                        }}
+                      >
+                        ● Own
+                      </span>
+                    ) : (
+                      <span
+                        style={{
+                          fontSize: 10,
+                          fontStyle: 'italic',
+                          color: 'var(--text-muted)',
+                        }}
+                      >
+                        Inherited (shared default)
+                      </span>
+                    )}
+                    {isOwn && (
+                      <button
+                        type="button"
+                        onClick={() => onVariantReset(m.key)}
+                        style={{
+                          fontSize: 10,
+                          color: 'var(--text-muted)',
+                          background: 'none',
+                          border: 'none',
+                          padding: 0,
+                          cursor: 'pointer',
+                          textDecoration: 'underline',
+                        }}
+                      >
+                        Use shared default
+                      </button>
+                    )}
+                  </div>
+                  {m.kind === 'num' ? (
+                    <NumberInput
+                      value={val || 0}
+                      onChange={(v) =>
+                        onVariantChange({ [m.key]: Number(v) || m.def })
+                      }
+                      step={m.step}
+                    />
+                  ) : (
+                    <TextInput
+                      value={val || m.def}
+                      onChange={(v) => onVariantChange({ [m.key]: v })}
+                      monospace
+                    />
+                  )}
+                </FormRow>
+              );
+            })}
           </div>
         </>
       )}

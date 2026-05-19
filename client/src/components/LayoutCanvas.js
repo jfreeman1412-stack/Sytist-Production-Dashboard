@@ -111,6 +111,27 @@ export default function LayoutCanvas({
 
   const interactive = typeof onSlotChange === 'function';
 
+  // Phase 57B: canvas dimensions / background / dpi are per-variant.
+  // Resolve variant-first with deprecated-root fallback — the SAME
+  // resolution compositeService uses at render time (57A) and the meta
+  // editor displays — so the editing surface matches what will actually
+  // print for the active variant (e.g. a 5×3.5 horizontal vs a 3.5×5
+  // vertical) instead of staying on the shared root.
+  const variantDef = layout.variants?.[variant];
+  const sheetW =
+    variantDef && variantDef.sheetWidth != null
+      ? variantDef.sheetWidth
+      : layout.sheetWidth;
+  const sheetH =
+    variantDef && variantDef.sheetHeight != null
+      ? variantDef.sheetHeight
+      : layout.sheetHeight;
+  const sheetDpi = (variantDef && variantDef.dpi) || layout.dpi || 300;
+  const sheetBg =
+    (variantDef && variantDef.backgroundColor) ||
+    layout.backgroundColor ||
+    '#ffffff';
+
   // Compute the on-screen → inches conversion factor. Re-derived on
   // every mousemove because the SVG might be in a flexbox that changes
   // size. Use getBoundingClientRect for accurate live values.
@@ -124,15 +145,15 @@ export default function LayoutCanvas({
     // in size to the canvas itself on the smaller dimension. Gives
     // generous room to extend slots past the canvas without the
     // bleed area feeling cramped.
-    return Math.min(layout.sheetWidth, layout.sheetHeight) * 0.6;
+    return Math.min(sheetW, sheetH) * 0.6;
   }
   function getInchesPerPixel() {
     if (!svgRef.current) return { x: 0, y: 0 };
     const rect = svgRef.current.getBoundingClientRect();
     const pad = bleedPaddingForLayout();
     return {
-      x: (layout.sheetWidth + pad * 2) / rect.width,
-      y: (layout.sheetHeight + pad * 2) / rect.height,
+      x: (sheetW + pad * 2) / rect.width,
+      y: (sheetH + pad * 2) / rect.height,
       rect,
     };
   }
@@ -155,11 +176,11 @@ export default function LayoutCanvas({
   //
   // Minimum size still enforced (0.1") so slots can't disappear.
   function constrainPosition(slot) {
-    const maxOut = Math.max(layout.sheetWidth, layout.sheetHeight) * 10;
+    const maxOut = Math.max(sheetW, sheetH) * 10;
     return {
       ...slot,
-      x: clamp(slot.x, -maxOut, layout.sheetWidth + maxOut),
-      y: clamp(slot.y, -maxOut, layout.sheetHeight + maxOut),
+      x: clamp(slot.x, -maxOut, sheetW + maxOut),
+      y: clamp(slot.y, -maxOut, sheetH + maxOut),
     };
   }
 
@@ -169,12 +190,12 @@ export default function LayoutCanvas({
   // beyond the generous outer bound.
   function constrainSize(slot) {
     const minDim = 0.1; // 0.1 inch minimum so slots can't disappear
-    const maxOut = Math.max(layout.sheetWidth, layout.sheetHeight) * 10;
+    const maxOut = Math.max(sheetW, sheetH) * 10;
     let { x, y, w, h } = slot;
 
     // Clamp position to generous outer bound only.
-    x = clamp(x, -maxOut, layout.sheetWidth + maxOut);
-    y = clamp(y, -maxOut, layout.sheetHeight + maxOut);
+    x = clamp(x, -maxOut, sheetW + maxOut);
+    y = clamp(y, -maxOut, sheetH + maxOut);
 
     // Clamp size to a positive minimum and a generous maximum.
     if (w < minDim) w = minDim;
@@ -333,9 +354,6 @@ export default function LayoutCanvas({
     );
   }
 
-  const variantDef = layout.variants?.[variant];
-  const sheetW = layout.sheetWidth;
-  const sheetH = layout.sheetHeight;
   const slots = variantDef?.slots || [];
 
   // Phase 23: bleed-area padding inside the SVG viewBox. Expand the
@@ -431,7 +449,7 @@ export default function LayoutCanvas({
         {/* Sheet background */}
         <rect
           x="0" y="0" width={sheetW} height={sheetH}
-          fill={layout.backgroundColor || '#ffffff'}
+          fill={sheetBg}
           stroke="#666"
           strokeWidth={Math.min(sheetW, sheetH) * 0.005}
         />
@@ -552,7 +570,7 @@ export default function LayoutCanvas({
           pointerEvents: 'none',
         }}
       >
-        {sheetW}″ × {sheetH}″ @ {layout.dpi || 300}dpi
+        {sheetW}″ × {sheetH}″ @ {sheetDpi}dpi
       </div>
     </div>
   );
