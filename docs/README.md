@@ -271,7 +271,7 @@ The dashboard reads from and writes to Sytist's existing `ms_notes` table. Every
 | 55    | Specialty subfolder filesystem-safety + visible download failures | ✅ |
 | 56    | Synthetic-cart-ID override keying + Apply→imposition parity | ✅ |
 | 57A   | Composite-layout variant split — foundation (per-variant canvas/dpi/bg render fallback + copy-down migration + verification gate) | ✅ |
-| 57B   | Variant split — designer write-target + copy-on-write UX + graphics-read switch | 📋 planned |
+| 57B   | Variant split — designer meta-editor + canvas per-variant (copy-on-write UX) + per-variant graphics library (namespaced keys, legacy-shared read-only group) | ✅ |
 
 See `CHANGELOG.md` for what each phase delivered and `SPEC.md` for the full design notes.
 
