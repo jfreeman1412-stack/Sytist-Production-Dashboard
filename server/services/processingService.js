@@ -291,6 +291,19 @@ class ProcessingService {
     // Status update: only when all sub-orders succeeded
     const allOk = result.subOrders.every((s) => s.success);
 
+    // ─── Phase 57: orphan cleanup — the Darkroom .txt is the manifest
+    // After every sub-order's .txt is written, anything in the order's
+    // REGULAR output dir not referenced by a .txt Filepath= line is
+    // staging debris (raw green-screen/composite subjects, the chain-
+    // SKU _composite_<layout>.jpg intermediate, crashed-write .tmp).
+    // Runs ONLY when every sub-order succeeded — a failed sub-order's
+    // files are left in place for operator inspection / retry. Specialty
+    // is a separate pipeline/folder and is never touched. Non-fatal:
+    // printing already happened; cleanup is cosmetic.
+    if (allOk) {
+      await this._cleanupOrphanOutputs(workOrder, result);
+    }
+
     // ─── Phase 13c: auto-create ShipStation order ───────────
     //
     // Fires after all sub-orders succeed, BEFORE the status update.
@@ -2002,6 +2015,180 @@ class ProcessingService {
       };
     });
     return filtered;
+  }
+
+  /**
+   * Phase 57: enforce the Darkroom-.txt-as-manifest invariant.
+   *
+   * After processing, the order's REGULAR output dir must contain only
+   * the .txt file(s), the packing slip(s), team divider(s), and exactly
+   * the files referenced by the Filepath= lines of this order's .txt
+   * file(s). Everything else for THIS order — raw green-screen/composite
+   * subjects, the chain-SKU `_composite_<layout>.jpg` intermediate,
+   * crashed-write `.tmp` debris — is pollution and is removed.
+   *
+   * Safety (every point the audit raised):
+   *   - Order-scoped: a file is in scope iff its basename is
+   *     `<orderNumber>.txt` or starts with `<orderNumber>_`. The
+   *     trailing `_` / `.` boundary stops order 110 matching `1100_…`.
+   *     Other orders sharing a folder-sorted dir are never touched.
+   *   - Referenced set = UNION of Filepath= basenames across EVERY
+   *     `<orderNumber>*.txt` in the dir (original + reprints + per-team
+   *     league chunks), not just the latest — so reprint and multi-team
+   *     batches never delete one another.
+   *   - Case-insensitive basename comparison: we only ever compare
+   *     lowercased basenames, never raw/absolute paths, so separator
+   *     and case differences between a Filepath= value and the on-disk
+   *     name cannot cause a false "unreferenced".
+   *   - Explicit carve-outs (referenced AND excluded, belt-and-braces):
+   *     the .txt manifests, packing slips (`_packing_slip`), team
+   *     dividers (`_DIVIDER_`).
+   *   - Specialty defence in depth: reads ONLY the regular downloadDir
+   *     (non-recursive, files only), never specialtyBase; bails if the
+   *     regular dir resolves under specialtyBase; never deletes a
+   *     `*_specialty.txt` or any recorded specialty path.
+   *   - If any manifest can't be read, cleanup is skipped entirely
+   *     (an incomplete referenced set must never drive deletions).
+   *   - Non-fatal: any failure → console.warn; printing already
+   *     succeeded.
+   */
+  async _cleanupOrphanOutputs(order, result) {
+    const orderNum = String(order.orderNumber || order.orderId);
+    try {
+      const { dir: downloadDir } =
+        await printOutputService.resolveOutputDir(order);
+
+      // specialtyBase resolved EXACTLY as _processSubOrder does, so the
+      // defence-in-depth check can't drift from real routing.
+      let specialtyBase = null;
+      try {
+        const configured = await specialtyService.getBasePath();
+        specialtyBase =
+          configured ||
+          path.win32.join(
+            pathsService.resolveBase('downloadBase', order),
+            'Specialty'
+          );
+      } catch {
+        specialtyBase = null;
+      }
+      const norm = (p) =>
+        path.win32.resolve(String(p)).replace(/\\+$/, '').toLowerCase();
+      if (
+        specialtyBase &&
+        norm(downloadDir).startsWith(norm(specialtyBase))
+      ) {
+        console.warn(
+          `[Processing] Order ${orderNum} cleanup SKIPPED: regular dir resolves under the specialty base — refusing to clean (${downloadDir})`
+        );
+        return;
+      }
+
+      let dirents;
+      try {
+        dirents = await fsp.readdir(downloadDir, { withFileTypes: true });
+      } catch (e) {
+        console.warn(
+          `[Processing] Order ${orderNum} cleanup: cannot read ${downloadDir}: ${e.message} (non-fatal)`
+        );
+        return;
+      }
+      const entries = dirents
+        .filter((d) => d.isFile())
+        .map((d) => d.name);
+
+      const lc = (s) => String(s).toLowerCase();
+      const onum = lc(orderNum);
+      const isOrderTxt = (name) => {
+        const n = lc(name);
+        return (
+          n === onum + '.txt' ||
+          (n.startsWith(onum + '_') && n.endsWith('.txt'))
+        );
+      };
+      const belongsToOrder = (name) => {
+        const n = lc(name);
+        return n === onum + '.txt' || n.startsWith(onum + '_');
+      };
+
+      // Referenced set: UNION of Filepath= basenames across ALL of this
+      // order's .txt files in the dir (original + every reprint + every
+      // per-team league chunk).
+      const referenced = new Set();
+      for (const name of entries) {
+        if (!isOrderTxt(name)) continue;
+        let body;
+        try {
+          body = await fsp.readFile(
+            path.win32.join(downloadDir, name),
+            'utf8'
+          );
+        } catch (e) {
+          // An unreadable manifest means we cannot trust the referenced
+          // set is complete — skip cleanup entirely rather than risk
+          // deleting a printed file.
+          console.warn(
+            `[Processing] Order ${orderNum} cleanup SKIPPED: could not read manifest ${name}: ${e.message}`
+          );
+          return;
+        }
+        const re = /^Filepath=(.+)$/gim;
+        let m;
+        while ((m = re.exec(body)) !== null) {
+          const ref = m[1].trim();
+          if (ref) referenced.add(lc(path.win32.basename(ref)));
+        }
+      }
+
+      // Defence-in-depth: never delete anything processing recorded as a
+      // specialty manifest path.
+      const specialtyNames = new Set();
+      for (const s of result.subOrders || []) {
+        if (s && s.specialtyTxtPath) {
+          specialtyNames.add(lc(path.win32.basename(s.specialtyTxtPath)));
+        }
+      }
+
+      const isCarveOut = (name) => {
+        const n = lc(name);
+        if (isOrderTxt(name)) return true; // the manifest(s)
+        if (n.endsWith('_specialty.txt')) return true; // specialty .txt
+        if (specialtyNames.has(n)) return true; // recorded specialty path
+        if (n.includes('_packing_slip')) return true; // packing slip(s)
+        if (n.includes('_divider_')) return true; // team divider(s)
+        return false;
+      };
+
+      const removed = [];
+      for (const name of entries) {
+        if (!belongsToOrder(name)) continue; // other orders / dividers
+        if (referenced.has(lc(name))) continue; // a printed file
+        if (isCarveOut(name)) continue; // manifest/slip/divider/specialty
+        const full = path.win32.join(downloadDir, name);
+        try {
+          await fsp.unlink(full);
+          removed.push(name);
+        } catch (e) {
+          console.warn(
+            `[Processing] Order ${orderNum} cleanup: could not remove orphan ${full}: ${e.message} (non-fatal)`
+          );
+        }
+      }
+
+      if (removed.length > 0) {
+        console.log(
+          `[Processing] Order ${orderNum} cleanup: removed ${removed.length} orphan file(s): [${removed.join(', ')}]`
+        );
+      } else {
+        console.log(
+          `[Processing] Order ${orderNum} cleanup: no orphan files`
+        );
+      }
+    } catch (e) {
+      console.warn(
+        `[Processing] Order ${orderNum} cleanup failed (non-fatal — printing already succeeded): ${e.message}`
+      );
+    }
   }
 
   _buildPhotoFilename(order, lineItem, reprintSuffix = '') {
