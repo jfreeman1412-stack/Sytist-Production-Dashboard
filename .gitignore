@@ -40,6 +40,9 @@ server/config/filename-config.json
 # Last good state is preserved in commit history; back up with server/config.
 server/config/composite-layouts.json
 server/config/composite-mappings.json
+# Pre-migration backups of composite-layouts.json (operator data; local
+# rollback only — never commit). Defensive against an accidental `git add -A`.
+server/config/composite-layouts.json.bak-*
 
 # Uploaded assets (user content, not source)
 server/assets/overlays/*
