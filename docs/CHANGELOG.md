@@ -334,6 +334,15 @@ Format: phase number → short title → what shipped → key files touched.
 - node --check clean both files. No tests/fixtures asserted ceiling behavior so none to update. Verification is the `[Packaging Trace]` server log — fractional-weight orders now print `Pre-rounding total: 3.7 oz / Floor rounding: -0.7 oz / FINAL: 3 oz`
 - Files: `server/services/packagingService.js`, `server/services/shipstationService.js`
 
+## Phase 58a — Orders-list "Missing Logo" badge + Settings preselect
+- Surfaces the same per-gallery "no logo set" condition as the order-detail `LogoWarningBanner` (Phase 12), earlier in the workflow — operators catch it during batch-processing decisions without clicking into detail. Identical detection rule, identical conservative posture (the detail banner intentionally doesn't check whether any line item's layout uses a logo slot; the badge inherits that)
+- Zero new endpoint, zero per-row HTTP, zero API/schema change: `OrdersListPage` fetches the existing `GET /api/sytist/gallery-assets/logos` ONCE on mount, stores the `{[galleryId]: {…}}` registry, checks each row locally. `order.galleryId` is already exposed per row by `sytistDbService`'s `primaryGallery` rollup
+- Soft-fail (matches detail banner's "false positives worse than misses"): no badge when `galleryId === 0`, registry hasn't loaded, or fetch failed
+- UX (operator-specified): red `⚠ Missing Logo` pill matching `WorkflowBadge`/`StatusBadge` styling + the list's warning-color family; text-primary so it reads at a glance. Hover tooltip `"No logo set for this gallery — click to upload"`. Click stops row propagation, routes to `/settings/gallery-assets?galleryId=<encoded>`
+- `GalleryAssetsSettings.LogosSection` reads `useSearchParams` and pre-selects the requested gallery in the uploader dropdown on initial load (gated on dropdown still empty — manual selection never overridden). Operator lands at the upload control for that gallery, not the empty default
+- Phase 57B per-variant composite-layout graphics doesn't interact — gallery logos are a separate per-gallery asset (`galleryAssetsService`). ESLint clean (3 pre-existing warnings unchanged)
+- Files: `client/src/pages/OrdersListPage.js`, `client/src/pages/settings/GalleryAssetsSettings.js`
+
 ---
 
 ## Reversed / removed

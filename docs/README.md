@@ -273,6 +273,7 @@ The dashboard reads from and writes to Sytist's existing `ms_notes` table. Every
 | 57A   | Composite-layout variant split — foundation (per-variant canvas/dpi/bg render fallback + copy-down migration + verification gate) | ✅ |
 | 57B   | Variant split — designer meta-editor + canvas per-variant (copy-on-write UX) + per-variant graphics library (namespaced keys, legacy-shared read-only group) | ✅ |
 | 58    | ShipStation package weights: floor to whole oz (USPS 1oz grace) — universal across packages/carriers, floored before grams conversion, per-item rollup handles negative remainder | ✅ |
+| 58a   | Orders-list "Missing Logo" row badge — surfaces the existing order-detail no-logo warning earlier (identical detection); soft-fail; click → `/settings/gallery-assets?galleryId=` which pre-selects the gallery in the uploader | ✅ |
 
 See `CHANGELOG.md` for what each phase delivered and `SPEC.md` for the full design notes.
 

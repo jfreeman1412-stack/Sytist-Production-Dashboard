@@ -1953,6 +1953,22 @@ Operational rate-savings change. Package weights are now **floored** to whole ou
 
 ---
 
+## 58a. Orders-list "Missing Logo" badge + Settings preselect
+
+Small operator-facing surface change: the same "no logo set for this gallery" warning that fires on the order-detail page (Phase 12 `LogoWarningBanner`) now also appears as a per-row badge on the main orders list, so operators see it during batch-processing decisions instead of having to click into each order to discover it.
+
+**Detection is identical to the detail page** — same per-gallery rule (`galleryLogos[order.galleryId]` truthiness check), same conservative posture (the detail banner deliberately does not check whether any line item's layout actually uses a logo slot; "false positives are cheap; false negatives would mean the wasted render the user wanted to avoid"). The badge inherits that posture so operators never see one without the other. Phase 57B's per-variant composite-layout graphics is a separate asset system (`compositeGraphicsService`, keyed by `layoutId` + namespaced key) and does not interact — gallery logos are per-gallery via `galleryAssetsService`.
+
+**Implementation, zero new endpoint, zero per-row HTTP.** `OrdersListPage` fetches the existing `GET /api/sytist/gallery-assets/logos` (the same registry endpoint `GalleryAssetsSettings` already uses) ONCE on mount and stores the `{ [galleryId]: { logoFilename, ... } }` map; each row checks locally against the map. The orders-list API already exposes `order.galleryId` per row (`sytistDbService` sets it from the `primaryGallery` rollup at L1162/L1659 — no schema change). Soft-fail rule: no badges when `galleryId === 0` (no primary gallery), the registry hasn't loaded yet, or the registry fetch failed — same false-positive-aversion posture as the detail-page banner.
+
+**UX (operator-specified).** Red `⚠ Missing Logo` pill in the row's gallery cell, styled to match the existing `WorkflowBadge` / `StatusBadge` pill vocabulary and the list's warning-color family (`rgba(220,53,69,0.x)`); text is the primary signal so a scanning operator reads "Missing Logo" without interpreting a glyph. `title` attribute provides the hover tooltip `"No logo set for this gallery — click to upload"`. Click stops row-event propagation (so the row's order-detail navigate doesn't fire) and routes to `/settings/gallery-assets?galleryId=<encoded id>`.
+
+**Settings-page preselect.** `GalleryAssetsSettings`'s `LogosSection` now reads `useSearchParams`; on initial load (gated on the dropdown still being at its empty default — manual operator selection is never overridden) it locates the requested gallery in the already-loaded list and pre-selects it. The badge click lands the operator at the upload control for that specific gallery instead of the empty default state.
+
+Files: `client/src/pages/OrdersListPage.js`, `client/src/pages/settings/GalleryAssetsSettings.js`.
+
+---
+
 ## Open follow-ups
 
 - ~~Identify the upstream "Sportsline UI" integration creating phantom SS orders.~~ **Identified during Phase 47 hotfix 2 diagnosis (2026-05-14)**: a separate processing tool used by operator Kirsten. Writes to Sytist directly (`note_who: "Kirsten"` with "Order Has been changed to Printing and Production" — distinct from our `"Sytist Dashboard: Order processed..."` prefix) and creates SS orders outside our pipeline. The ms_notes comparison showed our dashboard processed ~9 of 555 composite-mapped orders in the last 14 days; the other 546 went through Kirsten's tool. Phase 33's "adopt without push" already handles the coexistence pattern — no code change required. The remaining question is operational, not technical: should the dashboard become the primary tool, or stay a special-case path? Worth a conversation with Kirsten, not more code.
