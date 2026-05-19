@@ -30,6 +30,21 @@ const overrideRenderService = require('../services/overrideRenderService');
 const printOutputService = require('../services/printOutputService');
 const { requireAuth, requireRole } = require('../middleware/auth');
 
+// Phase 57B: graphics are per-variant. Resolve a graphic's metadata
+// variant-first — any variant that owns the key (keys are namespaced
+// `${variant}__<name>` so they're unique across variants) — then fall
+// back to the deprecated root `graphics` map (legacy / un-diverged
+// layouts). Read-only lookup for the variant-agnostic preview/info
+// stream routes; the render paths resolve against their known variant.
+function resolveGraphicMeta(layout, key) {
+  if (layout && layout.variants) {
+    for (const v of Object.values(layout.variants)) {
+      if (v && v.graphics && v.graphics[key]) return v.graphics[key];
+    }
+  }
+  return (layout && layout.graphics && layout.graphics[key]) || null;
+}
+
 // Phase 36: small helper to pull the audit context (display name +
 // IP) off req for downstream services. Falls back gracefully when
 // any field is missing. Used by every action that writes to
@@ -80,7 +95,7 @@ router.get(
       if (!layout) {
         return res.status(404).json({ error: 'Layout not found' });
       }
-      const meta = layout.graphics ? layout.graphics[key] : null;
+      const meta = resolveGraphicMeta(layout, key); // Phase 57B: variant-first/root-fallback
       const opened = await compositeGraphicsService.openGraphicStream({
         layoutId,
         key,
@@ -3217,7 +3232,11 @@ router.post('/composite/preview', async (req, res) => {
       const key = s.graphicKey || s.overlayId;
       if (!key || seenKeys.has(key)) continue;
       seenKeys.add(key);
-      const meta = layout.graphics ? layout.graphics[key] : null;
+      // Phase 57B: variant-first, deprecated-root fallback.
+      const meta =
+        (variantDef && variantDef.graphics && variantDef.graphics[key]) ||
+        (layout.graphics && layout.graphics[key]) ||
+        null;
       try {
         const buf = await compositeGraphicsService.readGraphicBuffer({
           layoutId: layout.id,
@@ -3818,7 +3837,11 @@ async function renderOverrideForOrder({
     const key = s.graphicKey || s.overlayId;
     if (!key || seenKeys.has(key)) continue;
     seenKeys.add(key);
-    const meta = layout.graphics ? layout.graphics[key] : null;
+    // Phase 57B: variant-first, deprecated-root fallback.
+    const meta =
+      (variantDef && variantDef.graphics && variantDef.graphics[key]) ||
+      (layout.graphics && layout.graphics[key]) ||
+      null;
     try {
       const buf = await compositeGraphicsService.readGraphicBuffer({
         layoutId: layout.id,
@@ -4043,15 +4066,28 @@ router.get(
       if (!layout) {
         return res.status(404).json({ error: 'Layout not found' });
       }
+      // Phase 57B: when ?variant= is given, the library shows that
+      // variant's own (namespaced) graphics. Without it we keep the
+      // pre-57B behaviour (root map, all on-disk) so a not-yet-updated
+      // client still works during the server→client rollout.
+      const variant =
+        typeof req.query.variant === 'string' ? req.query.variant : null;
       const onDisk = await compositeGraphicsService.listGraphicsOnDisk(
         layout.id
       );
-      const inJson = layout.graphics || {};
+      const inJson = variant
+        ? (layout.variants &&
+            layout.variants[variant] &&
+            layout.variants[variant].graphics) ||
+          {}
+        : layout.graphics || {};
 
       // Merge: prefer JSON metadata (has uploadedAt etc.), fall back to
-      // on-disk-only entries
+      // on-disk-only entries. When scoped to a variant, only that
+      // variant's namespace (`${variant}__…`) on disk is considered.
       const byKey = {};
       for (const item of onDisk) {
+        if (variant && !item.key.startsWith(variant + '__')) continue;
         byKey[item.key] = {
           key: item.key,
           filename: item.filename,
@@ -4069,9 +4105,23 @@ router.get(
           onDisk: !!byKey[key],
         };
       }
+
+      // Deprecated root graphics, surfaced separately so the client can
+      // render the read-only "Shared (legacy)" group (Phase 57B,
+      // decision c — the client hides it once the variant has its own
+      // graphics). Empty when unscoped (legacy clients ignore it).
+      const legacyShared = variant
+        ? Object.entries(layout.graphics || {}).map(([key, meta]) => ({
+            key,
+            ...meta,
+          }))
+        : [];
+
       res.json({
         layoutId: layout.id,
+        variant,
         graphics: Object.values(byKey),
+        legacyShared,
       });
     } catch (err) {
       res.status(500).json({ error: err.message });
@@ -4103,9 +4153,22 @@ router.post(
   async (req, res) => {
     try {
       const { layoutId, key } = req.params;
-      const { dataBase64, filename } = req.body || {};
+      const { dataBase64, filename, variant } = req.body || {};
       if (!dataBase64) {
         return res.status(400).json({ error: 'dataBase64 is required' });
+      }
+      // Phase 57B: graphics are per-variant. The client sends the active
+      // variant explicitly and a key already namespaced as
+      // `${variant}__<name>`; validate the prefix so a graphic can never
+      // be written to the wrong variant's map (or the deprecated root,
+      // which this route never writes).
+      if (!variant || typeof variant !== 'string') {
+        return res.status(400).json({ error: 'variant is required' });
+      }
+      if (!key.startsWith(variant + '__')) {
+        return res.status(400).json({
+          error: `key "${key}" must be namespaced as "${variant}__<name>"`,
+        });
       }
       const layout = await compositeService.getLayout(layoutId);
       if (!layout) {
@@ -4117,10 +4180,12 @@ router.post(
       // in server logs. If the browser sent N bytes of base64 but we
       // decoded < N * 0.75, the body got truncated somewhere.
       console.log(
-        `[composite/graphics POST] layout=${layoutId} key=${key} base64Length=${dataBase64.length} decodedBytes=${fileBuffer.length} filename=${filename || '?'}`
+        `[composite/graphics POST] layout=${layoutId} variant=${variant} key=${key} base64Length=${dataBase64.length} decodedBytes=${fileBuffer.length} filename=${filename || '?'}`
       );
 
-      // Save the file
+      // Save the file. The namespaced key keeps vertical/horizontal
+      // assets from colliding in the shared per-layout on-disk bucket
+      // (composite-graphics/<layoutId>/) — no service change needed.
       const meta = await compositeGraphicsService.saveGraphic({
         layoutId,
         key,
@@ -4128,26 +4193,39 @@ router.post(
         uploadedBy: req.user?.username || null,
       });
 
-      // Update layout.graphics map
-      const updatedLayout = {
-        ...layout,
-        graphics: {
-          ...(layout.graphics || {}),
-          [key]: {
-            filename: meta.filename,
-            mimeType: meta.mimeType,
-            sizeBytes: meta.sizeBytes,
-            uploadedAt: meta.uploadedAt,
-            uploadedBy: meta.uploadedBy,
-            originalFilename: filename || null,
+      // Phase 57B: write into variants[variant].graphics — create the
+      // variant if it doesn't exist yet (copy-on-write), preserve its
+      // slots and EVERY other variant. Root `graphics` is the deprecated
+      // fallback and is never written here. updateLayout shallow-merges,
+      // so we pass the full reconstructed variants object.
+      const prevVariant =
+        (layout.variants && layout.variants[variant]) || { slots: [] };
+      const newVariants = {
+        ...(layout.variants || {}),
+        [variant]: {
+          ...prevVariant,
+          graphics: {
+            ...(prevVariant.graphics || {}),
+            [key]: {
+              filename: meta.filename,
+              mimeType: meta.mimeType,
+              sizeBytes: meta.sizeBytes,
+              uploadedAt: meta.uploadedAt,
+              uploadedBy: meta.uploadedBy,
+              originalFilename: filename || null,
+            },
           },
         },
       };
-      await compositeService.updateLayout(layoutId, updatedLayout);
+      await compositeService.updateLayout(layoutId, {
+        ...layout,
+        variants: newVariants,
+      });
 
       res.json({
         success: true,
-        graphic: { key, ...updatedLayout.graphics[key] },
+        variant,
+        graphic: { key, ...newVariants[variant].graphics[key] },
       });
     } catch (err) {
       console.error('[sytist/composite/graphics POST]', err);
@@ -4164,19 +4242,38 @@ router.post(
 router.delete(
   '/composite/layouts/:layoutId/graphics/:key',
   requireRole('admin'),
+  express.json(),
   async (req, res) => {
     try {
       const { layoutId, key } = req.params;
+      // Phase 57B: explicit variant in the body; validate the namespaced
+      // key prefix so a delete can only ever remove from the intended
+      // variant's map — never another variant, never the deprecated root.
+      const { variant } = req.body || {};
+      if (!variant || typeof variant !== 'string') {
+        return res.status(400).json({ error: 'variant is required' });
+      }
+      if (!key.startsWith(variant + '__')) {
+        return res.status(400).json({
+          error: `key "${key}" must be namespaced as "${variant}__<name>"`,
+        });
+      }
       const layout = await compositeService.getLayout(layoutId);
       if (!layout) {
         return res.status(404).json({ error: 'Layout not found' });
       }
       await compositeGraphicsService.deleteGraphicFile({ layoutId, key });
-      const nextGraphics = { ...(layout.graphics || {}) };
+      const prevVariant =
+        (layout.variants && layout.variants[variant]) || { slots: [] };
+      const nextGraphics = { ...(prevVariant.graphics || {}) };
       delete nextGraphics[key];
+      const newVariants = {
+        ...(layout.variants || {}),
+        [variant]: { ...prevVariant, graphics: nextGraphics },
+      };
       await compositeService.updateLayout(layoutId, {
         ...layout,
-        graphics: nextGraphics,
+        variants: newVariants,
       });
       res.json({ success: true });
     } catch (err) {
@@ -4205,7 +4302,7 @@ router.get(
       if (!layout) {
         return res.status(404).json({ error: 'Layout not found' });
       }
-      const meta = layout.graphics ? layout.graphics[key] : null;
+      const meta = resolveGraphicMeta(layout, key); // Phase 57B: variant-first/root-fallback
       const opened = await compositeGraphicsService.openGraphicStream({
         layoutId,
         key,

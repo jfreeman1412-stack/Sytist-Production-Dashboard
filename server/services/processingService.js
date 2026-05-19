@@ -1562,7 +1562,13 @@ class ProcessingService {
           const key = s.graphicKey || s.overlayId;
           if (!key || seenKeys.has(key)) continue;
           seenKeys.add(key);
-          const meta = layout.graphics ? layout.graphics[key] : null;
+          // Phase 57B: variant-first, deprecated-root fallback.
+          const meta =
+            (variantDef &&
+              variantDef.graphics &&
+              variantDef.graphics[key]) ||
+            (layout.graphics && layout.graphics[key]) ||
+            null;
           try {
             const buf = await compositeGraphicsService.readGraphicBuffer({
               layoutId: layout.id,
