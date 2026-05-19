@@ -1937,6 +1937,22 @@ Files (57B): `client/src/pages/settings/LayoutDesignerPage.js`, `client/src/comp
 
 ---
 
+## 58. ShipStation package weights: floor to whole oz (USPS 1oz grace)
+
+Operational rate-savings change. Package weights are now **floored** to whole ounces (min 1) before they reach the ShipStation payload, universally across all packages and all carriers. USPS gives a 1oz grace per package — an 8.7oz package labelled 8oz is safe and sheds a rate-tier bump; `15.9 oz` labels as `15 oz`, not `16 oz` or `1 lb`. The rule was previously a **ceiling** (which paid the next tier for any sub-ounce overage).
+
+**Where the floor lives.** Inside `packagingService._buildResult` at both rounding sites — the normal path (`totalWeight = Math.max(1, Math.floor(itemWeight + baseWeight))`) and the unknown-packaging-type fallback (`Math.max(1, Math.floor(itemWeight + 2))`). The `Math.max(1, …)` enforces the 1oz minimum at the ounce step (the existing 1-gram clamp on the post-conversion grams was inadequate — 0.5oz would have rounded to 14g and printed as 0oz on the label). The same floor is **idempotently re-applied** at `shipstationService`'s order-level weight resolution so the rule is universal at the SS payload boundary — catching the operator-override and no-engine `defaultWeightOz` fallback that bypass the packaging engine.
+
+**Per-item rollup, both signs.** The engine emits per-line `itemWeights` (in oz) that sum to the order total — required because SS sums line-item weights and replaces the order weight with that sum when any SKU has SS Product Defaults. The "absorb the rounding remainder onto the first non-digital line item" helper (`_buildItemWeights`) previously assumed remainder > 0 (ceiling adds; absorber gets `+baseWeight + |fraction|`). Under floor the remainder is **negative** (we shed the fraction; absorber gets `+baseWeight − |fraction|`). The helper now handles both signs and clamps the absorbing item to ≥1oz so a degenerate `baseWeight = 0` config can't drive it negative. **Without this branch the floor would be silently undone by SS re-summing fractional per-item weights** — the engine's whole-oz total wouldn't survive the SS sum step.
+
+**Conversion order.** Floor at the ounce step happens **before** the `OZ_TO_G = 28.3495` grams conversion in `shipstationService` (per-item L583, order-level L650). The conversion stays as-is (`Math.max(1, Math.round(weightOz * OZ_TO_G))`); since input is now a whole-oz integer, the gram value is deterministic (e.g. 8 oz → 227 g).
+
+**Field/log rename for honesty.** The old `preCeilingOz` / `ceilingRemainderOz` names and `Pre-ceiling total` / `Ceiling rounding: +X oz` log copy would have been objectively wrong post-change. Renamed to `preRoundingOz` / `roundingDeltaOz` (sign-carrying — negative under floor) and `Pre-rounding total` / `Floor rounding: -X oz` (the leading `-` comes from the numeric formatter naturally). The log guard flipped to `Math.abs(roundingDeltaOz) > 0.001` so the "no rounding to mention" suppression still works.
+
+**No tests/fixtures asserted the old behavior**, so nothing to update. Verification path is the `[Packaging Trace]` server log — process any order with fractional weight; the trace now shows `Pre-rounding total: 3.7 oz` / `Floor rounding: -0.7 oz` / `FINAL: 3 oz` instead of the old ceiling output. Files: `server/services/packagingService.js`, `server/services/shipstationService.js`.
+
+---
+
 ## Open follow-ups
 
 - ~~Identify the upstream "Sportsline UI" integration creating phantom SS orders.~~ **Identified during Phase 47 hotfix 2 diagnosis (2026-05-14)**: a separate processing tool used by operator Kirsten. Writes to Sytist directly (`note_who: "Kirsten"` with "Order Has been changed to Printing and Production" — distinct from our `"Sytist Dashboard: Order processed..."` prefix) and creates SS orders outside our pipeline. The ms_notes comparison showed our dashboard processed ~9 of 555 composite-mapped orders in the last 14 days; the other 546 went through Kirsten's tool. Phase 33's "adopt without push" already handles the coexistence pattern — no code change required. The remaining question is operational, not technical: should the dashboard become the primary tool, or stay a special-case path? Worth a conversation with Kirsten, not more code.

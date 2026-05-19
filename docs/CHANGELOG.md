@@ -325,6 +325,15 @@ Format: phase number → short title → what shipped → key files touched.
 - **Operator UX shipped:** Memory Mate Horizontal now usable independently — set 5×3.5 canvas, upload a horizontal-specific background graphic, build out horizontal slots; legacy MM graphics remain available read-only and disappear from a variant's library only as they are individually replaced
 - Files: `client/src/pages/settings/LayoutDesignerPage.js`, `client/src/components/LayoutCanvas.js`, `client/src/services/api.js`, `server/routes/sytist.js`, `server/services/processingService.js`, `server/scripts/verify-layout-variant-graphics.js` (new)
 
+## Phase 58 — ShipStation package weights: floor to whole oz (USPS 1oz grace)
+- Operational rate-savings change. Weights are now **floored** to whole ounces (min 1) before SS — universal across all packages and all carriers. USPS gives a 1oz grace per package (`8.7oz → 8oz`, `15.9oz → 15oz`, never `16oz`/`1lb`). Previously **ceiled**, which paid the next tier for any sub-ounce overage
+- `packagingService._buildResult` — `Math.ceil(…)` → `Math.max(1, Math.floor(…))` at both rounding sites (normal `itemWeight + baseWeight`; fallback `itemWeight + 2`). The 1oz min enforced at the ounce step (the existing 1g clamp post-conversion was inadequate — 0.5oz would label as 0oz)
+- `shipstationService` — same floor idempotently re-applied at the order-level weight-resolution fallback so operator-override + no-engine `defaultWeightOz` paths are floored too, not just the packaging-engine output. Universal at the payload boundary
+- `_buildItemWeights` — remainder rollup now handles BOTH signs (was `> 0` only; under floor the remainder is negative — the absorber gets `+baseWeight − |fraction|`). Without this the floor would be silently undone by SS re-summing fractional per-item weights. Defensive ≥1oz clamp on the absorbing item so a degenerate `baseWeight=0` config can't drive it negative
+- Field/log rename for honesty (the old names would be wrong post-change): `preCeilingOz`→`preRoundingOz`, `ceilingRemainderOz`→`roundingDeltaOz` (sign-carrying); `Pre-ceiling total`→`Pre-rounding total`; `Ceiling rounding: +X oz`→`Floor rounding: -X oz`. Log guard flipped to `Math.abs(…) > 0.001` so no-op rounding is still suppressed
+- node --check clean both files. No tests/fixtures asserted ceiling behavior so none to update. Verification is the `[Packaging Trace]` server log — fractional-weight orders now print `Pre-rounding total: 3.7 oz / Floor rounding: -0.7 oz / FINAL: 3 oz`
+- Files: `server/services/packagingService.js`, `server/services/shipstationService.js`
+
 ---
 
 ## Reversed / removed
