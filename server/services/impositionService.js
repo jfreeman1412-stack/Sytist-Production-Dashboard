@@ -356,7 +356,7 @@ class ImpositionService {
       studioName,
       firstName: order.customer?.firstName || '',
       lastName: order.customer?.lastName || '',
-      itemDescription: lineItem.productName || '',
+      itemDescription: lineItem.productNameDisplay || '',
       itemSku: lineItem.sku || '',
       quantity: lineItem.qty || 1,
       photoTag: team,

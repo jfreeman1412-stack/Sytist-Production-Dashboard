@@ -590,7 +590,7 @@ class ShipStationService {
 
     const items = shippable.map((li) => {
       const namePieces = [];
-      if (li.productName) namePieces.push(li.productName);
+      if (li.productNameDisplay) namePieces.push(li.productNameDisplay);
       if (li.photo?.originalFilename)
         namePieces.push(li.photo.originalFilename);
       const name = namePieces.join(' · ') || 'Photo Product';

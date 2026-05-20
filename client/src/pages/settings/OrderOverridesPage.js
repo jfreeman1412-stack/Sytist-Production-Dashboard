@@ -272,7 +272,7 @@ export default function OrderOverridesPage() {
                         marginBottom: 3,
                       }}
                     >
-                      {li.productName || '(unnamed product)'}
+                      {li.productNameDisplay || '(unnamed product)'}
                     </div>
                     <div
                       style={{

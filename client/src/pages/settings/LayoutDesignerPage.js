@@ -1435,7 +1435,7 @@ function LineItemsPicker({ items, selectedCartId, onSelect }) {
                   whiteSpace: 'nowrap',
                 }}
               >
-                {li.productName || '(unnamed product)'}
+                {li.productNameDisplay || '(unnamed product)'}
               </div>
               <div
                 style={{

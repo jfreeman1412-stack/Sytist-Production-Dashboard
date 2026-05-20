@@ -28,6 +28,28 @@ let SHIPPING_MAP = {
   ship_to_managers: [],
   ship_to_league: [],
 };
+
+// Phase 58c: derive a leaf-only display name from Sytist's `>`-delimited
+// product hierarchy (e.g. "Print Packages > Silver Package > 8x10" →
+// "8x10"). Every line item gets BOTH `productName` (the full hierarchy
+// string, unchanged — the identifier consumers like darkroomService
+// template lookup, specialtyService path construction, and any
+// operator-edited config in template-mappings.json / specialty-
+// products.json continue to read this) AND `productNameDisplay` (the
+// leaf, for every render/display site: dashboard UI, packing slip JPG,
+// ShipStation payload, ms_notes audit text, imposition `{item_
+// description}` token, log lines).
+//
+// Edge-case guard: if the split-and-trim yields an empty string (e.g.
+// "Print Packages > " with a trailing `>`), fall back to the original
+// string so we never render an empty product name. Display sites still
+// guard with `|| '(no name)'` etc., but the helper itself never emits ''.
+function deriveDisplayName(productName) {
+  const raw = String(productName == null ? '' : productName);
+  if (!raw) return raw;
+  const leaf = raw.split('>').pop().trim();
+  return leaf || raw;
+}
 try {
   const raw = fs.readFileSync(SHIPPING_MAPPING_PATH, 'utf8');
   const parsed = JSON.parse(raw);
@@ -233,7 +255,7 @@ function _expandPackageLineItems(lineItems, packageContentsMap) {
     // that Sytist's data really is what we think.
     if (!sytistFlaggedAsPackage) {
       console.warn(
-        `[SytistDB] cart ${li.cartId} sku=${sku} (${li.productName || 'unnamed'}): ` +
+        `[SytistDB] cart ${li.cartId} sku=${sku} (${li.productNameDisplay || 'unnamed'}): ` +
           `Sytist's cart_package=0 but SKU is configured as a package in dashboard ` +
           `settings. Expanding using dashboard config (${contents.length} constituents).`
       );
@@ -289,6 +311,7 @@ function _expandPackageLineItems(lineItems, packageContentsMap) {
       out.push({
         cartId: `${li.cartId}-pkg-${item.sku}`,
         productName: item.name || `SKU ${item.sku}`,
+        productNameDisplay: deriveDisplayName(item.name || `SKU ${item.sku}`),
         sku: String(item.sku),
         qty: itemQty,
         price: 0, // bundled into parent package
@@ -428,6 +451,9 @@ function _expandAddonLineItems(lineItems, addonMap, productCategoriesBySku) {
       syntheticItems.push({
         cartId: `${li.cartId}-addon-${opt.coId || opt.optId}`,
         productName: mapping.name || opt.name || `Add-on ${opt.optId}`,
+        productNameDisplay: deriveDisplayName(
+          mapping.name || opt.name || `Add-on ${opt.optId}`
+        ),
         sku: targetSku,
         qty,
         price: opt.price || 0,
@@ -461,9 +487,15 @@ function _expandAddonLineItems(lineItems, addonMap, productCategoriesBySku) {
     // original object — clone if there's anything to add. Otherwise
     // pass through by reference so callers can rely on identity.
     if (parentSuffixes.length > 0 || parentModifiers.length > 0) {
+      const nextProductName = li.productName + parentSuffixes.join('');
       out.push({
         ...li,
-        productName: li.productName + parentSuffixes.join(''),
+        productName: nextProductName,
+        // Phase 58c: re-derive display from the full suffixed string so
+        // the sibling team-suffix (e.g. " (Team A)") appears in the
+        // leaf alongside the product name — split on '>' is preserved
+        // because suffixes never contain '>'.
+        productNameDisplay: deriveDisplayName(nextProductName),
         modifiers: parentModifiers,
       });
     } else {
@@ -1020,6 +1052,7 @@ class SytistDbService {
         return {
           cartId: c.cart_id,
           productName: c.cart_product_name || '',
+          productNameDisplay: deriveDisplayName(c.cart_product_name || ''),
           sku: c.cart_sku || '',
           qty: Number(c.cart_qty) || 0,
           price: Number(c.cart_price) || 0,

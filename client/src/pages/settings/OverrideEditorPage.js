@@ -794,7 +794,7 @@ export default function OverrideEditorPage() {
     <div>
       <PageHeader
         title="Override Editor"
-        subtitle={`Order ${orderId} · cart ${cartId} · ${lineItem.productName || lineItem.sku}`}
+        subtitle={`Order ${orderId} · cart ${cartId} · ${lineItem.productNameDisplay || lineItem.sku}`}
       />
 
       {/* Phase 11a: switcher — load a different order without going
@@ -1420,7 +1420,7 @@ function OrderSwitcher({
                           marginBottom: 3,
                         }}
                       >
-                        {li.productName || '(unnamed)'}
+                        {li.productNameDisplay || '(unnamed)'}
                       </div>
                       <div
                         style={{

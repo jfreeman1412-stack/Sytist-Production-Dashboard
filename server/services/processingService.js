@@ -453,7 +453,7 @@ class ProcessingService {
             const reprintedItems = (order.lineItems || []).filter((li) =>
               lineItemFilter.includes(String(li.cartId))
             );
-            const names = reprintedItems.map((li) => li.productName).join(', ');
+            const names = reprintedItems.map((li) => li.productNameDisplay).join(', ');
             noteText = `Sytist Dashboard: Item "${names}" reprinted as REPRINT_${reprintNumber}`;
           } else {
             noteText = `Sytist Dashboard: Order reprinted as REPRINT_${reprintNumber}`;
@@ -1105,7 +1105,7 @@ class ProcessingService {
       if (!li.photo || !li.photo.fullUrl) {
         subResult.photosFailed.push({
           cartId: li.cartId,
-          productName: li.productName,
+          productNameDisplay: li.productNameDisplay,
           error: 'no_photo_url',
         });
         continue;
@@ -1148,7 +1148,7 @@ class ProcessingService {
       } catch (err) {
         subResult.photosFailed.push({
           cartId: li.cartId,
-          productName: li.productName,
+          productNameDisplay: li.productNameDisplay,
           sku: li.sku,
           error: err.message,
         });
@@ -1904,7 +1904,7 @@ class ProcessingService {
       subResult.warnings.push({
         type: 'photo_skipped',
         cartId: fail.cartId,
-        message: `${fail.productName || 'Item'} skipped: ${fail.error}`,
+        message: `${fail.productNameDisplay || 'Item'} skipped: ${fail.error}`,
       });
     }
 

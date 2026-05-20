@@ -508,7 +508,7 @@ class PackagingService {
         } else {
           unitWeight = 1;
           source = 'fallback';
-          name = item.productName || `Unknown SKU ${sku}`;
+          name = item.productNameDisplay || `Unknown SKU ${sku}`;
         }
       }
       const lineWeight = unitWeight * qty;
@@ -651,7 +651,7 @@ class PackagingService {
       if (allBoxRouteSkus.has(sku)) {
         const qty = item.qty || 1;
         rigidItemCount += qty;
-        const desc = item.productName || `SKU ${sku}`;
+        const desc = item.productNameDisplay || `SKU ${sku}`;
         rigidItemDescriptions.push(qty > 1 ? `${qty}× ${desc}` : desc);
       }
     }

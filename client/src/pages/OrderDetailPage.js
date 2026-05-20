@@ -1262,7 +1262,7 @@ function LineItemRow({
           }}
         >
           <div style={{ fontSize: 14, fontWeight: 500, flex: 1 }}>
-            {lineItem.productName || '(no name)'}
+            {lineItem.productNameDisplay || '(no name)'}
           </div>
           <div
             style={{
@@ -2534,7 +2534,7 @@ function DarkroomPreviewContent({ data }) {
               >
                 {s.reason}
               </span>
-              {s.productName}
+              {s.productNameDisplay}
               {s.sku && (
                 <span style={{ color: 'var(--text-muted)', marginLeft: 6 }}>
                   (SKU {s.sku})
@@ -2590,9 +2590,9 @@ function DarkroomPreviewContent({ data }) {
               <td style={{ ...txtTd, width: 40 }}>{p.qty}</td>
               <td style={txtTd}>
                 {p.isSlip ? (
-                  <em style={{ color: 'var(--accent)' }}>{p.productName}</em>
+                  <em style={{ color: 'var(--accent)' }}>{p.productNameDisplay}</em>
                 ) : (
-                  p.productName
+                  p.productNameDisplay
                 )}
                 {p.templatePath && (
                   <div
@@ -2961,7 +2961,7 @@ function SlipPreviewContent({ info, imgUrl, orderId, onSave, saving, savedPath }
               >
                 {s.reason}
               </span>
-              {s.productName}
+              {s.productNameDisplay}
               {s.sku && (
                 <span style={{ color: 'var(--text-muted)', marginLeft: 6 }}>
                   (SKU {s.sku})
@@ -3250,7 +3250,7 @@ function ImpositionItemRow({ order, lineItem }) {
       >
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontSize: 13, fontWeight: 600 }}>
-            {lineItem.productName}
+            {lineItem.productNameDisplay}
             {lineItem.qty > 1 && (
               <span style={{ color: 'var(--text-muted)', marginLeft: 8 }}>
                 × {lineItem.qty}
@@ -3454,7 +3454,7 @@ function ImpositionItemRow({ order, lineItem }) {
             >
               <img
                 src={imgUrl}
-                alt={`Imposed sheet for ${lineItem.productName}`}
+                alt={`Imposed sheet for ${lineItem.productNameDisplay}`}
                 style={{
                   maxWidth: '100%',
                   maxHeight: 800,

@@ -860,7 +860,7 @@ class PackingSlipService {
       const itemSvg = Buffer.from(
         `<svg width="${textWidth + 10}" height="${thumbSize + 10}" xmlns="http://www.w3.org/2000/svg">` +
           `<text x="0" y="${Math.round(itemNameSize * 1.2)}" font-family="Arial, sans-serif" font-size="${itemNameSize}" ` +
-          `font-weight="bold" fill="#222222">${esc(li.productName || 'Unknown Product')}</text>` +
+          `font-weight="bold" fill="#222222">${esc(li.productNameDisplay || 'Unknown Product')}</text>` +
           modifierBlock +
           (skuLine
             ? `<text x="0" y="${skuY}" font-family="Arial, sans-serif" ` +
