@@ -275,6 +275,7 @@ The dashboard reads from and writes to Sytist's existing `ms_notes` table. Every
 | 58    | ShipStation package weights: floor to whole oz (USPS 1oz grace) — universal across packages/carriers, floored before grams conversion, per-item rollup handles negative remainder | ✅ |
 | 58a   | Orders-list "Missing Logo" row badge — surfaces the existing order-detail no-logo warning earlier (identical detection); soft-fail; click → `/settings/gallery-assets?galleryId=` which pre-selects the gallery in the uploader | ✅ |
 | 58c   | Product names display as leaf-only (after the last `>`) everywhere — `productNameDisplay` set once in `sytistDbService`, read at every UI/slip/SS/log render; `productName` (full hierarchy) preserved as the identifier for darkroom/specialty/config matching | ✅ |
+| 59    | Packing slip two-column layout (N≥7 splits items zone into two 680-px columns, items 1..⌈N/2⌉ in col 1 then ⌈N/2⌉+1..N in col 2, adaptive thumb 100→60 floor, hard ceiling ~20 items + `console.warn`) + "Items to Ship: K" qty-summed total on every slip (excludes specialty/dropship/digital; specialty still renders on the slip, only the count excludes); single JPG, zero changes outside `packingSlipService._composeSlip` | ✅ |
 
 See `CHANGELOG.md` for what each phase delivered and `SPEC.md` for the full design notes.
 

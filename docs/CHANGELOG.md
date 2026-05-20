@@ -379,6 +379,19 @@ Format: phase number → short title → what shipped → key files touched.
 
 ---
 
+## Phase 59 — Packing slip two-column layout + Items-to-Ship total
+
+- **Bug:** Packing slips for orders with many items overlapped the footer or cut off the bottom rows. Root cause in `packingSlipService._composeSlip`: the items zone has a fixed ~820-px vertical budget, the thumb-size scaling floors at 60 px (kicks in at N≥7), and the per-row loop iterated all items with no overflow check. Around N=12 the last rows started colliding with the footer divider/QR; past N=15 sharp silently clipped composites that ran past the canvas bottom. No error logged either way — silent regression.
+- **Fix:** at N≥7, split the items zone into two 680-px columns with a 20-px gutter. Items 1..ceil(N/2) fill column 1 top-to-bottom, items ceil(N/2)+1..N fill column 2 — canonical print order preserved (matches Darkroom .txt). Thumb size adaptive within 2-col mode: `clamp(60, 100, floor(820 / ceil(N/2)) - 20)`. Faint `#eeeeee` vertical divider between columns from itemsStartY to footerY-10. New ceiling: ~20 items at the 60-px floor; beyond that the same failure mode returns and operator gets a `console.warn` (`[Packing Slip] warning: order N has K items, may overflow 2-column layout (ceiling ~20)`).
+- **"Items to Ship: K" total** is added to the ITEMS header band on **every** slip (single-col AND two-col). The number is the qty-summed total of rows that actually ship in the lab box — `printedItems` minus specialty / drop-ship / digital-by-config (Phase 45 `packagingService.isDigital(sku)`). Specialty rows still **render** on the slip (orange tint + SPECIALTY badge — operator awareness unchanged) but ship separately on their own pipeline per Phase 55 and so don't count toward the lab-box total. In 2-col mode the header gains a `— 2 COLUMNS` suffix so operators don't miss column 2; the right-edge `QTY` label drops in 2-col mode (each column carries its own per-row qty badges).
+- **Single-column path preserved verbatim for N ≤ 6** — visual output for the common case is byte-comparable to pre-Phase-59 aside from the new `ITEMS TO SHIP: K` text (replaces the old `ITEMS (K)` label).
+- **Zero touch outside `packingSlipService._composeSlip`.** Slip still produces one JPG with one `Filepath=` entry in the Darkroom .txt; `subResult.slipPath` stays a scalar string; `_cleanupOrphanOutputs` substring carve-out (`n.includes('_packing_slip')`) unchanged. Per-team ship_to_league slips paginate independently — each team's slip decides 1-col vs 2-col based on that team's own item count.
+- **Pre-resolution unified.** The per-row loop's existing `isSpecialty` lookup loop was hoisted above the SVG build and extended to also resolve `isDropShipped` + `isDigital`, storing all three plus a derived `shipsWithLabOrder: !(any of the three)` per cartId in `eligibilityByCartId`. Single pre-pass instead of three; downstream sites read once.
+- 11/11 offline harness cases pass (`server/scripts/verify-slip-pagination.js`): N = 1, 3, 6, 7, 8, 12, 16, 20, 22, plus a qty-aware case (5 rows, qty 1+1+1+3+3 → "Items to Ship: 9") and a skip-flags case (download + giftCert filtered before the count). Cases deliberately cover the bug class (N=7 onset, N=12 overlap zone, N=20 ceiling, N=22 overflow-warn-fires) per the worked-examples discipline.
+- Files: `server/services/packingSlipService.js`, `server/scripts/verify-slip-pagination.js`, `.gitignore` (adds `server/scripts/_*-scratch/`)
+
+---
+
 ## Reversed / removed
 
 - **Phase 31**: auto-push packaging during adopt — reversed in Phase 33 after it conflicted with the upstream "Sportsline UI" tool's payload

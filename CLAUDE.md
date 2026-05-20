@@ -87,6 +87,14 @@ Invariants the cleanup must keep (don't weaken any of these):
 - **Explicit carve-outs even when also referenced** (belt-and-braces): the `.txt` manifests, packing slips (`_packing_slip`), team dividers (`_DIVIDER_` — these are *not* in any `.txt` and are not order-number-prefixed, so they are doubly safe).
 - **Non-fatal.** Printing already succeeded before cleanup runs; any failure (unreadable dir, unlink error) → `console.warn` and continue. An unreadable manifest → skip cleanup entirely (never delete against an incomplete referenced set). Cleanup logs `removed N orphan file(s): [list]` or `no orphan files` per order for operator visibility.
 
+### The packing slip's "Items to Ship" count is intentionally NOT what the slip displays (Phase 59)
+
+`packingSlipService._composeSlip` renders specialty rows on every slip (orange tint + SPECIALTY badge — operator awareness) but the "Items to Ship: K" header total in the ITEMS band **excludes them**, along with drop-ship and digital-by-config (Phase 45 `packagingService.isDigital(sku)`) rows. The count answers *"what's in THIS lab box?"* — specialty ships separately on its own pipeline per Phase 55, drop-ship leaves the studio outside the lab flow, digital is a download. Rendering them but counting them would be wrong: a packer scanning "ITEMS TO SHIP: 9" should be able to count nine things into the box. Rendering them but **not** rendering them at all would also be wrong: the operator preparing the order needs to know the specialty piece exists (it's their separate-pipeline reminder).
+
+Do not "fix" the divergence by filtering specialty rows out of `printedItems`, nor by including them in the count. Either change breaks one of the two operator workflows the divergence exists to serve. The eligibility resolution sits in `eligibilityByCartId` (one pre-pass over `printedItems` resolving `isSpecialty` / `isDropShipped` / `isDigitalByConfig` plus a derived `shipsWithLabOrder` boolean); reads happen at the count and at the row-tint independently. Don't introduce a fourth read site that conflates the two — the "lab box vs visible row" distinction is the whole point of the structure.
+
+Same goes for the two-column threshold at N≥7. Single-column for N≤6 keeps today's visual identity for the common case (5–6 items at 120-px thumbs). Two-column is an overflow mitigation, not the new default — don't unify the path "for consistency." The single-page constraint (one JPG, one `Filepath=` in the Darkroom .txt) is also load-bearing: it's why Phase 59 didn't have to touch `darkroomService` / `processingService` / orphan cleanup. Pagination (multi-JPG) was considered and rejected because the propagation through those services creates ongoing coupling not worth the marginal ceiling extension past N=20.
+
 ## Repo layout
 
 ```
