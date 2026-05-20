@@ -1576,6 +1576,14 @@ class SytistDbService {
       return {
         cartId: c.cart_id,
         productName: c.cart_product_name || '',
+        // Phase 58c hotfix: this is the SECOND cart-row mapper in this
+        // file (the first is in getOrdersByWorkflow at L1054). The
+        // original Phase 58c audit's `grep | head -25` cut off before
+        // reaching this site, so productNameDisplay was only set in
+        // the list-page path — leaving the order DETAIL page receiving
+        // line items with undefined productNameDisplay and rendering
+        // every name as the fallback "(no name)".
+        productNameDisplay: deriveDisplayName(c.cart_product_name || ''),
         sku: c.cart_sku || '',
         qty: Number(c.cart_qty) || 0,
         price: Number(c.cart_price) || 0,
