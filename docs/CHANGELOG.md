@@ -352,6 +352,15 @@ Format: phase number → short title → what shipped → key files touched.
 - **Verification:** process an order whose floored total is one of `{1, 4, 7, 10, 13, 15}` oz; SS should display ≥ that value (e.g. 4.02 oz / 15.03 oz). Process an 8 oz order to confirm no regression at the round/ceil-agree values (227 g, 8 oz display)
 - Files: `server/services/shipstationService.js`
 
+## Phase 58 hotfix 2 — integer ounces throughout the SS payload (eliminates the oz↔g round-trip)
+- **Real-order regression caught processing order 111921.** Packaging trace correctly produced `FINAL: 5 oz`; ShipStation displayed **5.04 oz** (per-item ceil sum 143 g reversed to 5.0442 oz), billing at the **6 oz tier** — Phase 58's failure mode again, via overshoot this time. **Hotfix 1's "bounded overshoot never crosses a whole-oz rate tier in practice" claim was wrong**: it crosses every time the floor lands on a whole-oz boundary (i.e., every time). Owning that diagnostic mistake — preserved in the commit log
+- **Root cause is the unit boundary, not the rounding direction.** `oz × 28.3495` is not an integer for any 1–16 whole-oz value → no integer gram value reverses to exactly N.00 oz under any rounding mode. The only fix is to not round-trip through grams at all
+- **Architectural fix.** Send `units: 'ounces'` with integer values for BOTH order-level AND per-item. New `distributeIntegerOzAcrossLines(itemWeights, orderFloorOz)` helper splits the whole-oz floor across physical lines as integers summing exactly to it (same first-physical-absorber pattern the packaging engine uses for its fractional rollup, expressed at integer-oz granularity). Order-level weight resolution hoisted above the line-item loop so the floor is known before distribution. `OZ_TO_G` constant + all grams conversions removed
+- **qty > 1 nuance (only imperfect case).** SS computes line total as `qty × per-unit`. For `qty=1` (dominant in observed orders): per-unit = lineIntegerOz exact. For `qty>1` where `lineIntegerOz/qty` isn't integer: per-unit ceils, bounded `≤ (qty-1) oz` over-shoot per such line, with `console.warn` so production frequency can be quantified. Phase 13b's original "SS truncates fractional oz per line" reason for grams doesn't apply to integer oz — no fraction to truncate
+- **Verification harness (`server/scripts/verify-weight-distribution.js`, new): 12/12 pass.** Operator-specified matrix incl. the real-order 5 oz reproducer (`[3, 2]` summing 5), 1 oz floor, single-physical, multi-item (`[4, 1, 1, 1]`), digital mix (digitals stay 0, physical absorbs all), pathological 5×0.6 oz clamp; plus null-safety + cross-checks against the 4 oz (hotfix-1 case, now `[3, 1]` exact) and 8 oz (round/ceil-agree, no regression) values. Lesson encoded: worked examples must exercise the bug class, not coincidentally-safe values
+- **Hotfix 1 stays in history** as a transitional patch — it did fix the 4 oz display, just not tier billing as claimed. Honest record over rewrite
+- Files: `server/services/shipstationService.js`, `server/scripts/verify-weight-distribution.js` (new)
+
 ---
 
 ## Reversed / removed
