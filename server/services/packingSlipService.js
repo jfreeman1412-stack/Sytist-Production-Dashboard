@@ -530,14 +530,17 @@ class PackingSlipService {
     y += 20;
 
     // Items header — Phase 59: "Items to Ship" is the prominent qty-summed
-    // total of lab-shippable rows (excludes specialty/dropship/digital);
-    // the 2-col indicator surfaces the layout switch so operators don't
-    // miss column 2. Right-edge QTY label drops in 2-col mode since each
+    // total of lab-shippable rows (excludes specialty/dropship/digital).
+    // The vertical column divider (rendered below) already communicates
+    // the 2-col structure visually; a textual "— 2 COLUMNS" suffix was
+    // tried in initial Phase 59 but removed after live-UI review as
+    // redundant. Right-edge QTY label drops in 2-col mode since each
     // column has its own qty badges and a single-edge label is misleading.
-    const itemsHeaderText = use2Col
-      ? `ITEMS TO SHIP: ${itemsToShipCount}   —   2 COLUMNS`
-      : `ITEMS TO SHIP: ${itemsToShipCount}`;
-    svgParts.push(`<text x="${leftCol}" y="${y + 28}" ${labelStyle}>${esc(itemsHeaderText)}</text>`);
+    svgParts.push(
+      `<text x="${leftCol}" y="${y + 28}" ${labelStyle}>` +
+        `ITEMS TO SHIP: ${itemsToShipCount}` +
+        `</text>`
+    );
     if (!use2Col) {
       svgParts.push(
         `<text x="${SLIP_WIDTH - MARGIN - 10}" y="${y + 28}" ${labelStyle} text-anchor="end">QTY</text>`
