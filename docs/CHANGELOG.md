@@ -361,6 +361,16 @@ Format: phase number → short title → what shipped → key files touched.
 - **Hotfix 1 stays in history** as a transitional patch — it did fix the 4 oz display, just not tier billing as claimed. Honest record over rewrite
 - Files: `server/services/shipstationService.js`, `server/scripts/verify-weight-distribution.js` (new)
 
+## Phase 58c — Product names display as leaf-only (everywhere)
+- Sytist hands us `>`-delimited hierarchies (`"Print Packages > Silver Package > 8x10"`); we now render just the leaf (`"8x10"`) at every operator-visible surface — dashboard UI, slip JPG, SS payload, `ms_notes` reprint audit, imposition `{item_description}` token, packaging trace + debug logs
+- **Architecture — Option Y (single source on the data shape).** Every line item carries both `productName` (full string, **identifier**, read by darkroom template lookup + specialty path construction + operator-edited config) and `productNameDisplay` (leaf, **display**, read by every render site). The field-name choice at the callsite signals intent — identifier-vs-display is structurally enforced, not utility-call discipline
+- `deriveDisplayName` helper at `sytistDbService` module level: `.split('>').pop().trim()` with empty-leaf fallback to the original string (so `"Print Packages > "` with trailing `>` never renders empty)
+- Set at all 4 `sytistDbService` construction sites: main cart line items, package constituents, addons, sibling parent-suffix variant (re-derives from suffixed string so team suffix appears in the leaf)
+- 8 server display sites + 8 client display sites updated to read `productNameDisplay`. `photosFailed[]` staging field renamed `productName` → `productNameDisplay` (client only reads `.length`, safe)
+- Identifier sites untouched: darkroom `template-mappings.json` matching, specialty `specialty-products.json` path construction, operator-edited settings pages. They keep reading `productName` (full path) — naturally protected by field-name choice
+- Existing weight-distribution harness still 12/12 pass; node --check clean all server; ESLint clean all client (1 pre-existing unrelated warning)
+- Files: `server/services/sytistDbService.js`, `shipstationService.js`, `packingSlipService.js`, `processingService.js`, `impositionService.js`, `packagingService.js`, `client/src/pages/OrderDetailPage.js`, `client/src/pages/settings/{LayoutDesignerPage,OrderOverridesPage,OverrideEditorPage}.js`
+
 ---
 
 ## Reversed / removed

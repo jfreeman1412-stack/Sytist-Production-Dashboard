@@ -2003,6 +2003,29 @@ Files: `client/src/pages/OrdersListPage.js`, `client/src/pages/settings/GalleryA
 
 ---
 
+## 58c. Product names display as leaf-only (everywhere)
+
+Operator-facing readability change: Sytist hands the dashboard a `>`-delimited product hierarchy (e.g. `"Print Packages > Silver Package > 8x10"`) — useful for matching/identifying, terrible for scanning a list of items. Phase 58c renders just the **leaf** (`"8x10"`) at every operator-visible surface — dashboard UI, packing slip JPG, ShipStation payload, `ms_notes` reprint audit (operator sees it in Sytist's own UI too), imposition `{item_description}` template token (renders on the imposed sheet if a layout uses it), packaging weight-trace log, server debug logs.
+
+**Architecture — Option Y (single source on the data shape).** `sytistDbService` is the only source of `productName` for line items, set at four construction sites: main cart line items (`L1052`), package constituents (`L311`), addons (`L451`), and the sibling parent-suffix variant (`L487`, which re-derives display from the suffixed string so the team suffix appears in the leaf). At each site the line item now carries **both** fields:
+
+- `productName` — full `>`-delimited string, **identifier**. Untouched downstream. Consumers that key off it (`darkroomService` template lookup at `L163/173/277/301/314/316`, `specialtyService` path construction at `L194/196/266/268`, operator-edited `template-mappings.json` and `specialty-products.json` records) keep reading this field — they're naturally protected because they read `productName`, not `productNameDisplay`.
+- `productNameDisplay` — leaf-only string, **display**. Every render site reads this. The field name itself signals the intent at every callsite, eliminating the per-display-site choice of "which utility do I call?" — a new display site added in 6 months just reads `productNameDisplay` and gets the right behaviour automatically.
+
+**Helper (one place).** `deriveDisplayName(productName)` at `sytistDbService` module level: `String(name).split('>').pop().trim()` with an empty-leaf guard — if the trim yields `''` (e.g. `"Print Packages > "` with a trailing `>`), fall back to the original string so the field is never empty. Display sites still guard with `|| '(no name)'` etc., but the helper itself never emits `''`.
+
+**Display sites updated.** Server: `shipstationService` payload line-item `name`, `packingSlipService` SVG render, `processingService` `ms_notes` reprint audit (`L456`), `processingService` `photosFailed` warning message (push field also renamed `productName` → `productNameDisplay` at `L1108/L1149`; reader at `L1907`), `impositionService` `{item_description}` template token (`L359`), `packagingService` weight-trace at `L511/L654`, `sytistDbService` debug log (`L258`). Client: `OrderDetailPage` line-item rows + process-result summaries + photo-failed callout + imposed-sheet alt text, `LayoutDesignerPage` preview-order picker, `OrderOverridesPage` cart row, `OverrideEditorPage` subtitle + cart switcher.
+
+**`photosFailed` field rename.** The internal `subResult.photosFailed[]` shape's `productName` field was renamed to `productNameDisplay` — safe because the client only reads `photosFailed.length`, not individual entries (verified by grep). Match the canonical line-item shape.
+
+**Identifier-vs-display separation, made explicit.** The rule from the audit (don't touch identifier sites) is now structurally enforced: if a consumer reads `productName`, it's doing an identifier operation (matching, path construction, lookup); if it reads `productNameDisplay`, it's rendering. The field-name choice at the callsite tells you which it is. No utility-call discipline needed.
+
+Verification: existing `verify-weight-distribution.js` still 12/12 pass (the SS helper export is unchanged); `node --check` clean on every server file; ESLint clean on every client file (only the pre-existing `ssSkipped` unused-var warning remains). Operational verification: process any order — leaf-only names should appear in the dashboard order detail, the slip JPG, the SS line-item display, and any `ms_notes` reprint audit text.
+
+Files: `server/services/sytistDbService.js`, `server/services/shipstationService.js`, `server/services/packingSlipService.js`, `server/services/processingService.js`, `server/services/impositionService.js`, `server/services/packagingService.js`, `client/src/pages/OrderDetailPage.js`, `client/src/pages/settings/LayoutDesignerPage.js`, `client/src/pages/settings/OrderOverridesPage.js`, `client/src/pages/settings/OverrideEditorPage.js`.
+
+---
+
 ## Open follow-ups
 
 - ~~Identify the upstream "Sportsline UI" integration creating phantom SS orders.~~ **Identified during Phase 47 hotfix 2 diagnosis (2026-05-14)**: a separate processing tool used by operator Kirsten. Writes to Sytist directly (`note_who: "Kirsten"` with "Order Has been changed to Printing and Production" — distinct from our `"Sytist Dashboard: Order processed..."` prefix) and creates SS orders outside our pipeline. The ms_notes comparison showed our dashboard processed ~9 of 555 composite-mapped orders in the last 14 days; the other 546 went through Kirsten's tool. Phase 33's "adopt without push" already handles the coexistence pattern — no code change required. The remaining question is operational, not technical: should the dashboard become the primary tool, or stay a special-case path? Worth a conversation with Kirsten, not more code.
