@@ -13,16 +13,76 @@
 // workaround from the PhotoDay codebase that we preserve unchanged.
 // Other endpoints use axios normally.
 //
-// Per-item weights are sent in GRAMS (integers), not ounces. SS truncates
-// fractional ounces per line item before summing them as the order
-// weight, which can lose up to ~1oz on multi-line orders. Grams are
-// integers so this lossy rounding can't bite us. The order-level weight
-// is also converted to grams for the same reason.
+// Per-item AND order-level weights are sent in OUNCES with integer
+// values (Phase 58 hotfix 2). The original Phase 13b switch to grams
+// dodged SS's "truncate fractional oz per line" behaviour; under
+// Phase 58 the order weight is whole-oz and the per-item rollup now
+// distributes that whole-oz across physical lines as INTEGER oz
+// (`distributeIntegerOzAcrossLines`), so there's no fraction to
+// truncate. Integer oz also bypasses the lossy oz×28.3495 round-trip
+// (a 4 oz floor → 113 g reverses to 3.99 oz in SS = 3 oz tier; a
+// 5 oz floor → 142 g per-item sum 143 g reverses to 5.04 oz = 6 oz
+// tier — both the exact failure mode Phase 58's floor was meant to
+// prevent). See SPEC §58 hotfix 2 for the full diagnosis.
 
 const axios = require('axios');
 const appSettings = require('../config/appSettings');
 
-const OZ_TO_G = 28.3495;
+// Phase 58 hotfix 2: weights are sent to ShipStation in OUNCES with
+// integer values — order-level AND per-item. The previous design
+// converted whole-oz to grams (OZ_TO_G = 28.3495) and let SS reverse
+// for display/billing; that round-trip is fundamentally lossy for
+// most whole-oz values (e.g. 4 oz × 28.3495 = 113.398 → round 113 →
+// reverse 3.99 oz → bills 3 oz tier instead of 4). Hotfix 1 swapped
+// round→ceil which moved 4.0 oz to 4.02 but didn't fix the
+// per-item-sum overshoot at 5 oz (5.04 oz → 6 oz tier). Sending
+// integer oz directly bypasses the conversion entirely — SS sees
+// exactly N oz and bills the N oz tier.
+//
+// The original Phase 13b reason for grams (SS truncates fractional
+// oz per line) doesn't apply to integer oz — no fraction to
+// truncate. distributeIntegerOzAcrossLines below splits the order's
+// whole-oz floor across physical lines as integers summing exactly
+// to the floor, using the same "first physical item absorbs" pattern
+// the packaging engine uses for its fractional rollup.
+//
+// Helper is exported (module.exports.distributeIntegerOzAcrossLines)
+// so the offline verification harness can test it without going
+// through the SS payload path.
+function distributeIntegerOzAcrossLines(itemWeights, orderFloorOz) {
+  const out = {};
+  let firstPhysicalKey = null;
+  let nonAbsorberSum = 0;
+  for (const iw of itemWeights || []) {
+    const key = iw && iw.lineItemKey;
+    if (!key) continue;
+    const rawOz = iw.weightOz || 0;
+    if (rawOz <= 0) {
+      // Digital / zero-weight line — never the absorber, contributes
+      // 0 to the order total (matches the engine's digital handling).
+      out[key] = 0;
+      continue;
+    }
+    if (firstPhysicalKey === null) {
+      // First physical line is the absorber. Placeholder for now;
+      // gets the floor − (non-absorber rounded sum) after the loop.
+      firstPhysicalKey = key;
+      out[key] = 0;
+      continue;
+    }
+    const r = Math.round(rawOz);
+    out[key] = r;
+    nonAbsorberSum += r;
+  }
+  if (firstPhysicalKey !== null) {
+    // Clamp to ≥0 — for the rare pathological combo (5+ items each
+    // ~0.6 oz with effectively zero baseWeight) the non-absorber sum
+    // can exceed the floor; the absorber goes to 0 and the line sum
+    // over-shoots by a few oz. Bounded; very unlikely in production.
+    out[firstPhysicalKey] = Math.max(0, orderFloorOz - nonAbsorberSum);
+  }
+  return out;
+}
 // Sytist line items can carry these flags; we don't ship the line item
 // if any of these are true. Matches the SKIP_FLAGS used by the Phase 11
 // processing pipeline.
@@ -502,17 +562,31 @@ class ShipStationService {
     }
 
     // ─── Build items with per-item weights from the engine ──
-    // ShipStation sums line-item weights if any SKU has Product
-    // Defaults stored on its side. The engine emits per-line weights
-    // (in oz) that total exactly the order weight. We convert each
-    // line's TOTAL weight (qty × unit) back to per-unit grams since
-    // ShipStation multiplies its unit weight by quantity itself.
-    const itemWeightByKey = {};
-    if (packaging?.itemWeights) {
-      for (const iw of packaging.itemWeights) {
-        if (iw.lineItemKey) itemWeightByKey[iw.lineItemKey] = iw.weightOz;
-      }
+    // Phase 58 hotfix 2: resolve the order's whole-oz floor BEFORE the
+    // line-item loop (this resolution used to run later, after the
+    // loop, under hotfix 1) so we can distribute it across physical
+    // lines as integer oz. Then build a per-line map of integer oz
+    // summing exactly to the floor. SS gets `units: 'ounces'` integers
+    // throughout — no oz↔g round-trip lossiness, exact rate-tier
+    // billing. SS sums line-item weights if any SKU has Product
+    // Defaults stored on its side, so the per-item sum must equal the
+    // order weight (which the integer distribution guarantees).
+    let weightOz;
+    if (overrides.weight?.value != null) {
+      weightOz = parseFloat(overrides.weight.value);
+    } else if (packaging?.weight?.value != null) {
+      weightOz = packaging.weight.value;
+    } else {
+      weightOz = parseFloat(
+        appSettings.getRawValueSync('defaultWeightOz') || '4'
+      );
     }
+    weightOz = Math.max(1, Math.floor(weightOz));
+
+    const integerOzByKey = distributeIntegerOzAcrossLines(
+      packaging?.itemWeights || [],
+      weightOz
+    );
 
     const items = shippable.map((li) => {
       const namePieces = [];
@@ -523,7 +597,7 @@ class ShipStationService {
 
       const lineItemKey = String(li.cartId || '');
       const qty = li.qty || 1;
-      const lineWeightOz = itemWeightByKey[lineItemKey];
+      const lineIntegerOz = integerOzByKey[lineItemKey];
 
       const payload = {
         lineItemKey,
@@ -577,23 +651,31 @@ class ShipStationService {
         payload.imageUrl = imageUrl;
       }
 
-      // Per-unit weight in grams. Engine gives us LINE total (qty×unit)
-      // so divide back out first. Use grams because SS truncates
-      // fractional ounces per line when summing.
-      //
-      // Phase 58 hotfix: `Math.ceil`, not `Math.round`. The round-trip
-      // contract is "oz → g → oz must reverse to ≥ the original oz"
-      // (otherwise Phase 58's floor is silently undone: e.g. 4 oz ×
-      // 28.3495 = 113.398 → round 113 → SS reverse 113 / 28.3495 =
-      // 3.99 oz, bills at the 3 oz tier — the opposite of what the
-      // floor was for). Ceil guarantees the reverse direction at the
-      // cost of ≤1 g per item; the per-item sum can exceed the order-
-      // level grams ceil by up to (N-1) g (~0.04 oz/item), bounded
-      // well within whole-oz rate tiers.
-      if (lineWeightOz !== undefined && qty > 0) {
-        const unitWeightOz = lineWeightOz / qty;
-        const unitWeightG = Math.max(1, Math.ceil(unitWeightOz * OZ_TO_G));
-        payload.weight = { value: unitWeightG, units: 'grams' };
+      // Phase 58 hotfix 2: per-unit weight in OUNCES (integer). The
+      // line's integer-oz contribution was computed once above via
+      // `distributeIntegerOzAcrossLines`, so the sum across all
+      // physical lines equals the order's whole-oz floor exactly —
+      // no oz↔g round-trip lossiness (see SPEC §58 hotfix 2).
+      // For qty=1 (the dominant case): per-unit = lineIntegerOz
+      // exactly. For qty>1: SS computes line total as qty × per-unit
+      // (integer), and Phase 13b's "SS truncates fractional oz per
+      // line" still applies — so we Math.ceil per-unit, accepting a
+      // bounded ≤(qty-1) oz over-shoot per such line. A console.warn
+      // fires when this actually happens so we can quantify the
+      // (probably rare) case in production.
+      if (lineIntegerOz !== undefined && qty > 0) {
+        let unitOz;
+        if (qty === 1) {
+          unitOz = lineIntegerOz;
+        } else {
+          unitOz = Math.ceil(lineIntegerOz / qty);
+          if (unitOz * qty !== lineIntegerOz) {
+            console.warn(
+              `[SS] line ${lineItemKey} sku=${String(li.sku || '')} qty=${qty} lineIntegerOz=${lineIntegerOz}: per-unit ceil=${unitOz} → SS will compute ${unitOz * qty} oz (over by ${unitOz * qty - lineIntegerOz} oz). qty>1 with non-divisible integer-oz line — bounded; see SPEC §58 hotfix 2`
+            );
+          }
+        }
+        payload.weight = { value: unitOz, units: 'ounces' };
       }
 
       return payload;
@@ -629,9 +711,11 @@ class ShipStationService {
     // engine failure or a fresh install with no SKUs registered yet,
     // app-settings defaults take over.
 
-    const defaultWeightOz = parseFloat(
-      appSettings.getRawValueSync('defaultWeightOz') || '4'
-    );
+    // Phase 58 hotfix 2: `defaultWeightOz` is no longer declared here;
+    // the order-level weight resolution (overrides > engine > app-
+    // settings default) was hoisted above the line-item loop and now
+    // looks up `defaultWeightOz` inline at the resolution site so
+    // `weightOz` is available for integer-oz per-line distribution.
     const defaultLength = parseFloat(
       appSettings.getRawValueSync('defaultLengthIn') || '10'
     );
@@ -650,31 +734,13 @@ class ShipStationService {
       appSettings.getRawValueSync('defaultPackageCode') ||
       'large_envelope_or_flat';
 
-    // Order-level weight resolution: overrides > engine > app-settings.
-    let weightOz;
-    if (overrides.weight?.value != null) {
-      weightOz = parseFloat(overrides.weight.value);
-    } else if (packaging?.weight?.value != null) {
-      weightOz = packaging.weight.value;
-    } else {
-      weightOz = defaultWeightOz;
-    }
-    // Phase 58: floor to whole oz (min 1) BEFORE the grams conversion —
-    // USPS gives a 1oz grace per package, so an 8.7oz package labelled
-    // 8oz is safe and saves a rate tier. Applies universally (all
-    // packages, all carriers). The packaging-engine branch is already
-    // floored upstream; this idempotently re-floors there and catches
-    // the operator-override and no-engine fallback so the rule really
-    // is universal at the SS payload boundary.
-    //
-    // Phase 58 hotfix: `Math.ceil`, not `Math.round`, for the grams
-    // conversion. Round-trip contract: oz → g → oz must reverse to ≥
-    // the original whole-oz floor. With round, values like 4 / 7 / 10
-    // / 13 / 15 oz undershoot by ~0.5 g and SS reverse-displayed them
-    // as 3.99 / 6.99 / 9.99 / 12.99 / 14.99 — billing at the LOWER
-    // tier, the exact failure Phase 58's floor was meant to prevent.
-    weightOz = Math.max(1, Math.floor(weightOz));
-    const weightG = Math.max(1, Math.ceil(weightOz * OZ_TO_G));
+    // Phase 58 hotfix 2: `weightOz` (whole-oz floor, applies to
+    // overrides, engine output, and the no-engine `defaultWeightOz`
+    // fallback equally) was resolved above, before the line-item
+    // loop, so we could distribute it across physical lines as
+    // integer oz (`integerOzByKey`). The grams conversion that lived
+    // here (`weightG = Math.ceil(weightOz * OZ_TO_G)` under hotfix 1)
+    // is gone — the payload sends `units: 'ounces'` directly.
 
     // Dimensions resolution: overrides > engine > app-settings.
     let dimensions;
@@ -726,7 +792,7 @@ class ShipStationService {
       shipTo: shipToAddress,
       items,
       internalNotes,
-      weight: { value: weightG, units: 'grams' },
+      weight: { value: weightOz, units: 'ounces' },
       dimensions,
       confirmation: 'none',
       carrierCode,
@@ -826,3 +892,8 @@ class ShipStationService {
 }
 
 module.exports = new ShipStationService();
+// Phase 58 hotfix 2: export the integer-oz distribution helper for the
+// offline verification harness (server/scripts/verify-weight-
+// distribution.js). Singleton stays the default export; this is a
+// named attach in the same pattern as compositeService's LAYOUTS_PATH.
+module.exports.distributeIntegerOzAcrossLines = distributeIntegerOzAcrossLines;
