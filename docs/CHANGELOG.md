@@ -371,6 +371,12 @@ Format: phase number → short title → what shipped → key files touched.
 - Existing weight-distribution harness still 12/12 pass; node --check clean all server; ESLint clean all client (1 pre-existing unrelated warning)
 - Files: `server/services/sytistDbService.js`, `shipstationService.js`, `packingSlipService.js`, `processingService.js`, `impositionService.js`, `packagingService.js`, `client/src/pages/OrderDetailPage.js`, `client/src/pages/settings/{LayoutDesignerPage,OrderOverridesPage,OverrideEditorPage}.js`
 
+## Phase 58c hotfix — missed second cart-row mapper in `getOrderById` (order detail rendered "(no name)" for every item)
+- **Real-order regression on the detail page.** Original Phase 58c set `productNameDisplay` at 4 line-item construction sites; the audit grep's `head -25` cut off before the FIFTH setter at `sytistDbService:1578` (the `getOrderById` main cart-row mapper — the order DETAIL data path, distinct from the list-page path at L1054). Detail page received line items with `productNameDisplay` undefined → `OrderDetailPage.js:1265` fallback `|| '(no name)'` fired on every row
+- **Fix:** add `productNameDisplay: deriveDisplayName(c.cart_product_name || '')` at L1578. Exhaustive `productName:` grep (no head limit) now shows zero other missed setters
+- **Lesson recorded as a separate CLAUDE.md bullet** (sibling to the "worked examples" one — different lesson): completeness audit greps must not be truncated with `head -N`. The original Phase 58c miss was a direct consequence of the truncated grep silently giving a smaller answer than reality
+- Files: `server/services/sytistDbService.js`
+
 ---
 
 ## Reversed / removed
