@@ -88,3 +88,8 @@ desktop.ini
 .cache/
 *.tmp
 *.temp
+
+# Scratch output from verify-* harness scripts (Phase 59: slip-pagination
+# scratch directory holds rendered JPGs for human inspection). Generic
+# pattern so future verifications under server/scripts/ don't pollute git.
+server/scripts/_*-scratch/

@@ -70,6 +70,7 @@ const QRCode = require('qrcode');
 
 const pathsService = require('./pathsService');
 const specialtyService = require('./specialtyService');
+const packagingService = require('./packagingService');
 const greenscreenService = require('./greenscreenService');
 
 // 5" × 8" at 300 DPI
@@ -311,6 +312,40 @@ class PackingSlipService {
     } = ctx;
     const itemCount = printedItems.length;
 
+    // ─── Phase 59: pre-resolve per-item eligibility flags ────
+    // We need these BEFORE building the SVG because:
+    //   1. The "Items to Ship" total (shown in the ITEMS header band) excludes
+    //      specialty/dropship/digital-by-config rows — they ship separately,
+    //      not in the lab box this slip rides on top of. Rows still render on
+    //      the slip for operator awareness; only the count excludes them.
+    //   2. The per-row loop already needed isSpecialty for the orange tint
+    //      band; co-locating all three resolutions here means one pre-pass
+    //      instead of three.
+    const eligibilityByCartId = {};
+    for (const li of printedItems) {
+      let isSpecialty = false;
+      let isDropShipped = false;
+      let isDigitalByConfig = false;
+      try { isSpecialty = await specialtyService.isSpecialty(li.sku); } catch {}
+      try { isDropShipped = await specialtyService.isDropShipped(li.sku); } catch {}
+      try { isDigitalByConfig = await packagingService.isDigital(li.sku); } catch {}
+      eligibilityByCartId[li.cartId] = {
+        isSpecialty,
+        isDropShipped,
+        isDigitalByConfig,
+        shipsWithLabOrder: !(isSpecialty || isDropShipped || isDigitalByConfig),
+      };
+    }
+
+    // Qty-summed total of rows that actually ship with this lab order.
+    // Matches what a packer arrives at by counting non-specialty rows × qty.
+    let itemsToShipCount = 0;
+    for (const li of printedItems) {
+      if (eligibilityByCartId[li.cartId]?.shipsWithLabOrder) {
+        itemsToShipCount += (li.qty || 1);
+      }
+    }
+
     // ─── Sizing math ─────────────────────────────────────
     // Reserve fixed space for header / order info / ship-to / items header
     // / footer. What's left determines per-item row height.
@@ -323,16 +358,47 @@ class PackingSlipService {
     const reservedBottom = FOOTER_BLOCK + MARGIN;
     const availableForItems = SLIP_HEIGHT - reservedTop - reservedBottom;
 
+    // ─── Phase 59: two-column layout decision ────────────
+    // Single-column (1–6 items) keeps today's per-N thumb sizing.
+    // Two-column (≥7 items) splits the items zone into two 680-px columns
+    // with a 20-px gutter; items 1..ceil(N/2) fill column 1 top-to-bottom,
+    // items ceil(N/2)+1..N fill column 2 — canonical print order preserved.
+    // Thumb size is adaptive within 2-col mode (100→60 floor) to extend
+    // the per-column row capacity. Hard ceiling: ~20 items at 60-px floor.
+    // Beyond that, items overflow the footer zone again — operator gets a
+    // console.warn (see below) and is expected to handle manually.
+    const use2Col = itemCount >= 7;
+    const COLUMN_GUTTER = 20;
+    const columnWidth = use2Col ? Math.floor((CONTENT_WIDTH - COLUMN_GUTTER) / 2) : CONTENT_WIDTH;
+    const column1Left = MARGIN;                                  // x: 60 (always)
+    const column2Left = use2Col ? MARGIN + columnWidth + COLUMN_GUTTER : MARGIN;
+    const dividerX = use2Col ? MARGIN + columnWidth + Math.floor(COLUMN_GUTTER / 2) : null;
+    const itemsPerCol = use2Col ? Math.ceil(itemCount / 2) : itemCount;
+
     let thumbSize;
     if (itemCount <= 0) thumbSize = 0;
+    else if (use2Col) {
+      // Adaptive within 2-col: start at 100, shrink toward a 60-px floor
+      // as items per column rise. Mirrors today's "shrink to fit" pattern
+      // applied per-column instead of full-width.
+      thumbSize = Math.max(60, Math.min(100, Math.floor(availableForItems / itemsPerCol) - 20));
+    }
     else if (itemCount <= 2) thumbSize = 200;
     else if (itemCount <= 4) thumbSize = 160;
-    else if (itemCount <= 6) thumbSize = 120;
-    else thumbSize = Math.max(60, Math.floor(availableForItems / itemCount) - 20);
+    else /* itemCount <= 6 */ thumbSize = 120;
     const itemRowHeight = thumbSize + 20;
     const itemNameSize = Math.max(18, Math.round(thumbSize * 0.22));
     const itemDetailSize = Math.max(14, Math.round(thumbSize * 0.16));
     const itemQtySize = Math.max(28, Math.round(thumbSize * 0.35));
+
+    // Phase 59: operator visibility for the rare >20-item case where
+    // two-column adaptive shrink still overflows. Logged once per slip.
+    if (itemCount > 20) {
+      console.warn(
+        `[Packing Slip] warning: order ${order.orderNumber || order.orderId} has ${itemCount} items, ` +
+        `may overflow 2-column layout (ceiling ~20). Verify slip output.`
+      );
+    }
 
     // ─── Build base SVG (text + boxes only, no raster images) ──
     const svgParts = [];
@@ -463,11 +529,20 @@ class PackingSlipService {
     );
     y += 20;
 
-    // Items header
-    svgParts.push(`<text x="${leftCol}" y="${y + 28}" ${labelStyle}>ITEMS (${itemCount})</text>`);
-    svgParts.push(
-      `<text x="${SLIP_WIDTH - MARGIN - 10}" y="${y + 28}" ${labelStyle} text-anchor="end">QTY</text>`
-    );
+    // Items header — Phase 59: "Items to Ship" is the prominent qty-summed
+    // total of lab-shippable rows (excludes specialty/dropship/digital);
+    // the 2-col indicator surfaces the layout switch so operators don't
+    // miss column 2. Right-edge QTY label drops in 2-col mode since each
+    // column has its own qty badges and a single-edge label is misleading.
+    const itemsHeaderText = use2Col
+      ? `ITEMS TO SHIP: ${itemsToShipCount}   —   2 COLUMNS`
+      : `ITEMS TO SHIP: ${itemsToShipCount}`;
+    svgParts.push(`<text x="${leftCol}" y="${y + 28}" ${labelStyle}>${esc(itemsHeaderText)}</text>`);
+    if (!use2Col) {
+      svgParts.push(
+        `<text x="${SLIP_WIDTH - MARGIN - 10}" y="${y + 28}" ${labelStyle} text-anchor="end">QTY</text>`
+      );
+    }
     y += 50;
     const itemsStartY = y;
 
@@ -477,6 +552,17 @@ class PackingSlipService {
     svgParts.push(
       `<line x1="${MARGIN}" y1="${footerY}" x2="${SLIP_WIDTH - MARGIN}" y2="${footerY}" stroke="#dddddd" stroke-width="2"/>`
     );
+
+    // Phase 59: vertical divider between columns when 2-col is active.
+    // Faint #eeeeee to match the inter-row dividers; spans the full items
+    // zone from itemsStartY down to just above the footer divider line so
+    // it frames the items zone even when column 2 is partially empty.
+    if (use2Col && dividerX !== null) {
+      svgParts.push(
+        `<line x1="${dividerX}" y1="${itemsStartY}" x2="${dividerX}" y2="${footerY - 10}" ` +
+          `stroke="#eeeeee" stroke-width="1"/>`
+      );
+    }
 
     // Footer contact info (right of QR code)
     const contactX = MARGIN + QR_SIZE + 30;
@@ -595,26 +681,31 @@ class PackingSlipService {
       }
     }
 
-    // Item rows
+    // Item rows — Phase 59: in 2-col mode itemY resets to itemsStartY when
+    // crossing from column 1 (idx < itemsPerCol) to column 2 (idx >=
+    // itemsPerCol). Each item's horizontal anchors derive from its
+    // column's colLeft + columnWidth (1-col mode collapses to the
+    // full-width values, so the geometry below is unified).
     let itemY = itemsStartY;
-
-    // Pre-resolve specialty status for each line item so the per-row loop
-    // doesn't have to await on each iteration. Specialty SKUs get the
-    // orange row tint from highlightColors.specialty (default #fff5e6).
-    const specialtyByCartId = {};
-    for (const li of printedItems) {
-      try {
-        specialtyByCartId[li.cartId] = await specialtyService.isSpecialty(li.sku);
-      } catch {
-        specialtyByCartId[li.cartId] = false;
-      }
-    }
+    // Eligibility is pre-resolved at the top of _composeSlip into
+    // eligibilityByCartId — used here for the specialty highlight tint
+    // (today's behavior) AND for the count earlier (Phase 59).
 
     for (let idx = 0; idx < printedItems.length; idx++) {
       const li = printedItems[idx];
       const qty = li.qty || 1;
       const isHighQty = qty > 1;
-      const isSpecialty = !!specialtyByCartId[li.cartId];
+      const isSpecialty = !!eligibilityByCartId[li.cartId]?.isSpecialty;
+
+      // Column placement: items 0..itemsPerCol-1 in column 1, rest in column 2.
+      // At the column boundary (idx === itemsPerCol in 2-col mode) reset
+      // itemY back to the top of the items zone.
+      const inColumn2 = use2Col && idx >= itemsPerCol;
+      if (use2Col && idx === itemsPerCol) {
+        itemY = itemsStartY;
+      }
+      const colLeft = inColumn2 ? column2Left : column1Left;
+      const colWidth = columnWidth;
 
       // Highlight band: specialty takes precedence over qty (specialty
       // matters more for routing — operator needs to see those first).
@@ -626,10 +717,10 @@ class PackingSlipService {
       if (bandColor) {
         composites.push({
           input: Buffer.from(
-            `<svg width="${CONTENT_WIDTH}" height="${thumbSize + 10}" xmlns="http://www.w3.org/2000/svg">` +
-              `<rect width="${CONTENT_WIDTH}" height="${thumbSize + 10}" fill="${bandColor}" rx="6"/></svg>`
+            `<svg width="${colWidth}" height="${thumbSize + 10}" xmlns="http://www.w3.org/2000/svg">` +
+              `<rect width="${colWidth}" height="${thumbSize + 10}" fill="${bandColor}" rx="6"/></svg>`
           ),
-          left: MARGIN,
+          left: colLeft,
           top: itemY - 5,
         });
       }
@@ -784,7 +875,7 @@ class PackingSlipService {
         const offsetY = Math.round((thumbSize - thumbMeta.height) / 2);
         composites.push({
           input: thumbBuffer,
-          left: MARGIN + 10,
+          left: colLeft + 10,
           top: itemY + offsetY,
         });
       } else {
@@ -796,14 +887,16 @@ class PackingSlipService {
               `<text x="${thumbSize / 2}" y="${thumbSize / 2 + 6}" font-family="Arial, sans-serif" font-size="14" fill="#cccccc" text-anchor="middle">No image</text>` +
               `</svg>`
           ),
-          left: MARGIN + 10,
+          left: colLeft + 10,
           top: itemY,
         });
       }
 
-      // Item text + qty
-      const textX = MARGIN + thumbSize + 25;
-      const textWidth = SLIP_WIDTH - textX - MARGIN - 10;
+      // Item text + qty — Phase 59: textX/textWidth derive from the active
+      // column rather than the full slip width. In 1-col mode these collapse
+      // to the original (colLeft=MARGIN, colWidth=CONTENT_WIDTH) values.
+      const textX = colLeft + thumbSize + 25;
+      const textWidth = colLeft + colWidth - textX - 10;
       const qtyColor = isHighQty ? '#DC3545' : '#222222';
       const qtyBadge = isHighQty
         ? `<rect x="${textWidth - Math.round(itemNameSize * 4)}" y="${Math.round(itemNameSize * 1.8)}" ` +
@@ -884,13 +977,17 @@ class PackingSlipService {
 
       itemY += itemRowHeight;
 
-      if (idx < printedItems.length - 1) {
+      // Inter-row divider: skip when this is the last row in its column
+      // (last item overall, OR — in 2-col mode — the last item of column 1).
+      const isLastInColumn1 = use2Col && idx === itemsPerCol - 1;
+      const isLastOverall = idx === printedItems.length - 1;
+      if (!isLastInColumn1 && !isLastOverall) {
         composites.push({
           input: Buffer.from(
-            `<svg width="${CONTENT_WIDTH - 20}" height="2" xmlns="http://www.w3.org/2000/svg">` +
-              `<line x1="0" y1="1" x2="${CONTENT_WIDTH - 20}" y2="1" stroke="#eeeeee" stroke-width="1"/></svg>`
+            `<svg width="${colWidth - 20}" height="2" xmlns="http://www.w3.org/2000/svg">` +
+              `<line x1="0" y1="1" x2="${colWidth - 20}" y2="1" stroke="#eeeeee" stroke-width="1"/></svg>`
           ),
-          left: MARGIN + 10,
+          left: colLeft + 10,
           top: itemY - 10,
         });
       }
