@@ -392,6 +392,18 @@ Format: phase number → short title → what shipped → key files touched.
 
 ---
 
+## Phase 60 — Digital-only orders get their own workflow bucket
+
+- **Bug:** Home/Manager galleries' orders showed under the **League** tab when the customer ordered only digital downloads. `categorizeShipping`'s numeric fallback bucketed `$0.00` shipping + empty option into `ship_to_league` (`else → league`). Diagnostic (90d): ~99 of the empty-option `$0.00` orders were digital-only and mostly belonged to home/manager galleries.
+- **Fix:** new `'digital'` workflow value. `categorizeShipping(optionName, cost, isDigitalOnly)` — a digital-only order (no physical item) in the league cost band now returns `workflow:'digital', uncategorized:false`. Option-name match still always wins (a digital order with an explicit `USPS-Ship to Home` option stays home). Digital orders aren't flagged uncategorized (deterministic, no "add to mapping" ⚠).
+- **JS ↔ SQL parity:** `_buildWorkflowSqlPredicate` gains a `'digital'` bucket and excludes digital-only from the `ship_to_league` **fallback** branch (name-matched league untouched). Digital-only = `NOT EXISTS` a physical cart row (`cart_download=0 AND sku NOT IN <packaging-config category=digital SKUs>` — Phase 45 landmine: 5D-type digital packages carry `cart_download=0`); checks `ms_cart` + `ms_cart_archive`. The digital-SKU list is **inlined** (validated `[A-Z0-9 _-]`, trusted local config) to avoid param juggling across the predicate + computed SELECT columns. The same `_physicalItemExistsSql` computes an `isDigitalOnly` column in the list query, `getOrderById`, and `getOrderCounts`, so badge / detail / filter / counts never disagree.
+- **Downstream (safe):** `'digital'` orders take the single-bundle process path (vs per-team) and skip SS auto-create (non-home) — harmless, digital-only orders have no physical output.
+- **Client:** amber **Digital** tab + `WorkflowBadge` (OrdersListPage), detail-page `WorkflowBadge` label/color (OrderDetailPage), Home dashboard stat card (HomePage).
+- **Verification:** `server/scripts/verify-shipping-classify.js` 11/11 (real `categorizeShipping`); live DB — 4 known orders reclassify `digital`, digital filter = 173 (all statuses), league still 1,724 with 0 leaks, home unaffected (23,913).
+- Files: `server/services/sytistDbService.js`, `server/scripts/verify-shipping-classify.js`, `client/src/pages/OrdersListPage.js`, `client/src/pages/HomePage.js`, `client/src/pages/OrderDetailPage.js`
+
+---
+
 ## Reversed / removed
 
 - **Phase 31**: auto-push packaging during adopt — reversed in Phase 33 after it conflicted with the upstream "Sportsline UI" tool's payload

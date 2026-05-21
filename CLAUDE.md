@@ -35,6 +35,16 @@ The remote Sytist MySQL database is **read-only except** for these explicit writ
 - **DATETIME from `mysql2` comes back as `"YYYY-MM-DD HH:MM:SS"` (space, not T)**. ShipStation V1 sometimes rejects this; always convert to ISO 8601 with `new Date(value).toISOString()` before sending (Phase 43).
 - **`order_id` is an integer**. Don't quote it as a string in SQL.
 - **Status IDs** in `ms_orders.order_open_status`: 0 = Open / queue, 40 = Printing/Production, 39 = Shipped.
+- **Workflow buckets** (`shipping.workflow`): `ship_to_home`, `ship_to_managers`, `ship_to_league`, and **`digital`** (Phase 60). Derived, not stored in Sytist — by `sytistDbService.categorizeShipping` (option-name match wins, else numeric cost fallback). `digital` = a digital-only order (no physical line item) that would otherwise hit the `$0.00 → league` fallback; it gets its own orders-list tab + Home stat card. Anything that enumerates "the three ship_to_* workflows" must now consider the 4th.
+
+### Workflow classification has two implementations that MUST agree (Phase 14a + 60)
+
+Workflow is decided in **two** places and they must classify the same order identically: the JS `categorizeShipping(optionName, cost, isDigitalOnly)` (per-order display badge) and the SQL `_buildWorkflowSqlPredicate(workflow, digitalSkuList)` (the list filter, next/prev navigation, AND the count-badge query). If you change the bucketing rule in one, change the other in the same commit — a drift makes the tab counts disagree with the filtered list, or the badge disagree with which tab an order appears in.
+
+Phase 60 specifics worth not breaking:
+- **Option-name match always wins** over cost and over digital status. The `digital` bucket only catches orders whose option name is *unmapped* and that hit the numeric fallback — a digital order with an explicit `USPS-Ship to Home` option stays home.
+- **"Digital-only" = `NOT EXISTS` a physical cart row**, where physical = `cart_download = 0 AND UPPER(cart_sku) NOT IN (<digital-by-config SKUs>)`. The SKU exclusion is **required** by the Phase 45 landmine — digital *packages* (5D etc.) carry `cart_download = 0`, so `cart_download` alone misses them. The SKU list comes from `packaging-config.json` `category:'digital'`, is **inlined** into SQL (validated `[A-Z0-9 _-]`, trusted local config — not a bound param, to avoid ordering bugs across the predicate + the computed `isDigitalOnly` SELECT columns), and checks **both** `ms_cart` and `ms_cart_archive`. The single `_physicalItemExistsSql` helper feeds the predicate, the list query's `isDigitalOnly` column, `getOrderById`, and `getOrderCounts` — keep them on that one helper so they can't diverge.
+- `digital` orders carry `uncategorized: false` (deterministic classification — no shipping option to add to the mapping, so no misleading "add to config" ⚠ badge), unlike the home/managers/league numeric-fallback buckets which stay `uncategorized: true`.
 
 ### Composite/composed thumbnails
 
