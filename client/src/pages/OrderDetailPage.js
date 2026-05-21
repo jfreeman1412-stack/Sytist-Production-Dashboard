@@ -5536,11 +5536,13 @@ function WorkflowBadge({ workflow, uncategorized, shippingOption }) {
     ship_to_home: 'Ship to Home',
     ship_to_managers: 'Ship to Managers',
     ship_to_league: 'Ship to League',
+    digital: 'Digital', // Phase 60: digital-only / no-ship order
   };
   const colors = {
     ship_to_home: { fg: '#4caf50', bg: 'rgba(76,175,80,0.12)', border: 'rgba(76,175,80,0.4)' },
     ship_to_managers: { fg: '#b48af0', bg: 'rgba(156,106,222,0.12)', border: 'rgba(156,106,222,0.4)' },
     ship_to_league: { fg: '#37b6cf', bg: 'rgba(55,182,207,0.12)', border: 'rgba(55,182,207,0.4)' },
+    digital: { fg: '#ffb300', bg: 'rgba(255,179,0,0.12)', border: 'rgba(255,179,0,0.4)' },
   };
   const c = colors[workflow] || {
     fg: 'var(--text-secondary)',

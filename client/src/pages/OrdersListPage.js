@@ -607,6 +607,9 @@ export default function OrdersListPage() {
     { key: 'ship_to_home', label: 'Ship to Home' },
     { key: 'ship_to_managers', label: 'Managers' },
     { key: 'ship_to_league', label: 'League' },
+    // Phase 60: digital-only orders (no physical item, $0.00 shipping) that
+    // previously fell into League via the cost fallback now bucket here.
+    { key: 'digital', label: 'Digital' },
   ];
 
   return (
@@ -1499,11 +1502,14 @@ function WorkflowBadge({ workflow, uncategorized }) {
     ship_to_home: { bg: 'rgba(76,175,80,0.15)', fg: '#4caf50', border: 'rgba(76,175,80,0.4)' },
     ship_to_managers: { bg: 'rgba(156,106,222,0.15)', fg: '#b48af0', border: 'rgba(156,106,222,0.4)' },
     ship_to_league: { bg: 'rgba(55,182,207,0.15)', fg: '#37b6cf', border: 'rgba(55,182,207,0.4)' },
+    // Phase 60: digital-only (no-ship) — amber, distinct from the ship-to hues.
+    digital: { bg: 'rgba(255,179,0,0.15)', fg: '#ffb300', border: 'rgba(255,179,0,0.4)' },
   };
   const labels = {
     ship_to_home: 'Home',
     ship_to_managers: 'Managers',
     ship_to_league: 'League',
+    digital: 'Digital',
   };
   const c = colors[workflow] || { bg: 'var(--bg-input)', fg: 'var(--text-muted)', border: 'var(--border-color)' };
   return (

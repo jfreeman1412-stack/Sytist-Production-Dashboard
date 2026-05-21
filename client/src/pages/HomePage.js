@@ -146,6 +146,14 @@ export default function HomePage() {
           accent="#37b6cf"
           onClick={() => goToFiltered('workflow', 'ship_to_league')}
         />
+        {/* Phase 60: digital-only orders (no physical item, $0.00 shipping) */}
+        <StatCard
+          label="Digital"
+          count={counts?.byWorkflow?.digital ?? null}
+          loading={countsLoading}
+          accent="#ffb300"
+          onClick={() => goToFiltered('workflow', 'digital')}
+        />
       </div>
 
       {countsError && (

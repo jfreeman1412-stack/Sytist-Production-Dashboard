@@ -23,6 +23,58 @@ const SHIPPING_MAPPING_PATH = path.join(
   'shipping-option-mappings.json'
 );
 
+// Phase 60: digital-only order detection for workflow classification.
+// A customer who orders only digital downloads pays no shipping ($0.00,
+// empty shipping option), which used to fall through categorizeShipping's
+// numeric fallback into ship_to_league. Such an order has nothing physical
+// to ship, so it now goes to its own 'digital' workflow bucket instead.
+const PACKAGING_CONFIG_PATH = path.join(
+  __dirname,
+  '..',
+  'config',
+  'packaging-config.json'
+);
+
+// Returns a SQL-safe, uppercased, single-quoted, comma-joined list of the
+// SKUs flagged category='digital' in packaging-config.json — e.g.
+// "'3D','5D','20D'" — or null when none. Inlined into SQL (not a bound
+// param) because the same clause is reused at many query positions
+// (predicate + computed SELECT columns) and param-array juggling across
+// those positions is error-prone; the source is trusted LOCAL config and
+// every SKU is validated against [A-Z0-9 _-] so there is no injection
+// surface. Read fresh each call so operator edits to packaging-config take
+// effect without a restart (matching packagingService.getConfig's contract).
+function _loadDigitalSkuList() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(PACKAGING_CONFIG_PATH, 'utf8'));
+    const weights = cfg.productWeights || {};
+    const skus = Object.keys(weights)
+      .filter((k) => weights[k] && weights[k].category === 'digital')
+      .map((s) => String(s).toUpperCase())
+      .filter((s) => /^[A-Z0-9 _-]+$/.test(s));
+    return skus.length ? skus.map((s) => `'${s}'`).join(',') : null;
+  } catch {
+    return null;
+  }
+}
+
+// SQL fragment: TRUE when the order has at least one PHYSICAL (shippable)
+// line item. Physical = a cart row that is neither a Sytist download
+// (cart_download=1) nor a digital-by-config SKU (Phase 45: digital packages
+// like 5D carry cart_download=0, so the SKU list is required to catch them).
+// Checks BOTH ms_cart and ms_cart_archive since an order's rows live in one
+// or the other (mirrors the gallery-filter EXISTS pattern). Param-free —
+// the digital SKU list is the validated inline string from
+// _loadDigitalSkuList(). The negation (NOT this) is "digital-only".
+function _physicalItemExistsSql(digitalSkuList) {
+  const skuLive = digitalSkuList ? ` AND UPPER(c.cart_sku) NOT IN (${digitalSkuList})` : '';
+  const skuArch = digitalSkuList ? ` AND UPPER(ca.cart_sku) NOT IN (${digitalSkuList})` : '';
+  return (
+    `(EXISTS (SELECT 1 FROM ms_cart c WHERE c.cart_order = o.order_id AND c.cart_download = 0${skuLive})` +
+    ` OR EXISTS (SELECT 1 FROM ms_cart_archive ca WHERE ca.cart_order = o.order_id AND ca.cart_download = 0${skuArch}))`
+  );
+}
+
 let SHIPPING_MAP = {
   ship_to_home: [],
   ship_to_managers: [],
@@ -75,9 +127,12 @@ try {
  * 2. Falls back to numeric rule based on shipping cost.
  * 3. Returns { workflow, uncategorized: bool } so UI can show warning badge.
  */
-function categorizeShipping(optionName, cost) {
+function categorizeShipping(optionName, cost, isDigitalOnly = false) {
   const opt = (optionName || '').trim();
 
+  // A configured option-name match ALWAYS wins, regardless of cost or
+  // digital status. A digital-only order that still carries an explicit
+  // "USPS-Ship to Home" option stays home — the customer/gallery tagged it.
   if (SHIPPING_MAP.ship_to_home.includes(opt)) {
     return { workflow: 'ship_to_home', uncategorized: false };
   }
@@ -90,6 +145,18 @@ function categorizeShipping(optionName, cost) {
 
   // Numeric fallback. Operator should add this option to the JSON.
   const n = Number(cost) || 0;
+
+  // Phase 60: a digital-only order (no physical item) at $0.00 has nothing
+  // to ship — it must NOT be lumped into ship_to_league by the cost rule.
+  // It only reaches here when its option name is unmapped AND cost isn't
+  // >1.01 or =1.00 (i.e. the exact misclassification case). Unlike the other
+  // fallback buckets this is a DETERMINISTIC classification — there's no
+  // shipping option to add to the mapping — so it is NOT flagged
+  // uncategorized (no misleading "add to config" ⚠ on the badge).
+  if (!(n > 1.01) && n !== 1.0 && isDigitalOnly) {
+    return { workflow: 'digital', uncategorized: false };
+  }
+
   let workflow;
   if (n > 1.01) workflow = 'ship_to_home';
   else if (n === 1.0) workflow = 'ship_to_managers';
@@ -117,12 +184,32 @@ function categorizeShipping(optionName, cost) {
 // Returns { sql, params } where `sql` is a single parenthesized
 // expression suitable for AND-joining into a WHERE clause. Returns
 // null if the workflow string isn't recognized.
-function _buildWorkflowSqlPredicate(workflow) {
+//
+// Phase 60: `digitalSkuList` is the inline SQL list from
+// _loadDigitalSkuList() (may be null). It powers the 'digital' bucket and
+// the digital-only carve-out of the ship_to_league fallback. Must be kept
+// in lockstep with categorizeShipping's `isDigitalOnly` branch — the JS
+// path and this SQL path classify the SAME orders identically.
+function _buildWorkflowSqlPredicate(workflow, digitalSkuList = null) {
   const allMappedNames = [
     ...SHIPPING_MAP.ship_to_home,
     ...SHIPPING_MAP.ship_to_managers,
     ...SHIPPING_MAP.ship_to_league,
   ];
+  const physicalExists = _physicalItemExistsSql(digitalSkuList);
+
+  // Phase 60: 'digital' bucket — option name unmapped AND free/cheap (the
+  // old league-fallback cost band) AND NO physical item. Mirrors
+  // categorizeShipping's `else if (isDigitalOnly) → 'digital'` branch,
+  // which only fires after the >1.01 and =1.00 checks fail (so the cost
+  // band here is the same `< 1.00 OR IS NULL` league fallback band).
+  if (workflow === 'digital') {
+    const notIn =
+      allMappedNames.length > 0 ? 'o.order_shipping_option NOT IN (?) AND ' : '';
+    const params = allMappedNames.length > 0 ? [allMappedNames] : [];
+    const sql = `((${notIn}(o.order_shipping < 1.00 OR o.order_shipping IS NULL)) AND NOT ${physicalExists})`;
+    return { sql, params };
+  }
 
   // Fallback predicates for orders whose option name isn't in any
   // configured list. The 'else' bucket in categorizeShipping is
@@ -161,7 +248,17 @@ function _buildWorkflowSqlPredicate(workflow) {
   if (allMappedNames.length > 0) {
     params.push(allMappedNames);
   }
-  parts.push(`(${notInClause}(${fallback}))`);
+
+  // Phase 60: the ship_to_league FALLBACK branch now requires a physical
+  // item — digital-only orders in that cost band go to the 'digital'
+  // bucket instead. The name-matched league branch (Branch 1) is
+  // untouched: a digital order with an explicit league option stays
+  // league (option-name match wins, exactly as in categorizeShipping).
+  const fallbackExpr =
+    workflow === 'ship_to_league'
+      ? `(${fallback}) AND ${physicalExists}`
+      : `(${fallback})`;
+  parts.push(`(${notInClause}${fallbackExpr})`);
 
   // Final predicate joins the branches with OR. Wrapped in parens so
   // it composes safely with AND-joined siblings.
@@ -808,9 +905,14 @@ class SytistDbService {
       params.push(shippingOption);
     }
 
+    // Phase 60: digital-only orders divert from the league fallback to the
+    // 'digital' bucket. The predicate and the isDigitalOnly SELECT column
+    // below both use this list, so they classify identically.
+    const digitalSkuList = _loadDigitalSkuList();
+
     // Workflow filter — in SQL now (Phase 14a fix).
     if (workflow !== 'all') {
-      const wfPredicate = _buildWorkflowSqlPredicate(workflow);
+      const wfPredicate = _buildWorkflowSqlPredicate(workflow, digitalSkuList);
       if (wfPredicate) {
         where.push(wfPredicate.sql);
         params.push(...wfPredicate.params);
@@ -854,11 +956,15 @@ class SytistDbService {
     const totalMatching = Number(countRows[0]?.total || 0);
 
     // ─── Query 1: orders matching base filter ──────────────
+    // Phase 60: isDigitalOnly is computed via the SAME physical-item SQL
+    // the workflow predicate uses, so the row's badge (set from this
+    // column) and the workflow filter never disagree.
     const [orderRows] = await pool.query(
       `
       SELECT
         o.*,
-        st.status_name AS productionStatusName
+        st.status_name AS productionStatusName,
+        (NOT ${_physicalItemExistsSql(digitalSkuList)}) AS isDigitalOnly
       FROM ms_orders o
       LEFT JOIN ms_order_status st ON st.status_id = o.order_open_status
       WHERE ${where.join(' AND ')}
@@ -1137,7 +1243,8 @@ class SytistDbService {
 
       const shipping = categorizeShipping(
         o.order_shipping_option,
-        o.order_shipping
+        o.order_shipping,
+        !!o.isDigitalOnly
       );
 
       return {
@@ -1297,7 +1404,9 @@ class SytistDbService {
       baseParams.push(shippingOption);
     }
     if (workflow !== 'all') {
-      const wfPred = _buildWorkflowSqlPredicate(workflow);
+      // Phase 60: same digital-aware predicate as the list query, so
+      // next/prev navigation stays consistent with the filtered list.
+      const wfPred = _buildWorkflowSqlPredicate(workflow, _loadDigitalSkuList());
       if (wfPred) {
         baseWhere.push(wfPred.sql);
         baseParams.push(...wfPred.params);
@@ -1447,11 +1556,14 @@ class SytistDbService {
 
     // Single-order query — bypass the open/paid filters since the caller
     // explicitly asked for THIS order, whatever state it's in.
+    // Phase 60: isDigitalOnly via the same physical-item SQL the list +
+    // counts use, so the detail-page workflow badge agrees with the list.
     const [orderRows] = await pool.query(
       `
       SELECT
         o.*,
-        st.status_name AS productionStatusName
+        st.status_name AS productionStatusName,
+        (NOT ${_physicalItemExistsSql(_loadDigitalSkuList())}) AS isDigitalOnly
       FROM ms_orders o
       LEFT JOIN ms_order_status st ON st.status_id = o.order_open_status
       WHERE o.order_id = ?
@@ -1645,7 +1757,7 @@ class SytistDbService {
     );
     const isSibling = distinctSubGalleries.size > 1;
     const primaryGallery = expandedLineItems.find((li) => li.galleryId > 0) || null;
-    const shipping = categorizeShipping(o.order_shipping_option, o.order_shipping);
+    const shipping = categorizeShipping(o.order_shipping_option, o.order_shipping, !!o.isDigitalOnly);
 
     return {
       source: 'sytist',
@@ -1903,15 +2015,22 @@ class SytistDbService {
 
     // 2. Workflow counts — restricted to queue (order_open_status = 0) since
     //    that's the actionable view operators care about.
+    //    Phase 60: group by a computed isDigitalOnly so the per-(option,cost)
+    //    buckets split into physical vs digital-only, feeding the same
+    //    categorizeShipping(isDigitalOnly) branch the list + detail use.
+    //    Aliased `o` because the physical-item SQL references o.order_id.
+    const digitalSkuList = _loadDigitalSkuList();
     const [workflowRows] = await pool.query(
       `
-      SELECT order_shipping_option AS optionName, order_shipping AS cost, COUNT(*) AS count
-      FROM ms_orders
-      WHERE order_payment_status = 'Completed'
-        AND order_status = 0
-        AND order_erased = 0
-        AND order_open_status = 0
-      GROUP BY order_shipping_option, order_shipping
+      SELECT o.order_shipping_option AS optionName, o.order_shipping AS cost,
+             (NOT ${_physicalItemExistsSql(digitalSkuList)}) AS isDigitalOnly,
+             COUNT(*) AS count
+      FROM ms_orders o
+      WHERE o.order_payment_status = 'Completed'
+        AND o.order_status = 0
+        AND o.order_erased = 0
+        AND o.order_open_status = 0
+      GROUP BY o.order_shipping_option, o.order_shipping, isDigitalOnly
       `
     );
 
@@ -1919,11 +2038,12 @@ class SytistDbService {
       ship_to_home: 0,
       ship_to_managers: 0,
       ship_to_league: 0,
+      digital: 0,
       uncategorized: 0,
     };
 
     for (const r of workflowRows) {
-      const cat = categorizeShipping(r.optionName, r.cost);
+      const cat = categorizeShipping(r.optionName, r.cost, !!r.isDigitalOnly);
       const n = Number(r.count) || 0;
       byWorkflow[cat.workflow] += n;
       if (cat.uncategorized) {
@@ -2559,4 +2679,11 @@ class SytistDbService {
   }
 }
 
-module.exports = new SytistDbService();
+const _instance = new SytistDbService();
+// Phase 60: expose the pure shipping-classification function for offline
+// tests. It's a module-level function (not an instance method); attaching it
+// here lets verify-shipping-classify.js exercise the REAL decision logic
+// without a DB connection. The SQL parity (_buildWorkflowSqlPredicate vs this
+// function) is verified live against the database.
+_instance._categorizeShipping = categorizeShipping;
+module.exports = _instance;
