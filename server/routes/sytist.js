@@ -546,6 +546,26 @@ router.get('/orders', async (req, res) => {
     if (req.query.sort) opts.sort = req.query.sort;
 
     const result = await sytistDb.getOrdersByWorkflow(opts);
+
+    // Phase 61: tag each order with its most-recent BATCH process outcome so
+    // the list can show a "⚠ Last process failed / partial" badge. Batch
+    // processing is the high-blindness moment — the operator isn't on the
+    // detail page to see the red banner — so the failure must surface here.
+    // Only failed/partial are attached (success orders carry nothing, keeping
+    // the payload lean). Non-fatal: a lookup failure just means no badge.
+    try {
+      const ids = (result.orders || []).map((o) => o.orderId);
+      const statusMap = await processHistoryService.getLatestStatusByOrderId(ids);
+      for (const o of result.orders || []) {
+        const ls = statusMap[String(o.orderId)];
+        if (ls && (ls.status === 'failed' || ls.status === 'partial')) {
+          o.lastProcess = ls;
+        }
+      }
+    } catch (e) {
+      console.warn(`[sytist/orders] lastProcess enrich failed (non-fatal): ${e.message}`);
+    }
+
     res.json(result);
   } catch (err) {
     console.error('[sytist/orders]', err);

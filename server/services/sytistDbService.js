@@ -75,6 +75,94 @@ function _physicalItemExistsSql(digitalSkuList) {
   );
 }
 
+// ─── Phase 60a: instant-pack eligibility ──────────────────────────────
+//
+// Per-SKU "instant-pack eligible" classification (default-deny), stored as
+// productWeights[sku].instantPackEligible in packaging-config.json. This is
+// a DISPLAY-ONLY badge in 60a — there is no orders-list filter tab and no
+// count badge, so (unlike Phase 60's isDigitalOnly) it can be computed
+// entirely in JS over the already-expanded canonical line items, in both
+// getOrdersByWorkflow and getOrderById. There is deliberately NO SQL-side
+// predicate. When 60b adds a filter tab / count badge, THAT is when a
+// _buildWorkflowSqlPredicate-style SQL parity becomes mandatory — flagged so
+// a future change doesn't ship a tab whose count disagrees with the badge.
+
+// Flags that mean a line item is NOT a physical lab item for instant-pack
+// purposes (a download, a gift cert, a credit product, a booking, a pre-sell
+// placeholder). Mirrors the base SS SKIP_FLAGS. NOTE: specialty and drop-ship
+// are deliberately ABSENT — those items DO physically ship, so they pass the
+// isPhysical predicate below and must themselves be on the eligible list.
+// Default-deny means they aren't (and a drop-ship SKU shouldn't be markable),
+// which correctly disqualifies any order containing one.
+const INSTANT_PACK_SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell'];
+
+// Build synchronous SKU→classification predicates from a pre-loaded
+// productWeights map. Reimplements packagingService.isDigital /
+// isInstantPackEligible's case-tolerant lookup (uppercase first, raw
+// fallback) so the badge classification matches the async service exactly —
+// they MUST agree (the service powers the SS filter / packing slip; this
+// powers the orders-list badge and the order-detail shape).
+function _makePackagingPredicates(productWeights) {
+  const weights = productWeights || {};
+  const lookup = (sku) => {
+    if (!sku) return null;
+    const raw = String(sku);
+    const upper = raw.toUpperCase();
+    return weights[upper] || (raw !== upper ? weights[raw] : null) || null;
+  };
+  return {
+    isDigitalSku: (sku) => {
+      const e = lookup(sku);
+      return !!(e && e.category === 'digital');
+    },
+    isEligibleSku: (sku) => {
+      const e = lookup(sku);
+      return !!(e && e.instantPackEligible === true);
+    },
+  };
+}
+
+// Pure eligibility computation over expanded canonical line items. Predicates
+// are injected so the offline harness runs without a DB or config.
+//
+// A line item PHYSICALLY SHIPS (and so must be eligible) iff it is not a
+// package header, carries none of INSTANT_PACK_SKIP_FLAGS, and is not a
+// digital-by-config SKU. Modifier-type add-ons never become line items, so
+// they are ignored for free. Package constituents and product-type add-ons
+// are evaluated by their OWN sku (each synthetic line item carries its own).
+//
+// An order is instant-pack eligible iff it has ≥1 physical item AND every
+// physical item's sku is on the eligible list. blockingSkus lists the
+// physical SKUs that are NOT eligible (deduped, in first-seen order) — these
+// are exactly why an order with a physical item fails, including specialty /
+// drop-ship SKUs that pass isPhysical but are default-deny-ineligible.
+function _computeInstantPackEligibility(lineItems, predicates) {
+  const isDigitalSku = (predicates && predicates.isDigitalSku) || (() => false);
+  const isEligibleSku = (predicates && predicates.isEligibleSku) || (() => false);
+
+  const physical = [];
+  for (const li of lineItems || []) {
+    const flags = (li && li.flags) || {};
+    if (flags.isPackageHeader) continue;
+    if (INSTANT_PACK_SKIP_FLAGS.some((f) => flags[f])) continue;
+    if (isDigitalSku(li.sku)) continue;
+    physical.push(li);
+  }
+
+  const blockingSkus = [];
+  const seen = new Set();
+  for (const li of physical) {
+    if (isEligibleSku(li.sku)) continue;
+    const key = String(li.sku == null ? '' : li.sku);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    blockingSkus.push(li.sku);
+  }
+
+  const eligible = physical.length >= 1 && blockingSkus.length === 0;
+  return { eligible, physicalCount: physical.length, blockingSkus };
+}
+
 let SHIPPING_MAP = {
   ship_to_home: [],
   ship_to_managers: [],
@@ -1000,6 +1088,19 @@ class SytistDbService {
       await this._loadPackageMap();
     const { addonMap } = await this._loadAddonMap();
 
+    // Phase 60a: load productWeights once for the whole page and build the
+    // synchronous instant-pack predicates. Loaded independently of
+    // _loadPackageMap (which short-circuits when no packages are configured)
+    // so eligibility is computed for every order, package or not. Empty map
+    // on failure → default-deny → no order shows the badge (safe).
+    let instantPackPredicates = _makePackagingPredicates({});
+    try {
+      const productWeights = await require('./packagingService').getProductWeights();
+      instantPackPredicates = _makePackagingPredicates(productWeights);
+    } catch (e) {
+      console.warn(`[SytistDB] instant-pack predicates unavailable (default-deny): ${e.message}`);
+    }
+
     // ─── Query 2: cart lines for those orders ──────────────
     //
     // UNION ALL across ms_cart and ms_cart_archive. Only orders with
@@ -1247,6 +1348,12 @@ class SytistDbService {
         !!o.isDigitalOnly
       );
 
+      // Phase 60a: instant-pack eligibility over the expanded line items.
+      const instantPack = _computeInstantPackEligibility(
+        expandedLineItems,
+        instantPackPredicates
+      );
+
       return {
         source: 'sytist',
         orderId: String(o.order_id),
@@ -1306,6 +1413,10 @@ class SytistDbService {
 
         lineItems: expandedLineItems,
         isSibling,
+        // Phase 60a: display-only badge driven from packaging-config's
+        // per-SKU instantPackEligible flag (default-deny). No SQL filter
+        // tab in 60a, so this is computed purely in JS here.
+        isInstantPackEligible: instantPack.eligible,
 
         dueDate:
           o.order_due_date && o.order_due_date !== '0000-00-00'
@@ -1759,6 +1870,19 @@ class SytistDbService {
     const primaryGallery = expandedLineItems.find((li) => li.galleryId > 0) || null;
     const shipping = categorizeShipping(o.order_shipping_option, o.order_shipping, !!o.isDigitalOnly);
 
+    // Phase 60a: instant-pack eligibility — same JS computation the list uses,
+    // over this order's expanded line items, so the detail-page shape and the
+    // orders-list badge can't disagree. Predicates from a one-off productWeights
+    // load (default-deny on failure).
+    let instantPackPredicates = _makePackagingPredicates({});
+    try {
+      const productWeights = await require('./packagingService').getProductWeights();
+      instantPackPredicates = _makePackagingPredicates(productWeights);
+    } catch (e) {
+      console.warn(`[SytistDB] instant-pack predicates unavailable (default-deny): ${e.message}`);
+    }
+    const instantPack = _computeInstantPackEligibility(expandedLineItems, instantPackPredicates);
+
     return {
       source: 'sytist',
       orderId: String(o.order_id),
@@ -1816,6 +1940,9 @@ class SytistDbService {
 
       lineItems: expandedLineItems,
       isSibling,
+      // Phase 60a: instant-pack eligibility badge (default-deny). Same JS
+      // computation as the orders list, so detail and list never disagree.
+      isInstantPackEligible: instantPack.eligible,
 
       dueDate:
         o.order_due_date && o.order_due_date !== '0000-00-00'
@@ -2686,4 +2813,10 @@ const _instance = new SytistDbService();
 // without a DB connection. The SQL parity (_buildWorkflowSqlPredicate vs this
 // function) is verified live against the database.
 _instance._categorizeShipping = categorizeShipping;
+// Phase 60a: expose the pure instant-pack helpers for the offline harness
+// (verify-instant-pack-eligible.js). _computeInstantPackEligibility takes
+// injected predicates so it runs with no DB/config; _makePackagingPredicates
+// builds those predicates from a productWeights map for in-harness realism.
+_instance._computeInstantPackEligibility = _computeInstantPackEligibility;
+_instance._makePackagingPredicates = _makePackagingPredicates;
 module.exports = _instance;

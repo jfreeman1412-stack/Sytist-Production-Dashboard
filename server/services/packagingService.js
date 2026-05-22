@@ -298,12 +298,39 @@ class PackagingService {
     return !!(entry && entry.category === 'digital');
   }
 
+  // Phase 60a: returns true if the SKU's productWeights entry has
+  // instantPackEligible === true. Default-deny: a missing entry or a
+  // missing/false flag means NOT eligible (so an order containing a SKU
+  // the operator hasn't explicitly marked is never instant-pack eligible).
+  // Lookup is case-tolerant in the same way as isDigital so the two stay
+  // in lockstep — sytistDbService._makePackagingPredicates reimplements
+  // this exact lookup synchronously over a pre-loaded productWeights map,
+  // and the offline harness exercises the same rule.
+  async isInstantPackEligible(sku) {
+    if (!sku) return false;
+    const weights = await this.getProductWeights();
+    const raw = String(sku);
+    const upper = raw.toUpperCase();
+    const entry = weights[upper] || (raw !== upper ? weights[raw] : null);
+    return !!(entry && entry.instantPackEligible === true);
+  }
+
   async setProductWeight(sku, data) {
     const config = await this.getConfig();
+    // Phase 60a: preserve instantPackEligible when the caller omits it
+    // (e.g. a future programmatic upsert that only touches weight/name).
+    // The PackagingPage row sends it on every save, so the operator's
+    // checkbox is authoritative there; an omitted field keeps the prior
+    // value rather than silently flipping it to default-deny false.
+    const existing = config.productWeights[String(sku)] || {};
     config.productWeights[String(sku)] = {
       weight: parseFloat(data.weight) || 0,
       name: data.name || '',
       category: data.category || 'flat',
+      instantPackEligible:
+        data.instantPackEligible === undefined
+          ? !!existing.instantPackEligible
+          : !!data.instantPackEligible,
     };
     await writeJsonAsync(CONFIG_PATH, config);
     return config.productWeights;

@@ -82,6 +82,11 @@ const overrideRenderService = require('./overrideRenderService');
 // the loop stays here; Process keeps its own Step 2 imposition). These
 // values now come from one module so Apply and Process can't drift.
 const printOutputService = require('./printOutputService');
+// Phase 61a: digital-by-config detection for the printable-set filter — a
+// standalone digital package (e.g. 5D) carries cart_download=0 (Phase 45
+// landmine) so SKIP_FLAGS misses it; without this it would reach the
+// fail-closed gate as a "printable item with no photo" and false-block.
+const packagingService = require('./packagingService');
 const sharp = require('sharp');
 
 const SETTINGS_PATH = path.join(
@@ -272,7 +277,7 @@ class ProcessingService {
       reprintSuffix: reprint ? reprintSuffix : null,
     };
 
-    const subOrders = this._splitIntoSubOrders(workOrder);
+    const subOrders = await this._splitIntoSubOrders(workOrder);
     console.log(
       `[Processing] Order ${workOrder.orderId}: ${subOrders.length} sub-order(s) ` +
         `(workflow=${workOrder.shipping?.workflow}, items=${(workOrder.lineItems || []).length})${reprint ? ' [REPRINT]' : ''}`
@@ -998,11 +1003,40 @@ class ProcessingService {
    *   (filtered to printable items only — flag-skipped items don't count)
    * - everything else: one sub-order with all items
    */
-  _splitIntoSubOrders(order) {
+  async _splitIntoSubOrders(order) {
     const workflow = order.shipping?.workflow;
+
+    // Phase 61a: also exclude digital-by-config items (packaging-config
+    // category='digital', e.g. 5D / 20D). They carry cart_download=0 (Phase 45
+    // landmine) so SKIP_FLAGS' `download` misses them, and they have no photo
+    // to download — left in the printable set they hit the fail-closed gate as
+    // a "printable item with no photo" and FALSELY halt the whole order (the
+    // 5D bug). Digital is a download, not a print; it never belonged here.
+    // One config read hoisted out of the filter (getProductWeights re-reads
+    // disk each call), with the SAME case-tolerant lookup as
+    // packagingService.isDigital so they classify identically. Exclusion keys
+    // on "this SKU is a configured digital product" — NOT on "missing photo",
+    // so a REAL print whose photo fails stays printable and still trips the
+    // gate. Soft-fail: if the config read throws, nothing is excluded (the
+    // gate's existing behavior), never a crash.
+    let productWeights = {};
+    try {
+      productWeights = await packagingService.getProductWeights();
+    } catch (e) {
+      console.warn(`[Processing] Order ${order.orderId}: digital-exclusion config read failed (no items excluded): ${e.message}`);
+    }
+    const isDigitalSku = (sku) => {
+      if (!sku) return false;
+      const raw = String(sku);
+      const upper = raw.toUpperCase();
+      const entry = productWeights[upper] || (raw !== upper ? productWeights[raw] : null);
+      return !!(entry && entry.category === 'digital');
+    };
+
     const printableItems = (order.lineItems || []).filter((li) => {
-      const skip = SKIP_FLAGS.find((f) => li.flags?.[f]);
-      return !skip;
+      if (SKIP_FLAGS.find((f) => li.flags?.[f])) return false;
+      if (isDigitalSku(li.sku)) return false;
+      return true;
     });
 
     if (workflow === 'ship_to_managers' || workflow === 'ship_to_league') {
@@ -1106,6 +1140,7 @@ class ProcessingService {
         subResult.photosFailed.push({
           cartId: li.cartId,
           productNameDisplay: li.productNameDisplay,
+          sku: li.sku, // Phase 61a: include sku — the gate log showed "sku=?" without it
           error: 'no_photo_url',
         });
         continue;
@@ -1138,7 +1173,13 @@ class ProcessingService {
       const filePath = path.win32.join(targetDir, filename);
 
       try {
-        await this._downloadFile(li.photo.fullUrl, filePath);
+        // Phase 61: bounded retry with backoff + per-attempt timeout. A
+        // transient blip no longer permanently drops the item (and then
+        // silently shrinks the order); only a genuine failure (all attempts
+        // exhausted, or a terminal 4xx) reaches the catch and the gate.
+        await this._downloadWithRetry(li.photo.fullUrl, filePath, {
+          logLabel: `order ${order.orderNumber || order.orderId} cart ${li.cartId} sku=${li.sku}${isSpecialty ? ' SPECIALTY' : ''}`,
+        });
         photosByCartId[li.cartId] = {
           path: filePath,
           isSpecialty,
@@ -1157,11 +1198,43 @@ class ProcessingService {
         // particular were invisible here — the CLAUDE.md "easy to
         // miss" specialty soft-failure landmine. A photo that doesn't
         // download means a product that won't print; that deserves a
-        // log line regardless of regular-vs-specialty.
+        // log line regardless of regular-vs-specialty. Phase 61: include
+        // err.cause — bare "fetch failed" alone is undiagnosable.
+        const cause = err && (err.cause?.code || err.cause?.message || err.cause);
         console.warn(
-          `[Processing] Order ${order.orderNumber || order.orderId} cart ${li.cartId} sku=${li.sku}${isSpecialty ? ' (SPECIALTY)' : ''}: photo download FAILED → ${filePath}: ${err.message}`
+          `[Processing] Order ${order.orderNumber || order.orderId} cart ${li.cartId} sku=${li.sku}${isSpecialty ? ' (SPECIALTY)' : ''}: photo download FAILED (all retries) → ${filePath}: ${err.message}` +
+            (cause ? ` cause=${cause}` : '')
         );
       }
+    }
+
+    // ─── Phase 61: FAIL-CLOSED gate on photo downloads ──────
+    // The invariant: "everything is in the .txt, or the order doesn't
+    // complete." If any printable item's photo failed to download (genuine
+    // download failure OR no source URL), we abort the sub-order HERE —
+    // before any output (composite/imposition/slip/.txt/S3) is produced —
+    // rather than building a partial manifest that silently ships fewer
+    // items than the customer ordered (order 112054 root cause). Regular
+    // AND specialty/drop-ship failures both land in photosFailed (the loop
+    // above doesn't branch by pipeline), so this one check enforces the
+    // Phase 61 decision that specialty failures block too (reverses Phase
+    // 55's specialty soft-fail). subResult.success stays false (its default)
+    // by early-returning before the success=true at the end of this method;
+    // allOk then short-circuits cleanup / ShipStation / status / ms_notes.
+    // The OK downloads remain on disk as inert debris (no .txt references
+    // them, so the lab prints nothing); a reprocess re-downloads everything.
+    if (subResult.photosFailed.length > 0) {
+      const list = subResult.photosFailed
+        .map((f) => `cart ${f.cartId} sku=${f.sku || '?'} (${f.productNameDisplay || 'item'}): ${f.error}`)
+        .join('; ');
+      subResult.error =
+        `${subResult.photosFailed.length} of ${sub.lineItems.length} photo(s) failed to download — ` +
+        `order NOT completed (no .txt, no ShipStation, Sytist status unchanged): ${list}`;
+      subResult.success = false;
+      console.warn(
+        `[Processing] Order ${order.orderNumber || order.orderId}: FAIL-CLOSED — ${subResult.error}`
+      );
+      return subResult;
     }
 
     // ─── Step 1.4 (Phase 34): green-screen compositing ──────
@@ -1343,14 +1416,19 @@ class ProcessingService {
           );
         }
       } catch (err) {
-        subResult.warnings.push({
-          type: 'greenscreen_compose_error',
-          cartId: li.cartId,
-          message: err.message,
-        });
+        // Phase 61: FATAL (wrong-product). A green-screen composite that
+        // throws means we'd ship the RAW keyed-out subject instead of the
+        // photo-on-background the customer ordered — wrong product, not a
+        // cosmetic degrade. Abort the sub-order. (The inner thumbnail-publish
+        // catch above stays non-fatal — that's just the SS thumbnail.) Note:
+        // greenscreen *warnings* (gsWarnings, keying-quality notes) are NOT a
+        // throw and remain non-fatal — only a hard compose failure lands here.
+        subResult.error = `Green-screen compositing failed for cart ${li.cartId} (sku ${li.sku}): ${err.message}`;
+        subResult.success = false;
         console.warn(
-          `[Processing] Order ${order.orderNumber || order.orderId} cart ${li.cartId}: green-screen compose failed: ${err.message} — using original subject`
+          `[Processing] Order ${order.orderNumber || order.orderId} cart ${li.cartId}: FAIL-CLOSED — ${subResult.error}`
         );
+        return subResult;
       }
     }
 
@@ -1740,11 +1818,21 @@ class ProcessingService {
           skipImpositionCartIds.add(li.cartId);
         }
       } catch (err) {
-        subResult.warnings.push({
-          type: 'composite_render_error',
-          cartId: li.cartId,
-          message: err.message,
-        });
+        // Phase 61: FATAL (wrong-product). A composite render that throws
+        // means downloaded.path still points at the RAW player photo, so the
+        // .txt would print the bare photo instead of the Memory Mate / Photo
+        // Button / etc. the customer ordered — wrong product. Abort the
+        // sub-order. (The asset-resolution sub-warnings inside this try —
+        // team_photo_missing, logo_missing, background fetch, graphic_missing,
+        // and the inner thumbnail-publish catch — do NOT throw; they render a
+        // placeholder and continue. Those degraded-but-recognizable cases stay
+        // non-fatal and are a deliberate Phase 62 policy pass.)
+        subResult.error = `Composite render failed for cart ${li.cartId} (sku ${li.sku}): ${err.message}`;
+        subResult.success = false;
+        console.warn(
+          `[Processing] Order ${order.orderNumber || order.orderId} cart ${li.cartId}: FAIL-CLOSED — ${subResult.error}`
+        );
+        return subResult;
       }
     }
 
@@ -1787,11 +1875,19 @@ class ProcessingService {
           }
         }
       } catch (err) {
-        subResult.warnings.push({
-          type: 'imposition_error',
-          cartId: li.cartId,
-          message: err.message,
-        });
+        // Phase 61: FATAL (wrong-product/wrong-quantity). An imposition that
+        // throws leaves the single un-imposed photo at downloaded.path, so the
+        // .txt would print 1 photo instead of the sheet (e.g. 8 wallets / 4
+        // mini-magnets) the customer ordered — wrong product AND wrong qty.
+        // Abort the sub-order. (Imposition r.warnings — orientation notes etc.
+        // — are not a throw and stay non-fatal; items with no imposition rule
+        // pass through untouched and never reach here.)
+        subResult.error = `Imposition failed for cart ${li.cartId} (sku ${li.sku}): ${err.message}`;
+        subResult.success = false;
+        console.warn(
+          `[Processing] Order ${order.orderNumber || order.orderId} cart ${li.cartId}: FAIL-CLOSED — ${subResult.error}`
+        );
+        return subResult;
       }
     }
 
@@ -2241,10 +2337,24 @@ class ProcessingService {
    * Download a URL to a file path. Uses .tmp + rename so partial
    * downloads don't leave a half-written file at the destination.
    */
-  async _downloadFile(url, destPath) {
-    const resp = await fetch(url);
+  // Phase 61: single download attempt. Adds an AbortController timeout — a
+  // bare fetch has none, so a hung Sytist host would block the whole batch
+  // forever. Throws an error carrying `.status` for HTTP responses so
+  // _downloadWithRetry can classify terminal-vs-transient; network/abort
+  // errors keep undici's `.cause` untouched for logging.
+  async _downloadFile(url, destPath, { timeoutMs = 20000 } = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let resp;
+    try {
+      resp = await fetch(url, { signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
     if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status} fetching ${url}`);
+      const err = new Error(`HTTP ${resp.status} fetching ${url}`);
+      err.status = resp.status;
+      throw err;
     }
     const ab = await resp.arrayBuffer();
     const dir = path.win32.dirname(destPath);
@@ -2253,6 +2363,56 @@ class ProcessingService {
     await fsp.writeFile(tmpPath, Buffer.from(ab));
     await fsp.rename(tmpPath, destPath);
     return destPath;
+  }
+
+  // Phase 61: classify a download error. Terminal (don't retry) = an HTTP 4xx
+  // that isn't 408 (Request Timeout) or 429 (Too Many Requests) — a 404/403
+  // means the source genuinely isn't there, so retrying just wastes time and
+  // delays the fail-closed signal. Everything else is transient and retried:
+  // network errors (ECONNRESET / ETIMEDOUT / ENOTFOUND / bare "fetch failed"),
+  // our AbortError timeout, and HTTP 5xx / 408 / 429.
+  _isTerminalDownloadError(err) {
+    const status = err && err.status;
+    if (typeof status === 'number' && status >= 400 && status < 500) {
+      return status !== 408 && status !== 429;
+    }
+    return false;
+  }
+
+  // Phase 61: retry wrapper around _downloadFile. `attempts` is the TOTAL
+  // number of tries (initial + retries); backoffsMs[i] is the delay before the
+  // (i+2)-th attempt. Logs err.cause on EVERY failed attempt — the whole
+  // reason order 112054's "fetch failed" was undiagnosable. Terminal errors
+  // short-circuit immediately. Pairs with the fail-closed gate: transient
+  // blips self-heal so they don't trigger a needless hard-fail, and a genuine
+  // failure (all attempts exhausted, or terminal) propagates to the gate.
+  async _downloadWithRetry(url, destPath, opts = {}) {
+    const {
+      attempts = 4,
+      timeoutMs = 20000,
+      backoffsMs = [1000, 3000, 9000],
+      logLabel = '',
+    } = opts;
+    let lastErr;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        return await this._downloadFile(url, destPath, { timeoutMs });
+      } catch (err) {
+        lastErr = err;
+        const terminal = this._isTerminalDownloadError(err);
+        const cause = err && (err.cause?.code || err.cause?.message || err.cause);
+        console.warn(
+          `[Processing] download attempt ${attempt}/${attempts} ` +
+            `${terminal ? 'TERMINAL' : 'transient'} failed` +
+            `${logLabel ? ` (${logLabel})` : ''}: ${err.message}` +
+            (cause ? ` cause=${cause}` : '')
+        );
+        if (terminal || attempt === attempts) break;
+        const delay = backoffsMs[Math.min(attempt - 1, backoffsMs.length - 1)];
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+    throw lastErr;
   }
 }
 

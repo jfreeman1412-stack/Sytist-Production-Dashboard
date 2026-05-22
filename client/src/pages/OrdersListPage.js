@@ -1365,6 +1365,10 @@ function OrderRow({ order, galleryLogos, subGalleryFilter, isSelected, onToggleS
       </td>
       <td style={{ padding: '10px 12px', fontFamily: 'var(--font-mono, monospace)', fontSize: 12 }}>
         {order.orderId}
+        {/* Phase 61: most-recent batch process outcome. Surfaced at the start
+            of the row so a failed/partial order is unavoidable during batch
+            review (when the operator isn't on the detail page). */}
+        {order.lastProcess && <LastProcessBadge lastProcess={order.lastProcess} />}
       </td>
       <td style={{ padding: '10px 12px', whiteSpace: 'nowrap', color: 'var(--text-secondary)' }}>
         {formatOrderDate(order.orderDate)}
@@ -1436,6 +1440,10 @@ function OrderRow({ order, galleryLogos, subGalleryFilter, isSelected, onToggleS
             📦 Bundle ships together
           </div>
         )}
+        {/* Phase 60a: instant-pack eligibility — every physical item in the
+            order is marked Instant-Ship Eligible in Settings → Packaging.
+            Display-only in 60a (bulk actions land in 60b). */}
+        {order.isInstantPackEligible && <InstantPackBadge />}
       </td>
       <td style={{ padding: '10px 12px' }}>
         <StatusBadge status={order.productionStatus} />
@@ -1494,6 +1502,75 @@ function MissingLogoBadge({ galleryId }) {
       <span>⚠</span>
       <span>Missing Logo</span>
     </button>
+  );
+}
+
+// Phase 60a: per-row "Instant-Ship" badge. Rendered only when the order's
+// canonical shape carries isInstantPackEligible (≥1 physical item, and every
+// physical item's SKU is marked Instant-Ship Eligible in packaging config).
+// Filled style (vs the translucent outline workflow badges) so it reads as a
+// distinct class — a readiness state, not a shipping category. Display-only:
+// no click action in 60a; bulk actions arrive in 60b.
+function InstantPackBadge() {
+  return (
+    <div
+      title="Instant-Ship eligible — every physical item in this order is marked eligible in Settings → Packaging"
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 4,
+        marginTop: 4,
+        padding: '2px 8px',
+        background: '#4263eb',
+        color: '#fff',
+        borderRadius: 10,
+        fontSize: 11,
+        fontWeight: 600,
+        whiteSpace: 'nowrap',
+        lineHeight: 1.2,
+      }}
+    >
+      <span>⚡</span>
+      <span>Instant-Ship</span>
+    </div>
+  );
+}
+
+// Phase 61: orders-list badge surfacing the most-recent BATCH process outcome
+// (order.lastProcess, attached by the orders route from process-history). The
+// high-blindness moment is batch processing — the operator isn't on the detail
+// page to see the red banner — so a held order must be visible right in the
+// list. Red = the fail-closed gate held the order (nothing shipped); amber =
+// partial (some teams OK, some failed). Clears when a later successful
+// reprocess overrides the history entry. Hover shows the error + timestamp.
+function LastProcessBadge({ lastProcess }) {
+  if (!lastProcess) return null;
+  const failed = lastProcess.status === 'failed';
+  const c = failed
+    ? { bg: '#dc3545', label: 'Last process failed' }
+    : { bg: '#e0901b', label: 'Last process partial' };
+  const when = lastProcess.at ? new Date(lastProcess.at).toLocaleString() : '';
+  return (
+    <div
+      title={`${lastProcess.error || lastProcess.status}${when ? ` — ${when}` : ''}`}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 4,
+        marginTop: 4,
+        padding: '2px 8px',
+        background: c.bg,
+        color: '#fff',
+        borderRadius: 10,
+        fontSize: 10,
+        fontWeight: 700,
+        whiteSpace: 'nowrap',
+        lineHeight: 1.2,
+      }}
+    >
+      <span>⚠</span>
+      <span>{c.label}</span>
+    </div>
   );
 }
 
@@ -2246,19 +2323,33 @@ function BatchShipResultBanner({ result, onDismiss }) {
  * it (so they can review the results).
  */
 function JobProgressBanner({ job, onDismiss, onCancel }) {
+  const navigate = useNavigate();
   const isComplete = job.status === 'complete';
   const isFailed = job.status === 'failed';
   const isCancelled = job.status === 'cancelled';
   const isCancelling = !!job.cancelRequested && !isComplete && !isFailed && !isCancelled;
   const isRunning = !isComplete && !isFailed && !isCancelled;
 
-  const successCount = (job.results || []).filter(
-    (r) => !r.error && r.subOrders && r.subOrders.every((s) => s.success)
-  ).length;
-  const errorCount = (job.results || []).filter((r) => !!r.error).length;
-  const partialCount = (job.results || []).filter(
-    (r) => !r.error && r.subOrders && !r.subOrders.every((s) => s.success)
-  ).length;
+  // Phase 61: classify each per-order result the SAME way processHistoryService
+  // does, so the banner, the orders-list badge, and the history page all agree.
+  // A fail-closed gate failure sets subOrders[].success=false (NOT a top-level
+  // r.error), so the old "errorCount = r.error" missed full gate failures and
+  // the old "partialCount = !every(success)" mislabeled a fully-failed
+  // single-sub-order order as "partial". Proper rule: failed = top-level error
+  // OR no sub-order succeeded; partial = some-but-not-all succeeded.
+  const classify = (r) => {
+    if (r.error) return { status: 'failed', error: r.error };
+    const subs = r.subOrders || [];
+    if (subs.length > 0 && subs.every((s) => s.success)) return { status: 'success', error: null };
+    const someOk = subs.some((s) => s.success);
+    const firstErr = (subs.find((s) => !s.success && s.error) || {}).error || 'failed';
+    return { status: someOk ? 'partial' : 'failed', error: firstErr };
+  };
+  const classified = (job.results || []).map((r) => ({ r, ...classify(r) }));
+  const successCount = classified.filter((c) => c.status === 'success').length;
+  const partialCount = classified.filter((c) => c.status === 'partial').length;
+  const errorCount = classified.filter((c) => c.status === 'failed').length;
+  const attentionOrders = classified.filter((c) => c.status !== 'success');
 
   const pct = job.total ? Math.round((job.completed / job.total) * 100) : 0;
 
@@ -2371,6 +2462,47 @@ function JobProgressBanner({ job, onDismiss, onCancel }) {
           {errorCount > 0 && (
             <span style={{ color: '#dc3545' }}>✗ {errorCount} failed</span>
           )}
+        </div>
+      )}
+
+      {/* Phase 61: ALWAYS-visible enumeration of failed/partial orders (not
+          behind a "show details" expand). Batch processing is the high-
+          blindness moment — a held order must be unavoidable here, since the
+          operator isn't on the detail page. Each row links to the order so the
+          operator can fix the source and reprocess. */}
+      {(isComplete || isCancelled) && attentionOrders.length > 0 && (
+        <div
+          style={{
+            marginTop: 10,
+            padding: 8,
+            background: 'rgba(220,53,69,0.08)',
+            border: '1px solid rgba(220,53,69,0.3)',
+            borderRadius: 4,
+            maxHeight: 160,
+            overflowY: 'auto',
+          }}
+        >
+          <div style={{ fontSize: 11, fontWeight: 700, color: '#dc3545', marginBottom: 4 }}>
+            {attentionOrders.length} order{attentionOrders.length === 1 ? '' : 's'} need attention — not shipped
+          </div>
+          {attentionOrders.map((c, i) => (
+            <div
+              key={i}
+              onClick={() => navigate(`/orders/${c.r.orderId}`)}
+              title={c.error || c.status}
+              style={{
+                cursor: 'pointer',
+                fontSize: 11,
+                padding: '2px 0',
+                color: c.status === 'failed' ? '#dc3545' : '#e0b341',
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+              }}
+            >
+              {c.status === 'failed' ? '✗' : '⚠'} #{c.r.orderNumber || c.r.orderId} — {c.error || c.status}
+            </div>
+          ))}
         </div>
       )}
 

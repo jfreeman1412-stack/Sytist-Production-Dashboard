@@ -5219,15 +5219,27 @@ function ProcessResultDisplay({ result }) {
   const ssCreated = ss && ss.ok && !ss.skipped;
   const ssSkipped = ss && ss.ok && ss.skipped;
 
-  // Overall banner color: red if anything failed (sub-order or SS),
-  // amber if there were warnings, green if everything's clean.
+  // Phase 61: a sub-order with success===false is a HARD FAIL — the fail-closed
+  // gate fired (photo download / composite / imposition / green-screen). The
+  // order produced NO .txt, NO ShipStation order, and NO status change. This
+  // must read as a blocking RED banner, not the old amber "completed with
+  // errors" (which wrongly implied the order completed).
+  const hasFailedSubOrder = result.subOrders.some((s) => !s.success);
+  const failedSubOrders = result.subOrders.filter((s) => !s.success);
+
+  // Banner state: red on a hard fail (sub-order or SS), green when fully clean,
+  // amber when it completed but carried non-fatal warnings.
   const overallOk = allOk && !ssFailed;
+  const isHardFail = hasFailedSubOrder;
+  const bg = isHardFail ? 'rgba(220,53,69,0.10)' : overallOk ? 'rgba(76,175,80,0.08)' : 'rgba(224,179,65,0.08)';
+  const bd = isHardFail ? 'rgba(220,53,69,0.45)' : overallOk ? 'rgba(76,175,80,0.3)' : 'rgba(224,179,65,0.3)';
+  const fg = isHardFail ? '#dc3545' : overallOk ? '#4caf50' : '#e0b341';
   return (
     <div
       style={{
         padding: 12,
-        background: overallOk ? 'rgba(76,175,80,0.08)' : 'rgba(224,179,65,0.08)',
-        border: `1px solid ${overallOk ? 'rgba(76,175,80,0.3)' : 'rgba(224,179,65,0.3)'}`,
+        background: bg,
+        border: `1px solid ${bd}`,
         borderRadius: 6,
       }}
     >
@@ -5235,19 +5247,58 @@ function ProcessResultDisplay({ result }) {
         style={{
           fontSize: 12,
           fontWeight: 600,
-          color: overallOk ? '#4caf50' : '#e0b341',
+          color: fg,
           marginBottom: 8,
         }}
       >
-        {overallOk
+        {isHardFail
+          ? `✗ ORDER NOT COMPLETED — ${failedSubOrders.length} sub-order${failedSubOrders.length === 1 ? '' : 's'} failed`
+          : overallOk
           ? `✓ Processed ${result.subOrders.length} sub-order${result.subOrders.length === 1 ? '' : 's'} successfully`
-          : `⚠ Completed with errors`}
+          : `⚠ Completed with warnings`}
         {result.statusUpdated && (
           <span style={{ fontWeight: 500, marginLeft: 8 }}>
             (status → {result.newStatusId})
           </span>
         )}
       </div>
+
+      {/* Phase 61: blocking explanation + per-sub-order reasons when the
+          fail-closed gate fired. The order printed NOTHING and was not sent to
+          ShipStation; the operator must fix the source and reprocess. */}
+      {isHardFail && (
+        <div
+          style={{
+            padding: 8,
+            marginBottom: 8,
+            background: 'rgba(220,53,69,0.08)',
+            border: '1px solid rgba(220,53,69,0.35)',
+            borderRadius: 4,
+            fontSize: 12,
+          }}
+        >
+          <div style={{ fontWeight: 600, color: '#dc3545', marginBottom: 4 }}>
+            Nothing was printed or sent to ShipStation; Sytist status unchanged.
+          </div>
+          <div style={{ color: 'var(--text-muted)', marginBottom: 6 }}>
+            The order is held to prevent a partial shipment. Fix the underlying
+            issue (usually a photo that wouldn't download, or a composite /
+            imposition / green-screen failure) and run Process again.
+          </div>
+          {failedSubOrders.map((s, i) => (
+            <div
+              key={i}
+              style={{
+                fontFamily: 'var(--font-mono, monospace)',
+                fontSize: 11,
+                color: '#dc3545',
+              }}
+            >
+              ✗ {s.scope === 'home' ? 'Whole order' : `Team: ${s.scope?.subGalleryName || '(unnamed)'}`}: {s.error || 'failed'}
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* Phase 13c: ShipStation auto-create outcome. Shown as its own
           row right under the headline so the operator immediately sees

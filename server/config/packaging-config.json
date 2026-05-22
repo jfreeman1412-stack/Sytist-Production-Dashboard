@@ -3,7 +3,8 @@
     "6": {
       "weight": 0.5,
       "name": "Memory Mate",
-      "category": "flat"
+      "category": "flat",
+      "instantPackEligible": true
     },
     "7": {
       "weight": 0.2,
@@ -13,22 +14,26 @@
     "8": {
       "weight": 0.5,
       "name": "8x10 Individual",
-      "category": "flat"
+      "category": "flat",
+      "instantPackEligible": true
     },
     "9": {
       "weight": 0.5,
       "name": "8x10 Team Photo",
-      "category": "flat"
+      "category": "flat",
+      "instantPackEligible": true
     },
     "10": {
       "weight": 0.1,
       "name": "5x7 Individual Print",
-      "category": "flat"
+      "category": "flat",
+      "instantPackEligible": true
     },
     "11": {
       "weight": 0.1,
       "name": "5x7 Team Photo",
-      "category": "flat"
+      "category": "flat",
+      "instantPackEligible": true
     },
     "12": {
       "weight": 0.5,
@@ -90,36 +95,6 @@
       "name": "Digital Download",
       "category": "digital"
     },
-    "3D": {
-      "weight": 0,
-      "name": "Digital Package - 3 HiRes Images",
-      "category": "digital"
-    },
-    "5D": {
-      "weight": 0,
-      "name": "Digital Package - 5 HiRes Images",
-      "category": "digital"
-    },
-    "20D": {
-      "weight": 0,
-      "name": "Digital Package - 20 HiRes Images",
-      "category": "digital"
-    },
-    "5 DIGITALS - CHEER": {
-      "weight": 0,
-      "name": "5 Digitals - CHEER",
-      "category": "digital"
-    },
-    "5 DIGITALS": {
-      "weight": 0,
-      "name": "5 Digitals",
-      "category": "digital"
-    },
-    "10 HIGH RESOLUTION DIGITAL IMAGES CHEER": {
-      "weight": 0,
-      "name": "10 High Resolution Digital Images CHEER",
-      "category": "digital"
-    },
     "26": {
       "weight": 0,
       "name": "Acrylic Ornament",
@@ -159,6 +134,36 @@
       "weight": 0.2,
       "name": "Item 45",
       "category": "flat"
+    },
+    "3D": {
+      "weight": 0,
+      "name": "Digital Package - 3 HiRes Images",
+      "category": "digital"
+    },
+    "5D": {
+      "weight": 0,
+      "name": "Digital Package - 5 HiRes Images",
+      "category": "digital"
+    },
+    "20D": {
+      "weight": 0,
+      "name": "Digital Package - 20 HiRes Images",
+      "category": "digital"
+    },
+    "5 DIGITALS - CHEER": {
+      "weight": 0,
+      "name": "5 Digitals - CHEER",
+      "category": "digital"
+    },
+    "5 DIGITALS": {
+      "weight": 0,
+      "name": "5 Digitals",
+      "category": "digital"
+    },
+    "10 HIGH RESOLUTION DIGITAL IMAGES CHEER": {
+      "weight": 0,
+      "name": "10 High Resolution Digital Images CHEER",
+      "category": "digital"
     }
   },
   "packageBundles": {

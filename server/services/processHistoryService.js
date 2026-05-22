@@ -144,6 +144,39 @@ class ProcessHistoryService {
     return entries.find((e) => e.jobId === jobId) || null;
   }
 
+  /**
+   * Phase 61: latest per-order process outcome, for the orders-list
+   * "⚠ Last process failed" badge. Scans entries newest-first and returns the
+   * FIRST (most recent) result for each requested orderId — so a later
+   * successful reprocess overrides an earlier failure, and the badge clears
+   * on its own. Only BATCH jobs are recorded here; single-order Process
+   * failures surface on the order-detail red banner instead (the operator is
+   * on that page when they single-process). Returns a map keyed by String
+   * orderId → { status, error, jobId, at }. Orders never batch-processed are
+   * simply absent (no badge). Non-throwing by contract — callers treat a
+   * thrown/empty result as "no badge".
+   */
+  async getLatestStatusByOrderId(orderIds = []) {
+    const want = new Set((orderIds || []).map((id) => String(id)));
+    const out = {};
+    if (want.size === 0) return out;
+    const entries = await this._read(); // newest-first
+    for (const entry of entries) {
+      for (const r of entry.results || []) {
+        const id = String(r.orderId);
+        if (!want.has(id) || out[id]) continue;
+        out[id] = {
+          status: r.status,
+          error: r.error || null,
+          jobId: entry.jobId,
+          at: entry.completedAt || entry.startedAt || null,
+        };
+      }
+      if (Object.keys(out).length === want.size) break; // all found — stop early
+    }
+    return out;
+  }
+
   async clear() {
     await this._write([]);
     return { cleared: true };

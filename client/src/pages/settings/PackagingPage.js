@@ -236,6 +236,7 @@ function ProductWeightsSection({ productWeights, onSave, onDelete }) {
   const [newName, setNewName] = useState('');
   const [newWeight, setNewWeight] = useState('');
   const [newCategory, setNewCategory] = useState('flat');
+  const [newInstantPack, setNewInstantPack] = useState(false);
 
   async function handleAdd() {
     if (!newSku.trim()) return;
@@ -243,11 +244,13 @@ function ProductWeightsSection({ productWeights, onSave, onDelete }) {
       name: newName.trim(),
       weight: parseFloat(newWeight) || 0,
       category: newCategory,
+      instantPackEligible: newInstantPack,
     });
     setNewSku('');
     setNewName('');
     setNewWeight('');
     setNewCategory('flat');
+    setNewInstantPack(false);
   }
 
   return (
@@ -262,6 +265,7 @@ function ProductWeightsSection({ productWeights, onSave, onDelete }) {
             <th style={thStyle}>Name</th>
             <th style={thStyleRight}>Weight (oz)</th>
             <th style={thStyle}>Category</th>
+            <th style={{ ...thStyle, textAlign: 'center' }} title="When checked, products with this SKU can be auto-packed/shipped without operator review. An order is Instant-Ship eligible only if EVERY physical item in it is checked (default off).">⚡ Instant-Ship Eligible</th>
             <th style={thStyle}></th>
           </tr>
         </thead>
@@ -309,6 +313,14 @@ function ProductWeightsSection({ productWeights, onSave, onDelete }) {
                 options={CATEGORIES}
               />
             </td>
+            <td style={{ ...tdStyle, textAlign: 'center' }}>
+              <input
+                type="checkbox"
+                checked={newInstantPack}
+                onChange={(e) => setNewInstantPack(e.target.checked)}
+                style={{ cursor: 'pointer' }}
+              />
+            </td>
             <td style={tdStyle}>
               <button
                 onClick={handleAdd}
@@ -329,14 +341,16 @@ function ProductWeightRow({ sku, row, onSave, onDelete }) {
   const [name, setName] = useState(row.name || '');
   const [weight, setWeight] = useState(String(row.weight ?? ''));
   const [category, setCategory] = useState(row.category || 'flat');
+  const [instantPack, setInstantPack] = useState(row.instantPackEligible === true);
   const [dirty, setDirty] = useState(false);
 
   useEffect(() => {
     setName(row.name || '');
     setWeight(String(row.weight ?? ''));
     setCategory(row.category || 'flat');
+    setInstantPack(row.instantPackEligible === true);
     setDirty(false);
-  }, [row.name, row.weight, row.category]);
+  }, [row.name, row.weight, row.category, row.instantPackEligible]);
 
   function bump() {
     setDirty(true);
@@ -378,11 +392,22 @@ function ProductWeightRow({ sku, row, onSave, onDelete }) {
           options={CATEGORIES}
         />
       </td>
+      <td style={{ ...tdStyle, textAlign: 'center' }}>
+        <input
+          type="checkbox"
+          checked={instantPack}
+          onChange={(e) => {
+            setInstantPack(e.target.checked);
+            bump();
+          }}
+          style={{ cursor: 'pointer' }}
+        />
+      </td>
       <td style={tdStyle}>
         <div style={{ display: 'flex', gap: 6 }}>
           <button
             disabled={!dirty}
-            onClick={() => onSave(sku, { name, weight, category })}
+            onClick={() => onSave(sku, { name, weight, category, instantPackEligible: instantPack })}
             style={smallButton(dirty ? '#4a7fc1' : 'transparent', !dirty)}
           >
             Save
