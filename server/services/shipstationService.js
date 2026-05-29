@@ -85,8 +85,9 @@ function distributeIntegerOzAcrossLines(itemWeights, orderFloorOz) {
 }
 // Sytist line items can carry these flags; we don't ship the line item
 // if any of these are true. Matches the SKIP_FLAGS used by the Phase 11
-// processing pipeline.
-const SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell'];
+// processing pipeline. Phase 64: preRegister (cart_pre_register_id > 0) — a $0
+// pre-registration placeholder, never a shippable line.
+const SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell', 'preRegister'];
 
 // Phase 13a hotfix #6: ShipStation rejects country fields that aren't
 // 2-letter ISO codes. Sytist orders can show up with "United States",

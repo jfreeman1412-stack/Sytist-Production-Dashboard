@@ -734,7 +734,8 @@ async function _computeEligibility(order) {
       giftCertCount += 1;
       continue;
     }
-    if (flags.creditProduct || flags.booking || flags.preSell) {
+    if (flags.creditProduct || flags.booking || flags.preSell || flags.preRegister) {
+      // Phase 64: preRegister — $0 pre-registration placeholder, not shippable.
       otherSkippedCount += 1;
       continue;
     }

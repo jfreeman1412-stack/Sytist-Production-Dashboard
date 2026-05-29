@@ -119,7 +119,14 @@ const DEFAULT_SETTINGS = {
 // label for the operator/slip. Skipping it here keeps darkroom .txt
 // and the print pipeline from rendering "Gold Package" as if it were
 // a single product.
-const SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell', 'isPackageHeader'];
+// Phase 64: preRegister — a Sytist pre-registration placeholder line
+// (cart_pre_register_id > 0). It has no SKU, no photo, and carries none of the
+// other skip-flags, so before this it survived into printableItems and tripped
+// the fail-closed gate as a "printable item with no photo" (order 112376 — same
+// class as the 5D digital false-block, different item type). Keying on the flag
+// (item identity) not on "missing photo" preserves the gate guard: a real print
+// whose photo genuinely fails has no preRegister flag and still hard-fails.
+const SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell', 'preRegister', 'isPackageHeader'];
 
 // In-memory job registry for batch processing progress polling. Cleared
 // 1 hour after job completion to avoid unbounded growth.
@@ -1225,7 +1232,14 @@ class ProcessingService {
     // them, so the lab prints nothing); a reprocess re-downloads everything.
     if (subResult.photosFailed.length > 0) {
       const list = subResult.photosFailed
-        .map((f) => `cart ${f.cartId} sku=${f.sku || '?'} (${f.productNameDisplay || 'item'}): ${f.error}`)
+        // Phase 64: distinguish an empty SKU from a genuinely-missing field.
+        // `f.sku || '?'` rendered "sku=?" for an empty-string SKU, which read
+        // like "unlogged" when it actually means the cart row has no SKU at all
+        // (the pre-registration / data-gap signature). Show "(empty)" for that.
+        .map((f) => {
+          const skuLabel = f.sku ? f.sku : (f.sku === '' ? '(empty)' : '?');
+          return `cart ${f.cartId} sku=${skuLabel} (${f.productNameDisplay || 'item'}): ${f.error}`;
+        })
         .join('; ');
       subResult.error =
         `${subResult.photosFailed.length} of ${sub.lineItems.length} photo(s) failed to download — ` +

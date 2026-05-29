@@ -60,9 +60,10 @@ const DEFAULT_SIZE = '5x8';
 const DEFAULT_FILENAME_CONFIG = { pattern: '{order_number}', extension: '.txt' };
 
 // Skip line items whose flags say they aren't a print job. These are
-// download deliveries, prepayments, gift certs, registration credits, and
-// pre-sales — none of them produce a JPEG that goes to Darkroom.
-const SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell'];
+// download deliveries, prepayments, gift certs, registration credits,
+// pre-sales, and pre-registration placeholders (Phase 64) — none of them
+// produce a JPEG that goes to Darkroom.
+const SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell', 'preRegister'];
 
 class DarkroomService {
   constructor() {

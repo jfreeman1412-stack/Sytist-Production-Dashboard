@@ -105,7 +105,10 @@ const DEFAULT_SLIP_CONFIG = {
 // — the constituents are — so we skip it from the slip the same way
 // we skip digital downloads. The constituents (with flags.isPackageItem
 // = true and their own SKUs) DO show on the slip as individual rows.
-const SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell', 'isPackageHeader'];
+// Phase 64: preRegister — a pre-registration placeholder (cart_pre_register_id
+// > 0) is a $0 non-product with no photo; it must not render on the slip nor be
+// counted in "Items to Ship".
+const SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell', 'preRegister', 'isPackageHeader'];
 
 class PackingSlipService {
   constructor() {

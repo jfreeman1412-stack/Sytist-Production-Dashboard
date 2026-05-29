@@ -17,6 +17,12 @@
 //   6. digital-by-config (5D, no photo) is EXCLUDED → order completes (ignored)
 //   7. GUARD: a real print (not digital) with no photo STILL gate-fails —
 //      proving the exclusion keys on digital-ness, not on "missing photo".
+// Phase 64 adds two more on the same boundary, for pre-registration lines:
+//   8. a pre-registration placeholder (flags.preRegister, no SKU, no photo) is
+//      EXCLUDED → an order with it alongside real prints completes (ignored).
+//   9. GUARD: a real print with no photo STILL gate-fails even when a sibling
+//      pre-reg line is excluded — the exclusion is per-item by flag, not
+//      order-wide and not on "missing photo".
 
 process.env.SYTIST_DB_HOST = process.env.SYTIST_DB_HOST || 'offline';
 process.env.SYTIST_DB_USER = process.env.SYTIST_DB_USER || 'offline';
@@ -222,6 +228,38 @@ async function expect(name, fn) {
     if (!(subs[0].lineItems.length === 1 && subs[0].lineItems[0].sku === '8')) return false; // 8 stays printable
     const r = await proc._processSubOrder(order, subs[0], {});
     return r.success === false && r.txtPath === null && /sku=8/.test(r.error || '') && calls.buildOrderTxt === 0;
+  });
+
+  // 8. Phase 64: a pre-registration placeholder (flags.preRegister, empty SKU,
+  // no photo URL) is EXCLUDED from the printable set — same boundary as the
+  // digital case but keyed on the cart_pre_register_id-derived flag, not on a
+  // config SKU lookup. An order containing it alongside a real print COMPLETES;
+  // the pre-reg line is ignored, not a failure (order 112376 false-block).
+  await expect('pre-registration (no photo) excluded → order completes, .txt written', async () => {
+    const order = makeOrder([
+      printItem({ cartId: '1', sku: '10' }), // real print, downloads OK
+      printItem({ cartId: '2', sku: '', productNameDisplay: 'Pre-registration for X', flags: { preRegister: true }, photo: { fullUrl: '' } }),
+    ]);
+    const subs = await proc._splitIntoSubOrders(order);
+    const printableCartIds = subs[0].lineItems.map((li) => li.cartId);
+    if (!(printableCartIds.length === 1 && printableCartIds[0] === '1')) return false; // pre-reg excluded, real print kept
+    const r = await proc._processSubOrder(order, subs[0], {});
+    return r.success === true && r.photosFailed.length === 0 && calls.buildOrderTxt === 1;
+  });
+
+  // 9. Phase 64 GUARD: the preRegister exclusion is per-item and keyed on the
+  // flag, NOT order-wide and NOT on "missing photo". A real print (no
+  // preRegister flag) with no photo URL STILL hard-fails even when a sibling
+  // pre-reg line is correctly excluded — proving we didn't weaken the gate.
+  await expect('real print no photo STILL gate-fails alongside an excluded pre-reg sibling', async () => {
+    const order = makeOrder([
+      printItem({ cartId: '1', sku: '10', photo: { fullUrl: '' } }), // real print, NO photo → must fail
+      printItem({ cartId: '2', sku: '', flags: { preRegister: true }, photo: { fullUrl: '' } }), // pre-reg, excluded
+    ]);
+    const subs = await proc._splitIntoSubOrders(order);
+    if (!(subs[0].lineItems.length === 1 && subs[0].lineItems[0].cartId === '1')) return false; // only the real print remains printable
+    const r = await proc._processSubOrder(order, subs[0], {});
+    return r.success === false && r.txtPath === null && calls.buildOrderTxt === 0;
   });
 
   console.log(`\n${pass}/${pass + fails.length} fail-closed gate cases pass`);
