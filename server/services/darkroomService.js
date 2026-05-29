@@ -554,11 +554,21 @@ class DarkroomService {
           lastName: order.customer?.lastName || '',
         };
 
+    // Phase 65: Darkroom-.txt-ONLY — prefix the order number to the last name
+    // (e.g. "112376-Simonson") so lab print jobs sort numerically by order
+    // number in Darkroom. This is deliberately contained to the value passed
+    // into the .txt renderer: order.customer.lastName is NOT mutated, so the
+    // packing slip (reads order.shipTo) and ShipStation (billTo reads
+    // order.customer, shipTo reads order.shipTo) keep the clean last name with
+    // no number. ExtOrderNum below still carries the bare order number too.
+    // The divider (buildDividerTxt) calls _renderContent on its own with a
+    // synthetic lastName='' and is intentionally NOT prefixed.
+    const ordNum = order.orderNumber || order.orderId;
     const content = this._renderContent({
       firstName: customerName.firstName,
-      lastName: customerName.lastName,
+      lastName: `${ordNum}-${customerName.lastName || ''}`,
       email: order.customer?.email || '',
-      orderNum: order.orderNumber || order.orderId,
+      orderNum: ordNum,
       lineItems: orderedItems,
     });
 
