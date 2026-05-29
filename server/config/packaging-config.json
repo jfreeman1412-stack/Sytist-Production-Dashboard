@@ -38,7 +38,8 @@
     "12": {
       "weight": 0.5,
       "name": "8 Wallets",
-      "category": "flat"
+      "category": "flat",
+      "instantPackEligible": true
     },
     "13": {
       "weight": 4,
@@ -103,7 +104,8 @@
     "27": {
       "weight": 0.5,
       "name": "4-3.5x5 Prints",
-      "category": "flat"
+      "category": "flat",
+      "instantPackEligible": true
     },
     "32": {
       "weight": 2,
@@ -127,13 +129,57 @@
     },
     "36": {
       "weight": 32,
-      "name": "Item 36",
-      "category": "rigid"
+      "name": "8x10 Team Plaque",
+      "category": "rigid",
+      "instantPackEligible": false
+    },
+    "37": {
+      "weight": 11.5,
+      "name": "Team Coffee mug",
+      "category": "bulky",
+      "instantPackEligible": false
+    },
+    "38": {
+      "weight": 5,
+      "name": "Team Mouse Pad",
+      "category": "rigid",
+      "instantPackEligible": false
+    },
+    "41": {
+      "weight": 0.2,
+      "name": "5x7 Alt Team Photo",
+      "category": "flat",
+      "instantPackEligible": true
+    },
+    "42": {
+      "weight": 0,
+      "name": "Alt 8x10 IND Photo",
+      "category": "flat",
+      "instantPackEligible": false
+    },
+    "43": {
+      "weight": 11.5,
+      "name": "Alt Team Photo Mug",
+      "category": "bulky",
+      "instantPackEligible": false
+    },
+    "44": {
+      "weight": 5,
+      "name": "Alt Team Mouse Pad",
+      "category": "rigid",
+      "instantPackEligible": false
     },
     "45": {
       "weight": 0.2,
-      "name": "Item 45",
-      "category": "flat"
+      "name": "5x7 Alt Team Photo",
+      "category": "flat",
+      "instantPackEligible": true
+    },
+    "46": {
+      "weight": 0.5,
+      "name": "Alt Team 8x10",
+      "category": "flat",
+      "instantPackEligible": true
     },
     "3D": {
       "weight": 0,
@@ -170,7 +216,7 @@
     "1": {
       "name": "Gold Package",
       "weight": 7,
-      "forcePackage": false
+      "forcePackage": true
     },
     "2": {
       "name": "Silver Package",
@@ -266,10 +312,6 @@
     "36",
     "35",
     "38",
-    "41",
-    "42",
-    "45",
-    "46",
     "19"
   ],
   "packingSlipPosition": "last",
