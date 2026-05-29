@@ -476,16 +476,16 @@ router.get('/packaging/config', async (req, res) => {
 
 // PUT /packaging/config — replace top-level fields.
 // Body: any subset of { productWeights, packagingTypes, packageBundles,
-//   forcePackageSKUs, magnetThreshold, framedPanoSmallSKUs,
-//   framedPanoLargeSKUs, boxRouteSKUs, packingSlipWeightOz,
-//   packingSlipPosition }. Unrecognized keys are dropped.
+//   magnetThreshold, framedPanoSmallSKUs, framedPanoLargeSKUs, boxRouteSKUs,
+//   packingSlipWeightOz, packingSlipPosition }. Unrecognized keys are dropped.
+// Phase 66: forcePackageSKUs removed from the allowlist — retired in favor of
+// productWeights[sku].category (rigid/bulky/pano) driving Package service.
 router.put('/packaging/config', async (req, res) => {
   try {
     const allowed = [
       'productWeights',
       'packagingTypes',
       'packageBundles',
-      'forcePackageSKUs',
       'magnetThreshold',
       'framedPanoSmallSKUs',
       'framedPanoLargeSKUs',

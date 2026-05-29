@@ -79,6 +79,15 @@ The line-item filter in `shipstationService.buildOrderFromSytist` skips an item 
 
 If you ever see a "digital" or "non-shippable" SKU bypass the filter, the fix is usually a missing `packaging-config.json` entry rather than a code change. Add the SKU with `category: 'digital'` (uppercased key) and the next process call picks it up — `packagingService.getConfig` reads from disk each call, no restart needed.
 
+### Packaging: category is the source of truth for "force Package service" (Phase 66)
+
+A physical SKU ships as ShipStation `packageCode = 'package'` (not `large_envelope_or_flat`) iff its `packaging-config.json` `productWeights[sku].category` is **`rigid`, `bulky`, or `pano`**. This lives in `packagingService.determinePackaging`'s force-package loop (`PACKAGE_CATEGORIES` set). `flat` → flat mailer (default); `digital` is filtered out upstream.
+
+- **`forcePackageSKUs` is RETIRED** — there used to be a parallel hand-maintained "ship as package" SKU list, and it drifted from the category dropdown (SKU 18 Bagtag was `category:'rigid'` but missing from the list, so it shipped flat). The category dropdown is now the *only* knob. The old key is gone from `DEFAULT_CONFIG`, the migrate seeding, the live config, the PUT-config allowlist (`routes/shipstation.js`), and the Settings → Packaging UI. **Do not reintroduce a parallel force-package list** — change the SKU's category instead. (A stray `forcePackageSKUs` key left in some old config file is inert; nothing reads it.)
+- **This is ONLY about `packageCode`, not box sizing.** `boxRouteSKUs` (+ legacy plaques 21/22) still independently decide Medium vs Large *box* and run *before* the category check (returning early), so a boxed SKU is already `package`. The magnet count rule (`magnetThreshold`, SKUs 15/17 at qty ≥ 3) and `packageBundles[].forcePackage` are also untouched. A rigid/bulky/pano item that isn't box-routed gets the existing "9x11 flat-as-package" treatment (packageType `flat_9x11`, `packageCode 'package'`) — physically a flat, but classified as a package, which is the intent.
+- Worked/verified by `server/scripts/verify-package-routing.js` (10/10) plus a read-only live-config sweep: all SKUs formerly in `forcePackageSKUs` still package; 18/34/37 flipped flat→package; flats stay flat.
+- **Known live data note:** `packageBundles` Gold `forcePackage` is `false` in the live config (the bundle override mechanism is intact, but Gold is not currently forcing package). Separately, SKU 45 (a flat) is still in `boxRouteSKUs` so it boxes — pending a deliberate one-line config removal.
+
 ### Output path configuration
 
 There are **two independent operator-configurable output roots**, sourced from different config files and resolved by different services. They do **not** cascade — changing one does not move the other.

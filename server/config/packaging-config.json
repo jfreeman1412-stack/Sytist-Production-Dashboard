@@ -249,18 +249,6 @@
       "service": "package"
     }
   },
-  "forcePackageSKUs": [
-    "13",
-    "16",
-    "7",
-    "32",
-    "33",
-    "21",
-    "22",
-    "19",
-    "20",
-    "35"
-  ],
   "framedPanoSmallSKUs": [
     "26x10x2"
   ],

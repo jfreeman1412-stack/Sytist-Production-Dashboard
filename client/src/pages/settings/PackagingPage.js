@@ -591,9 +591,9 @@ function PackagingTypeRow({ typeId, row, onSave }) {
 // ─── Section 3: Routing rules ──────────────────────────────
 
 function RoutingRulesSection({ config, onSave }) {
-  const [forcePackageSKUs, setForcePackageSKUs] = useState(
-    (config.forcePackageSKUs || []).join(', ')
-  );
+  // Phase 66: forcePackageSKUs retired — "force Package service" is driven by
+  // the per-SKU category dropdown (rigid/bulky/pano) in the Product weights
+  // section. No standalone field here anymore.
   const [boxRouteSKUs, setBoxRouteSKUs] = useState(
     (config.boxRouteSKUs || []).join(', ')
   );
@@ -618,7 +618,6 @@ function RoutingRulesSection({ config, onSave }) {
   const [dirty, setDirty] = useState(false);
 
   useEffect(() => {
-    setForcePackageSKUs((config.forcePackageSKUs || []).join(', '));
     setBoxRouteSKUs((config.boxRouteSKUs || []).join(', '));
     setFramedPanoSmallSKUs((config.framedPanoSmallSKUs || []).join(', '));
     setFramedPanoLargeSKUs((config.framedPanoLargeSKUs || []).join(', '));
@@ -630,7 +629,6 @@ function RoutingRulesSection({ config, onSave }) {
     // Re-init when config arrives from server
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
-    config.forcePackageSKUs,
     config.boxRouteSKUs,
     config.framedPanoSmallSKUs,
     config.framedPanoLargeSKUs,
@@ -648,7 +646,6 @@ function RoutingRulesSection({ config, onSave }) {
 
   function handleSave() {
     onSave({
-      forcePackageSKUs: parseCsv(forcePackageSKUs),
       boxRouteSKUs: parseCsv(boxRouteSKUs),
       framedPanoSmallSKUs: parseCsv(framedPanoSmallSKUs),
       framedPanoLargeSKUs: parseCsv(framedPanoLargeSKUs),
@@ -682,15 +679,12 @@ function RoutingRulesSection({ config, onSave }) {
         }}
       >
         <FieldGroup
-          label="forcePackageSKUs"
-          hint="SKUs that force Package service (rigid items that wouldn't survive a flat envelope)."
+          label="Force Package service"
+          hint="Retired as a SKU list. An item ships as Package automatically when its category (in Product weights above) is rigid, bulky, or pano. Edit the SKU's category to change this."
         >
-          <CellInput
-            value={forcePackageSKUs}
-            onChange={bump(setForcePackageSKUs)}
-            placeholder="13, 16, 7, 32, 33"
-            width="100%"
-          />
+          <div style={{ fontSize: 13, color: '#666', padding: '8px 0' }}>
+            Driven by per-SKU <strong>category</strong> (rigid / bulky / pano).
+          </div>
         </FieldGroup>
 
         <FieldGroup

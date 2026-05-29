@@ -30,8 +30,8 @@
 //        1 rigid item  → medium box
 //        2+ rigid items → large box
 //   6. Mouse pad → medium box
-//   7. forcePackageSKUs (collector cards, key chains, buttons) →
-//      9x11 flat-as-package
+//   7. Category rigid/bulky/pano → 9x11 flat-as-package (Phase 66 — the
+//      category dropdown is the source of truth; replaces forcePackageSKUs)
 //   8. Magnet threshold (3+ across magnet SKUs) → 9x11 flat-as-package
 //   9. Has any 8x10-size product (SKUs 6/8/9/22) or package bundle →
 //      9x11 flat mailer
@@ -144,9 +144,10 @@ const DEFAULT_CONFIG = {
     'large_box':     { name: 'Large Box',        length: 14, width: 10, height: 6,   baseWeight: 9,   service: 'package' },
   },
 
-  // SKUs that force PACKAGE service (not flat envelope) — rigid
-  // items that wouldn't survive a flat envelope.
-  forcePackageSKUs: ['13', '16', '7', '32', '33', '21', '22', '19', '20', '35'],
+  // Phase 66: forcePackageSKUs RETIRED. "Force Package service" is now
+  // driven entirely by productWeights[sku].category (rigid/bulky/pano) — see
+  // the force-package loop in determinePackaging. No parallel SKU list to
+  // keep in sync.
 
   // Combined-count rule: if sum of quantities across the listed
   // SKUs ≥ threshold, force PACKAGE service. PD's live config
@@ -246,10 +247,9 @@ class PackagingService {
       config.framedPanoLargeSKUs = [];
       dirty = true;
     }
-    if (!Array.isArray(config.forcePackageSKUs)) {
-      config.forcePackageSKUs = [];
-      dirty = true;
-    }
+    // Phase 66: forcePackageSKUs retired — no longer seeded or read. An
+    // existing key left in a config file is harmless (nothing reads it); we
+    // intentionally do NOT strip it here to keep migration non-destructive.
     if (config.packingSlipPosition === undefined) {
       config.packingSlipPosition = 'first';
       dirty = true;
@@ -727,12 +727,24 @@ class PackagingService {
 
     // ─── Flat vs Package determination ─────────────────────
 
+    // Phase 66: category is the SINGLE source of truth for "force Package
+    // service". Any physical SKU whose productWeights.category is rigid /
+    // bulky / pano ships as packageCode='package' — a flat mailer can't
+    // protect it. This REPLACES the retired forcePackageSKUs list, which had
+    // to be hand-kept in sync with the category dropdown and drifted (e.g.
+    // SKU 18 Bagtag was category 'rigid' but absent from the list, so it
+    // shipped as a flat). Box SIZING above (boxRouteSKUs → Medium/Large) is
+    // untouched: a boxed SKU already returned earlier with service=package, so
+    // this only catches items that would otherwise fall to the flat default.
+    // The bundle forcePackage override below and the magnet count rule are
+    // also untouched.
+    const PACKAGE_CATEGORIES = new Set(['rigid', 'bulky', 'pano']);
     let forcePackage = false;
     for (const sku of skuSet) {
-      if ((config.forcePackageSKUs || []).includes(sku)) {
-        const pw = config.productWeights[sku];
+      const pw = config.productWeights[sku];
+      if (pw && PACKAGE_CATEGORIES.has(pw.category)) {
         notes.push(
-          `SKU ${sku} (${pw?.name || 'unknown'}) forces Package service`
+          `SKU ${sku} (${pw.name || 'unknown'}) category '${pw.category}' → Package service`
         );
         forcePackage = true;
       }
