@@ -302,6 +302,18 @@ If Process leaves an order Open with no `.txt`, no ShipStation order, and a red 
 
 **Invariant — key on item identity, NEVER on "missing photo".** Excluding on "no photo" would re-open the Phase 61 gate's guard: a *real* print whose photo genuinely failed to download must still hard-fail. The dedicated-column check preserves that (a real print never has `cart_pre_register_id > 0` etc.). The empty-`cart_sku` edge is a Sytist data gap — assign the SKU, don't add productName-substring matching.
 
+### Composite text token vocabulary lives in THREE places (Phase 67 — `{customer.phoneFormatted}`)
+
+The token vocabulary used in composite text slots (`{customer.firstName}`, `{year}`, `{customer.phoneFormatted}`, etc.) is **duplicated across three files that must stay in sync** — add a new token in all three or the editor's preview will silently disagree with what production renders:
+
+1. **Server resolution:** `compositeService.buildTokensFromOrder(order, lineItem)` — the context the regex `_substituteTokens` resolves against, plus any helper functions like `formatPhone`.
+2. **Client mirror:** `client/src/pages/settings/OverrideEditorPage.js` — has its own `buildTokensFromOrder` + `camelCaseKey` + (Phase 67) `formatPhone`, per the Phase 48 contract. Powers the override editor's preview + the Text content textarea's resolved-value display.
+3. **Variable-picker UI:** `client/src/pages/settings/LayoutDesignerPage.js` — the `VARIABLES` array of `{ token, label }` rows that becomes the button strip in the text-content editor (e.g. `{ token: '{customer.phoneFormatted}', label: 'Phone' }`).
+
+Phase 67 added `{customer.phoneFormatted}` — strips non-digits, then renders 10-digit numbers as `xxx-xxx-xxxx`, strips a leading `1` on 11-digit numbers, and returns the raw input untouched for anything else (empty/whitespace-only → blank). The raw `customer.phone` is **deliberately left unchanged** — `shipstationService.js:513,530` reads it for billTo/shipTo phone fallback and formatting it there would silently leak hyphens into ShipStation. So `{customer.phone}` (raw) and `{customer.phoneFormatted}` coexist.
+
+**Source choice — `order_phone`, not a `ms_people` join, by the data.** `phoneFormatted` reads from `customer.phone` (= `ms_orders.order_phone`). A 90-day live profile justified skipping the obvious `ms_orders.order_email = ms_people.p_email` join: `order_phone` and `p_phone` agree 100% of the time when both are populated, the join would gain only ~10 phones across 4,521 orders (~0.2%), and the email join is fragile (32 emails have >1 `ms_people` row → ambiguous which to pick; 10 orders have no `ms_people` row at all). **When a future token genuinely needs a field only `ms_people` carries, add the join at `sytistDbService.getOrderById`'s query — don't sneak it into `buildTokensFromOrder`.**
+
 ### nodemon doesn't reload after `npm install`
 
 Always Ctrl+C and restart manually after installing packages. Otherwise the new module silently fails to load and you waste an hour debugging.

@@ -2166,3 +2166,40 @@ Files: `server/services/processingService.js`, `server/services/processHistorySe
 **Verification.** `verify-failclose-gate.js` grows to 8/8 with the two cases above. Live two-sided check required before commit (the harness missed 5D originally, so harness-only is insufficient): (1) a real order with a standalone digital item completes — no false-block, `.txt` written, ShipStation created, status advances; (2) a real print whose photo genuinely fails still hard-fails (no `.txt`, no SS, status unchanged).
 
 Files: `server/services/processingService.js`, `server/scripts/verify-failclose-gate.js`.
+
+## 67. Composite text token `{customer.phoneFormatted}` (dash-formatted phone)
+
+**Goal.** Operators want to print the customer's phone number on composite outputs, dash-formatted (`555-123-4567`). Add a `{customer.phoneFormatted}` token to the composite text vocabulary, plus a "Phone" button in the variable-picker UI.
+
+**Source — `order_phone`, not `ms_people.p_phone`. Settled by the data.** The natural-sounding spec was "join `ms_orders.order_email = ms_people.p_email` and read `p_phone`," but a 90-day live profile of 4,521 orders showed:
+
+| | count |
+|---|---|
+| `order_phone` empty | 224 |
+| `ms_people.p_phone` populated (post-join) | 4,278 |
+| `order_phone` empty BUT `p_phone` populated (real gain) | **10** |
+| `order_phone` and `p_phone` disagree (normalized) | **0** |
+| Orders with no `ms_people` row at all | 10 |
+| Emails with > 1 `ms_people` row (ambiguous) | 32 |
+
+`order_phone` and `p_phone` agree 100% when both populated; joining `ms_people` would gain ~10 phones across 4,521 orders (~0.2%) at the cost of email-fragility (32 ambiguous duplicate-email rows). **Sourced from `customer.phone` (= `order_phone`), already on the canonical order shape.** No new SQL, no new column, no join.
+
+**Naming — `{customer.phoneFormatted}`, not bare `{phone}`.** The existing token vocabulary uses `{customer.firstName}/.lastName/.email/.phone` (dotted) for customer fields and bare for top-level (`{year}`, `{date}`). The new token groups with `customer`. Critical: **`customer.phone` (raw) stays unchanged** because `shipstationService.js:513,530` reads it for the ShipStation billTo/shipTo phone fallback — formatting it there would silently leak hyphens into SS. Raw and formatted coexist on the customer object.
+
+**`formatPhone` semantics.** Strip non-digits, then: 10 digits → `xxx-xxx-xxxx`; 11 digits starting with `1` → strip the leading `1`, format as above; anything else → return the raw input untouched (so the operator sees malformed values rather than the system guessing). Empty / null / undefined / whitespace-only → `""`. Mirrored byte-identically in the server (`compositeService.formatPhone`) and client (`OverrideEditorPage`'s mirror) per the Phase 48 contract — change one side, change the other.
+
+**Three places the token vocabulary lives.** Adding a new composite text token requires touching ALL three or the editor's preview will silently disagree with what production renders:
+1. **Server resolution** — `compositeService.buildTokensFromOrder(order, lineItem)` (the context the regex `_substituteTokens` resolves against, plus any helper functions like `formatPhone`).
+2. **Client mirror** — `client/src/pages/settings/OverrideEditorPage.js`'s `buildTokensFromOrder` + helpers (Phase 48 contract). Powers the override editor's preview + the Text content textarea's resolved-value display.
+3. **Variable-picker UI** — `client/src/pages/settings/LayoutDesignerPage.js`'s `VARIABLES` array of `{ token, label }` rows that becomes the button strip (`{ token: '{customer.phoneFormatted}', label: 'Phone' }`).
+
+A `CLAUDE.md` landmine now documents this three-place rule so the next addition doesn't drop one.
+
+**Verification.** `server/scripts/verify-phone-token.js` — 13/13 offline:
+- Operator-listed formatter cases: clean 10-digit `"5551234567"`, 11-digit with leading `1` `"15551234567"`, already-formatted `"(555) 123-4567"`, empty string, malformed 7-digit `"555-1234"` (raw passthrough).
+- Defensive: `null`, `undefined`, whitespace-only, `"+1 555.123.4567"` (strips and formats).
+- `buildTokensFromOrder` plumbing: `tokens.customer.phoneFormatted` field present, raw `tokens.customer.phone` preserved, empty input → blank, missing customer object → blank.
+
+Live spot-check (env-gated; +2/2 when DB env is configured): real order 112801 with `customer.phone = "7633501875"` → `tokens.customer.phoneFormatted = "763-350-1875"`, raw preserved. The originally-listed "email-mismatch case → blank not error" is **moot under the chosen design** — `phoneFormatted` reads `customer.phone` directly, no email join, no mismatch surface. Remaining live checks (variable-picker "Phone" button inserts the token, rendered composite shows dashed output) ride the next natural phone-bearing composite — not blocking.
+
+Files: `server/services/compositeService.js`, `client/src/pages/settings/OverrideEditorPage.js`, `client/src/pages/settings/LayoutDesignerPage.js`, `server/scripts/verify-phone-token.js`, `CLAUDE.md`.

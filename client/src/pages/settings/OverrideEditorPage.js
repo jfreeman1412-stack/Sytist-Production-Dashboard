@@ -2071,6 +2071,8 @@ function clamp(n, lo, hi) {
 // order / year / date — must match the server; the subject key camelCasing must
 // match too, since templates like {subject.athleteName} bind to the camelCased
 // label from ms_subjects.
+// Phase 67: also mirrors customer.phoneFormatted (+ the formatPhone helper
+// below). Change one side, change the other.
 function buildTokensFromOrder(order, lineItem) {
   const subject = {};
   if (order && order.subject && Array.isArray(order.subject.fields)) {
@@ -2080,7 +2082,12 @@ function buildTokensFromOrder(order, lineItem) {
     }
   }
   return {
-    customer: { ...((order && order.customer) || {}) },
+    customer: {
+      ...((order && order.customer) || {}),
+      phoneFormatted: formatPhone(
+        (order && order.customer && order.customer.phone) || ''
+      ),
+    },
     subject,
     galleryName: (order && order.galleryName) || '',
     subGalleryName:
@@ -2094,6 +2101,23 @@ function buildTokensFromOrder(order, lineItem) {
     year: new Date().getFullYear(),
     date: new Date().toISOString().split('T')[0],
   };
+}
+
+// Phase 67: dash-format a phone-shaped string for composite text rendering.
+// Mirrors compositeService.formatPhone on the server — keep them identical.
+function formatPhone(raw) {
+  if (raw == null) return '';
+  const s = String(raw);
+  if (!s.trim()) return '';
+  const digits = s.replace(/\D/g, '');
+  if (digits.length === 10) {
+    return `${digits.slice(0, 3)}-${digits.slice(3, 6)}-${digits.slice(6)}`;
+  }
+  if (digits.length === 11 && digits.charAt(0) === '1') {
+    const d = digits.slice(1);
+    return `${d.slice(0, 3)}-${d.slice(3, 6)}-${d.slice(6)}`;
+  }
+  return s;
 }
 
 function camelCaseKey(label) {

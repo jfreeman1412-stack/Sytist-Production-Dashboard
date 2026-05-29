@@ -444,6 +444,18 @@ Format: phase number → short title → what shipped → key files touched.
 
 ---
 
+## Phase 67 — `{customer.phoneFormatted}` composite text token (dash-formatted from `order_phone`)
+
+- **Goal:** new composite-builder variable for printing the customer's phone in dash-formatted form (e.g. `555-123-4567`). Operator inserts via a "Phone" button in the variable picker.
+- **Source — `order_phone`, not an `ms_people.p_phone` join, by the data.** 90-day live profile (4,521 orders): `order_phone` empty in 224; `ms_people.p_phone` populated (post-join) in 4,278; but **only 10 orders where `p_phone` would gain over `order_phone`**, and **zero disagreements** where both were present. Email join (`ms_orders.order_email = ms_people.p_email`) is fragile — 32 emails with >1 `ms_people` row (ambiguous which to pick), 10 with no `ms_people` row at all. Data settled it: use the field already on the order row, no SQL change.
+- **Naming — `{customer.phoneFormatted}`, not bare `{phone}`.** Groups under `customer`. The raw `{customer.phone}` is **deliberately left unchanged** — `shipstationService.js:513,530` reads it for the ShipStation billTo/shipTo phone fallback, and formatting it there would silently leak hyphens into SS. Raw and formatted coexist.
+- **`formatPhone` formatter:** strip non-digits; 10 digits → `xxx-xxx-xxxx`; 11 digits starting with `1` → strip the leading `1`, format as above; anything else (including empty / null / undefined / whitespace-only → blank) → return raw input untouched. Mirrored byte-identically in the server and the client `OverrideEditorPage` per the Phase 48 contract.
+- **Three places the token vocabulary lives** (sync-warning landmine added to `CLAUDE.md`): `compositeService.buildTokensFromOrder` (server) + `OverrideEditorPage.buildTokensFromOrder` (client mirror) + `LayoutDesignerPage.VARIABLES` (the picker UI's `{ token, label }` array, where `{ token: '{customer.phoneFormatted}', label: 'Phone' }` was added). Future tokens must touch all three or the editor's preview silently disagrees with production.
+- **Verification:** `server/scripts/verify-phone-token.js` — 13/13 offline (5 operator-listed formatter + 4 defensive null/undefined/whitespace/`+1` notation + 4 `buildTokensFromOrder` plumbing) + 2/2 live on order 112801 (raw `"7633501875"` → `tokens.customer.phoneFormatted = "763-350-1875"`, raw preserved unchanged). The originally-listed "email-mismatch case → blank not error" is moot — no email join under the chosen design. Live UI checks ride next natural phone-bearing composite (operator confirms picker "Phone" inserts the token; rendered composite shows dashed output).
+- Files: `server/services/compositeService.js`, `client/src/pages/settings/OverrideEditorPage.js`, `client/src/pages/settings/LayoutDesignerPage.js`, `server/scripts/verify-phone-token.js`, `CLAUDE.md`
+
+---
+
 ## Reversed / removed
 
 - **Phase 31**: auto-push packaging during adopt — reversed in Phase 33 after it conflicted with the upstream "Sportsline UI" tool's payload

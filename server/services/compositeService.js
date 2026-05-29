@@ -42,12 +42,18 @@
 // Token substitution in text slots — same vocabulary documented in
 // the prior schema deep-dive:
 //   {customer.firstName}    {customer.lastName}
-//   {customer.email}        {customer.phone}
+//   {customer.email}        {customer.phone}            (raw — see below)
+//   {customer.phoneFormatted}  (Phase 67 — dash-formatted from order_phone)
 //   {subject.athleteName}   {subject.coach}    (from subject.fields[])
 //   {subject.team}          {subject.sport}    (subject.fields[] → camelCase)
 //   {galleryName}           {subGalleryName}
 //   {order.id}              {order.date}
 //   {year}                  {date}
+//
+// `customer.phone` stays RAW (the value from ms_orders.order_phone) because
+// shipstationService reads it for billTo/shipTo phone fallback — formatting
+// it there would silently leak hyphens into ShipStation. The new
+// `{customer.phoneFormatted}` is the dash-formatted variant for composite text.
 //
 // Phase 8a deliberately does NOT wire this into the orchestrator. The
 // verification endpoint exposes `previewComposite()` so you can render
@@ -865,7 +871,13 @@ class CompositeService {
       }
     }
     return {
-      customer: { ...(order.customer || {}) },
+      // Phase 67: spread the raw customer object FIRST, then layer in
+      // phoneFormatted so the raw `phone` field is preserved (ShipStation reads
+      // it) and the new formatted variant is available for composite text.
+      customer: {
+        ...(order.customer || {}),
+        phoneFormatted: formatPhone((order.customer && order.customer.phone) || ''),
+      },
       subject,
       galleryName: order.galleryName || '',
       subGalleryName: order.subGalleryName || (lineItem && lineItem.subGalleryName) || '',
@@ -917,6 +929,36 @@ function camelCaseKey(label) {
     .join('');
 }
 
+// Phase 67: dash-format a phone-shaped string for composite text rendering.
+// Strips non-digits, then:
+//   - 10 digits                  → xxx-xxx-xxxx
+//   - 11 digits starting with 1  → strip the leading 1, format as 10
+//   - anything else (including empty/whitespace-only input → '')
+//     → return the raw input untouched (no fallback text)
+// Empty / null / undefined / whitespace-only ⇒ '' (renders blank). The
+// "untouched" branch catches malformed values like a 7-digit local "555-1234"
+// so the operator sees what was actually stored — better than guessing.
+//
+// IMPORTANT: this is mirrored by client/src/pages/settings/OverrideEditorPage.js
+// (Phase 48 contract — server + client token-builders must agree). Change one
+// implementation, change the other.
+function formatPhone(raw) {
+  if (raw == null) return '';
+  const s = String(raw);
+  if (!s.trim()) return '';
+  const digits = s.replace(/\D/g, '');
+  if (digits.length === 10) {
+    return `${digits.slice(0, 3)}-${digits.slice(3, 6)}-${digits.slice(6)}`;
+  }
+  if (digits.length === 11 && digits.charAt(0) === '1') {
+    const d = digits.slice(1);
+    return `${d.slice(0, 3)}-${d.slice(3, 6)}-${d.slice(6)}`;
+  }
+  return s;
+}
+
 module.exports = new CompositeService();
 module.exports.LAYOUTS_PATH = LAYOUTS_PATH;
 module.exports.MAPPINGS_PATH = MAPPINGS_PATH;
+// Phase 67: exposed for verify-phone-token.js + any future direct use.
+module.exports.formatPhone = formatPhone;

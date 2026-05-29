@@ -1758,6 +1758,11 @@ const TEXT_TOKEN_CATALOG = [
   { token: '{subject.jerseyNumber}', label: 'Jersey #' },
   { token: '{customer.firstName}', label: 'First name' },
   { token: '{customer.lastName}', label: 'Last name' },
+  // Phase 67: dash-formatted phone from order_phone (raw {customer.phone} stays
+  // available too — ShipStation reads it). Adding a token here REQUIRES the
+  // matching server (compositeService.buildTokensFromOrder) and client mirror
+  // (OverrideEditorPage.buildTokensFromOrder) to expose the same field.
+  { token: '{customer.phoneFormatted}', label: 'Phone' },
   { token: '{galleryName}', label: 'Gallery' },
   { token: '{subGalleryName}', label: 'Sub-gallery' },
   { token: '{year}', label: 'Year' },
