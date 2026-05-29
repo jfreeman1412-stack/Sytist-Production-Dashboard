@@ -444,6 +444,41 @@ Format: phase number → short title → what shipped → key files touched.
 
 ---
 
+## Phase 64 — Pre-registration line items skip-flagged (fail-closed false-block fix)
+
+- **Bug:** order 112376 (3 real prints + 1 "Pre-registration for Kristin Nelson") false-blocked by the Phase 61 fail-closed gate. The pre-reg cart row carries no SKU, no photo, and none of the existing skip-flags (`booking`/`preSell`/`creditProduct`/`download`), so it survived into `printableItems`, hit the download loop, returned `no_photo_url`, and hard-failed the whole order — 3 real prints held hostage by one non-product line. Same class of bug as the 5D digital false-block (Phase 61a), different item type.
+- **Discriminator:** Sytist has a dedicated `ms_cart.cart_pre_register_id` column (positive integer ⇒ pre-registration line). Live DB profile (`ms_cart` + `ms_cart_archive`): **641 pre-reg rows, 0 with a photo, 0 with a SKU, 0 with `cart_download=1`, 0 counterexamples** — a clean type signal that can never drop a real print.
+- **Fix:** new `flags.preRegister` (from `cart_pre_register_id > 0`) at both line-item construction sites in `sytistDbService` (with the column added to both SELECTs). Wired into every skip set that lists `booking`/`preSell`: `processingService` `SKIP_FLAGS` (the gate), `darkroomService`, `packingSlipService`, `shipstationService`, `INSTANT_PACK_SKIP_FLAGS` in `sytistDbService`, and the inline eligibility check in `routes/shipstation.js`. The full retirement was deliberate — `processingService`-only would unblock the gate but leave a phantom $0 pre-reg line on the slip and as a ShipStation line item.
+- **Identity-not-photo invariant:** keys on the dedicated flag (`flags.preRegister`), NEVER on "missing photo." A real print whose photo genuinely fails still hard-fails — a real print can't have `cart_pre_register_id > 0`. The empty-`cart_sku` edge is a Sytist data gap (assign the SKU); no productName-substring matching.
+- **Gate log fix:** `cart N sku=? (item): error` previously rendered `sku=?` for empty-string SKUs (pre-reg signature), reading like "unlogged" when actually no SKU on the row. Now `sku=(empty)` (truly empty) vs `sku=?` (genuinely null/undefined).
+- **Recurring-pattern landmine added to `CLAUDE.md`:** non-product line item types (`booking`, `preSell`, `preRegister`, future variants) — always identify via dedicated `cart_*` column, add `flags.<type>`, wire into every skip set in lockstep, key on item identity. **Audit the `cart_*` column set in `ms_cart` for sibling flags before assuming a new type is already covered.**
+- **Verification:** `verify-failclose-gate.js` 10/10 (added cases 8/9 — pre-reg + real prints completes; sibling real-print-no-photo still hard-fails alongside excluded pre-reg). Live read-only on 112376: pre-reg cart 488923 now `flags.preRegister=true`; `_splitIntoSubOrders` excludes it; gate sees only the 3 real prints (all with photos) → would NOT fire.
+- Files: `server/services/sytistDbService.js`, `server/services/processingService.js`, `server/services/darkroomService.js`, `server/services/packingSlipService.js`, `server/services/shipstationService.js`, `server/routes/shipstation.js`, `server/scripts/verify-failclose-gate.js`, `CLAUDE.md`
+
+---
+
+## Phase 65 — Order-number prefix on Darkroom `.txt` last name (lab sort)
+
+- **Goal:** the Darkroom `.txt` `OrderLastName=` header now reads `<orderNumber>-<lastname>` (e.g. `112376-Nelson`) so lab print jobs sort numerically by order number on Darkroom import. Operator-requested for stack management at the print bench.
+- **Darkroom-`.txt`-ONLY.** Built as a local string at the `_renderContent` call site in `buildOrderTxt`; `order.customer` is **never mutated**. The packing slip (reads `order.shipTo`) and ShipStation (billTo reads `order.customer`, shipTo reads `order.shipTo`) keep the clean last name with no number. `ExtOrderNum` still carries the bare order number on its own header line. Verified live on order 112376: `order.customer.lastName` / `order.shipTo.lastName` both unchanged before vs after `buildOrderTxt` — leak-safe end-to-end.
+- **Divider carve-out.** `_renderContent` is shared between `buildOrderTxt` and `buildDividerTxt` (the Phase 63 batch divider). Editing only the `buildOrderTxt` call site leaves the divider untouched by construction — `buildDividerTxt` calls `_renderContent` with its own synthetic `lastName=''` and `orderNum='DIVIDER <teamName>'`. A divider isn't an order; correct.
+- **Edge:** order with empty `customer.lastName` renders `OrderLastName=<orderNumber>-` (trailing dash). Documented; matches the "always include order number" intent.
+- Files: `server/services/darkroomService.js`
+
+---
+
+## Phase 66 — Product category drives `packageCode=package` (`forcePackageSKUs` retired)
+
+- **Architecture change:** the per-SKU `productWeights[sku].category` field (rigid / bulky / pano / flat / digital) is now the **single source of truth** for "force Package service." `determinePackaging`'s force-package loop checks `category ∈ {rigid, bulky, pano}` for each physical SKU; matches set `forcePackage = true` and the existing flat-as-package path (`packageCode='package'`, `flat_9x11` dims) takes over. The parallel hand-maintained `forcePackageSKUs` SKU list is **retired entirely** — engine, `DEFAULT_CONFIG`, migrate-seeding, live `packaging-config.json`, the PUT-config allowlist in `routes/shipstation.js`, and the Settings → Packaging UI input (replaced with a static "Driven by per-SKU category" pointer).
+- **Why retire:** the parallel list drifted. SKU 18 Bagtag was `category:'rigid'` but absent from `forcePackageSKUs`, so it shipped as a flat. Live audit confirmed retirement is safe — all 10 SKUs in the live `forcePackageSKUs` are category rigid/bulky/pano, so category subsumes them.
+- **Behavior change — exactly 3 SKUs flip:** 18 (Bagtag, rigid), 37 (Team Coffee mug, bulky), 34 (12x36 Pano, pano) — previously `large_envelope_or_flat` — now `packageCode='package'`. Every other SKU unchanged.
+- **Intentionally untouched:** `boxRouteSKUs` (Medium-vs-Large box sizing, runs BEFORE the force-package check and returns early — boxed SKUs were already `service:'package'`), the magnet count rule (`magnetThreshold` SKUs 15/17 at qty ≥ 3 → package), and `packageBundles[].forcePackage` (bundle override). The narrow scope keeps Phase 66 as "category replaces the parallel list," not "rewrite box routing."
+- **CLAUDE.md landmine added:** do not reintroduce a parallel force-package list; change the SKU's category instead.
+- **Verification:** `server/scripts/verify-package-routing.js` 10/10 (rigid/bulky/pano → package, flat → flat, magnet count rule unchanged, Gold bundle override unchanged, boxRoute sizing unchanged, SKU 45 without boxRoute → flat) + read-only live sweep (every SKU formerly in `forcePackageSKUs` still ships package; 18/34/37 flip flat→package).
+- Files: `server/services/packagingService.js`, `server/config/packaging-config.json`, `server/routes/shipstation.js`, `client/src/pages/settings/PackagingPage.js`, `server/scripts/verify-package-routing.js`, `CLAUDE.md`
+
+---
+
 ## Phase 67 — `{customer.phoneFormatted}` composite text token (dash-formatted from `order_phone`)
 
 - **Goal:** new composite-builder variable for printing the customer's phone in dash-formatted form (e.g. `555-123-4567`). Operator inserts via a "Phone" button in the variable picker.
