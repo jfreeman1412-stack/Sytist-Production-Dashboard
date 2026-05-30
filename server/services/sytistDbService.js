@@ -94,7 +94,7 @@ function _physicalItemExistsSql(digitalSkuList) {
 // isPhysical predicate below and must themselves be on the eligible list.
 // Default-deny means they aren't (and a drop-ship SKU shouldn't be markable),
 // which correctly disqualifies any order containing one.
-const INSTANT_PACK_SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell', 'preRegister'];
+const INSTANT_PACK_SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell', 'preRegister', 'coupon'];
 
 // Build synchronous SKU→classification predicates from a pre-loaded
 // productWeights map. Reimplements packagingService.isDigital /
@@ -1129,6 +1129,7 @@ class SytistDbService {
           c.cart_credit_product, c.cart_booking, c.cart_photo_bg,
           c.cart_pre_sell, c.cart_pre_sold, c.cart_pre_sold_gallery,
           c.cart_pre_register_id,
+          c.cart_coupon,
           c.cart_thumb, c.cart_notes,
           c.cart_frame_size, c.cart_canvas_id,
           0 AS fromArchive
@@ -1151,6 +1152,7 @@ class SytistDbService {
           ca.cart_credit_product, ca.cart_booking, ca.cart_photo_bg,
           ca.cart_pre_sell, ca.cart_pre_sold, ca.cart_pre_sold_gallery,
           ca.cart_pre_register_id,
+          ca.cart_coupon,
           ca.cart_thumb, ca.cart_notes,
           ca.cart_frame_size, ca.cart_canvas_id,
           1 AS fromArchive
@@ -1307,6 +1309,14 @@ class SytistDbService {
             // "printable item with no photo" (order 112376). Treated as a
             // skip-flag everywhere booking/preSell are.
             preRegister: c.cart_pre_register_id > 0,
+            // Phase 69: coupon line (Sytist cart_coupon > 0). Same shape as the
+            // Phase 64 pre-registration case — no SKU, no photo, no product
+            // name, no other skip-flag. Treated as a skip-flag everywhere
+            // (orders 112885/112886). Profile: 2,635 coupon rows DB-wide, 0
+            // with sku/photo/download/name — clean type discriminator. The
+            // Phase 64 landmine called this out — "audit cart_* siblings" —
+            // and caught it on the third instance.
+            coupon: c.cart_coupon > 0,
             fromArchive: c.fromArchive === 1,
           },
 
@@ -1726,6 +1736,7 @@ class SytistDbService {
         ${cartAlias}.cart_credit_product, ${cartAlias}.cart_booking, ${cartAlias}.cart_photo_bg,
         ${cartAlias}.cart_pre_sell, ${cartAlias}.cart_pre_sold, ${cartAlias}.cart_pre_sold_gallery,
         ${cartAlias}.cart_pre_register_id,
+        ${cartAlias}.cart_coupon,
         ${cartAlias}.cart_thumb, ${cartAlias}.cart_notes,
         ${cartAlias}.cart_frame_size, ${cartAlias}.cart_canvas_id,
         ${fromArchive ? 1 : 0} AS fromArchive
@@ -1850,6 +1861,8 @@ class SytistDbService {
           // Phase 64: pre-registration placeholder (cart_pre_register_id > 0).
           // See the getOrderById flags block for the full rationale.
           preRegister: c.cart_pre_register_id > 0,
+          // Phase 69: coupon line (cart_coupon > 0). See first flags block.
+          coupon: c.cart_coupon > 0,
           fromArchive: c.fromArchive === 1,
         },
 

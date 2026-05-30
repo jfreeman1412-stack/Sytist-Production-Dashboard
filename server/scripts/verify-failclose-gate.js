@@ -23,6 +23,12 @@
 //   9. GUARD: a real print with no photo STILL gate-fails even when a sibling
 //      pre-reg line is excluded — the exclusion is per-item by flag, not
 //      order-wide and not on "missing photo".
+// Phase 69 adds two more for coupon lines (the third instance of this pattern;
+// the Phase 64 landmine — "audit cart_* siblings" — caught it):
+//   10. a coupon line (flags.coupon, no SKU, no photo, no name) is EXCLUDED →
+//       an order with it alongside real prints completes (orders 112885/112886).
+//   11. GUARD: a real print with no photo STILL gate-fails even when a sibling
+//       coupon line is excluded — same per-item-by-flag invariant.
 
 process.env.SYTIST_DB_HOST = process.env.SYTIST_DB_HOST || 'offline';
 process.env.SYTIST_DB_USER = process.env.SYTIST_DB_USER || 'offline';
@@ -255,6 +261,38 @@ async function expect(name, fn) {
     const order = makeOrder([
       printItem({ cartId: '1', sku: '10', photo: { fullUrl: '' } }), // real print, NO photo → must fail
       printItem({ cartId: '2', sku: '', flags: { preRegister: true }, photo: { fullUrl: '' } }), // pre-reg, excluded
+    ]);
+    const subs = await proc._splitIntoSubOrders(order);
+    if (!(subs[0].lineItems.length === 1 && subs[0].lineItems[0].cartId === '1')) return false; // only the real print remains printable
+    const r = await proc._processSubOrder(order, subs[0], {});
+    return r.success === false && r.txtPath === null && calls.buildOrderTxt === 0;
+  });
+
+  // 10. Phase 69: a coupon line (flags.coupon, empty SKU, no photo, no product
+  // name) is EXCLUDED from the printable set — same boundary as the pre-reg
+  // case, keyed on cart_coupon-derived flag. An order containing it alongside
+  // a real print COMPLETES; the coupon line is ignored, not a failure (live
+  // bug: orders 112885 and 112886).
+  await expect('coupon line (no photo) excluded → order completes, .txt written', async () => {
+    const order = makeOrder([
+      printItem({ cartId: '1', sku: '10' }), // real print, downloads OK
+      printItem({ cartId: '2', sku: '', productNameDisplay: '', flags: { coupon: true }, photo: { fullUrl: '' } }),
+    ]);
+    const subs = await proc._splitIntoSubOrders(order);
+    const printableCartIds = subs[0].lineItems.map((li) => li.cartId);
+    if (!(printableCartIds.length === 1 && printableCartIds[0] === '1')) return false; // coupon excluded, real print kept
+    const r = await proc._processSubOrder(order, subs[0], {});
+    return r.success === true && r.photosFailed.length === 0 && calls.buildOrderTxt === 1;
+  });
+
+  // 11. Phase 69 GUARD: the coupon exclusion is per-item and keyed on the
+  // flag, NOT on "missing photo". A real print (no coupon flag) with no photo
+  // URL STILL hard-fails even when a sibling coupon line is excluded —
+  // proving we didn't weaken the gate. Same invariant as case 9 (pre-reg).
+  await expect('real print no photo STILL gate-fails alongside an excluded coupon sibling', async () => {
+    const order = makeOrder([
+      printItem({ cartId: '1', sku: '10', photo: { fullUrl: '' } }), // real print, NO photo → must fail
+      printItem({ cartId: '2', sku: '', flags: { coupon: true }, photo: { fullUrl: '' } }), // coupon, excluded
     ]);
     const subs = await proc._splitIntoSubOrders(order);
     if (!(subs[0].lineItems.length === 1 && subs[0].lineItems[0].cartId === '1')) return false; // only the real print remains printable

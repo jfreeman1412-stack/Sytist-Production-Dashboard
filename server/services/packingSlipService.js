@@ -108,7 +108,9 @@ const DEFAULT_SLIP_CONFIG = {
 // Phase 64: preRegister — a pre-registration placeholder (cart_pre_register_id
 // > 0) is a $0 non-product with no photo; it must not render on the slip nor be
 // counted in "Items to Ship".
-const SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell', 'preRegister', 'isPackageHeader'];
+// Phase 69: coupon — cart_coupon > 0; non-product, must not render on slip or
+// count toward "Items to Ship".
+const SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell', 'preRegister', 'coupon', 'isPackageHeader'];
 
 class PackingSlipService {
   constructor() {

@@ -734,8 +734,9 @@ async function _computeEligibility(order) {
       giftCertCount += 1;
       continue;
     }
-    if (flags.creditProduct || flags.booking || flags.preSell || flags.preRegister) {
+    if (flags.creditProduct || flags.booking || flags.preSell || flags.preRegister || flags.coupon) {
       // Phase 64: preRegister — $0 pre-registration placeholder, not shippable.
+      // Phase 69: coupon — Sytist coupon line (cart_coupon > 0), not shippable.
       otherSkippedCount += 1;
       continue;
     }

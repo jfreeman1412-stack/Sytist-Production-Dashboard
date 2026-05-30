@@ -63,7 +63,8 @@ const DEFAULT_FILENAME_CONFIG = { pattern: '{order_number}', extension: '.txt' }
 // download deliveries, prepayments, gift certs, registration credits,
 // pre-sales, and pre-registration placeholders (Phase 64) — none of them
 // produce a JPEG that goes to Darkroom.
-const SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell', 'preRegister'];
+// Phase 69: coupon — cart_coupon > 0; non-product line, never produces a JPEG.
+const SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell', 'preRegister', 'coupon'];
 
 class DarkroomService {
   constructor() {

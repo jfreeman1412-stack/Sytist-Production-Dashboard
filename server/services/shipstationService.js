@@ -87,7 +87,8 @@ function distributeIntegerOzAcrossLines(itemWeights, orderFloorOz) {
 // if any of these are true. Matches the SKIP_FLAGS used by the Phase 11
 // processing pipeline. Phase 64: preRegister (cart_pre_register_id > 0) — a $0
 // pre-registration placeholder, never a shippable line.
-const SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell', 'preRegister'];
+// Phase 69: coupon — cart_coupon > 0; non-shippable line, never on the SS payload.
+const SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell', 'preRegister', 'coupon'];
 
 // Phase 13a hotfix #6: ShipStation rejects country fields that aren't
 // 2-letter ISO codes. Sytist orders can show up with "United States",

@@ -126,7 +126,13 @@ const DEFAULT_SETTINGS = {
 // class as the 5D digital false-block, different item type). Keying on the flag
 // (item identity) not on "missing photo" preserves the gate guard: a real print
 // whose photo genuinely fails has no preRegister flag and still hard-fails.
-const SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell', 'preRegister', 'isPackageHeader'];
+// Phase 69: coupon — Sytist coupon line (cart_coupon > 0). Same recurring
+// pattern as Phase 64 preRegister: no SKU, no photo, no product name, no other
+// skip-flag, so it survived `printableItems` and tripped the gate as a
+// "printable item with no photo" (orders 112885/112886). Added to the skip set
+// in lockstep with preRegister. The Phase 64 landmine predicted this — keep
+// auditing `cart_*` columns for the next sibling.
+const SKIP_FLAGS = ['download', 'giftCert', 'creditProduct', 'booking', 'preSell', 'preRegister', 'coupon', 'isPackageHeader'];
 
 // In-memory job registry for batch processing progress polling. Cleared
 // 1 hour after job completion to avoid unbounded growth.
