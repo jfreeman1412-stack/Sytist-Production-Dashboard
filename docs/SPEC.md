@@ -2277,3 +2277,41 @@ A `CLAUDE.md` landmine now documents this three-place rule so the next addition 
 Live spot-check (env-gated; +2/2 when DB env is configured): real order 112801 with `customer.phone = "7633501875"` → `tokens.customer.phoneFormatted = "763-350-1875"`, raw preserved. The originally-listed "email-mismatch case → blank not error" is **moot under the chosen design** — `phoneFormatted` reads `customer.phone` directly, no email join, no mismatch surface. Remaining live checks (variable-picker "Phone" button inserts the token, rendered composite shows dashed output) ride the next natural phone-bearing composite — not blocking.
 
 Files: `server/services/compositeService.js`, `client/src/pages/settings/OverrideEditorPage.js`, `client/src/pages/settings/LayoutDesignerPage.js`, `server/scripts/verify-phone-token.js`, `CLAUDE.md`.
+
+## 69. Coupon line skip-flag (third instance of the non-product-line gate-block pattern)
+
+**The bug.** Phase 61's fail-closed gate fired on orders 112885 and 112886. Both orders contained a Sytist coupon line in `ms_cart` (cart 492158 "Harberts10" on 112885; cart 492160 "Melanie95" on 112886) carrying no SKU, no product name (`cart_product_name = ''`), no photo (`cart_pic_id = 0`), and **none** of the existing skip-flags (`cart_download`, `cart_booking`, `cart_pre_sell`, `cart_pre_register_id` all 0/null). It survived `_splitIntoSubOrders`' `SKIP_FLAGS` filter, the Phase 61a `isDigitalSku` filter (empty SKU isn't digital), and the Phase 64 `preRegister` filter. Reached the download loop, returned `no_photo_url`, tripped the gate → real prints held hostage. **Third instance of the same pattern in close succession** — digital-by-config 5D (Phase 61a), pre-registration (Phase 64), coupon (Phase 69).
+
+**The Phase 64 landmine earned its keep.** The Phase 64 landmine note explicitly said: *"audit the `cart_*` column set in `ms_cart` for sibling flags before assuming a new type is already covered."* When the operator reported 112885/112886 with the guess that it was a 5D-class issue, the audit immediately surfaced `cart_coupon` as a previously-unmodeled type — the standing rule did exactly what it was added for. **Audit `cart_*` columns for siblings remains the standing rule** whenever a "won't process" / `no_photo_url` symptom appears on an order whose products look fine.
+
+**The discriminator.** `ms_cart.cart_coupon > 0` (and `cart_coupon_name` populated with the coupon code). Live DB profile:
+
+| | count |
+|---|---|
+| `cart_coupon > 0` rows total (`ms_cart` + `ms_cart_archive`) | 2,635 |
+| …with a photo (`cart_pic_id > 0`) | **0** |
+| …with a SKU (`TRIM(cart_sku) <> ''`) | **0** |
+| …with `cart_download = 1` | **0** |
+| …with a product name (`TRIM(cart_product_name) <> ''`) | **0** |
+| Counterexamples (coupon row with any product attribute) | **0** |
+| Currently-blocked open orders in last 14 days | **2** (112885, 112886) |
+
+Clean type signal — can never drop a real print (a real print never has `cart_coupon > 0`), and the gate's guard ("real print with no photo still hard-fails") is preserved.
+
+**Fix — `flags.coupon`, wired into every skip set (Phase 64 template, exactly).** New boolean derived from `cart_coupon > 0` at both `sytistDbService` line-item construction sites (`getOrderById` + `getOrdersByWorkflow`), with `cart_coupon` added to all three SELECTs (live + archive in `getOrderById`, the workflow query in `getOrdersByWorkflow`). Wired into every skip set that lists `booking`/`preSell`/`preRegister`:
+- `processingService` `SKIP_FLAGS` (the fail-closed gate — fixes the false-block)
+- `darkroomService` `SKIP_FLAGS` (slip row + `.txt` row)
+- `packingSlipService` `SKIP_FLAGS` (visible slip line)
+- `shipstationService` `SKIP_FLAGS` (SS payload line items)
+- `INSTANT_PACK_SKIP_FLAGS` in `sytistDbService` (instant-pack eligibility)
+- Inline eligibility check in `routes/shipstation.js`
+
+Full wiring was deliberate (not just `processingService`) — the minimal fix would unblock the gate but leave the coupon as a phantom $0 line on the packing slip and as a ShipStation line item with no product info. Same trap Phase 64 navigated.
+
+**Identity-not-photo invariant.** Keys on the dedicated flag (`flags.coupon`), NEVER on "missing photo." A real print whose photo genuinely fails still hard-fails — a real print can't have `cart_coupon > 0`. Same rule as Phase 61a (digital exclusion) and Phase 64 (pre-reg exclusion).
+
+**CLAUDE.md landmine updated.** The "Non-product line items false-block the fail-closed gate" section now lists `coupon` alongside `booking`/`preSell`/`preRegister` in the type set, and explicitly acknowledges that the Phase 64 audit-`cart_*`-siblings rule caught this third instance on first report.
+
+**Verification.** `verify-failclose-gate.js` 12/12 — Phase 61/61a/64 cases unchanged; new cases 10/11 added: coupon + real prints completes (coupon excluded, not a failure); sibling real-print-no-photo still hard-fails alongside excluded coupon (the gate's guard intact). Adjacent harnesses unchanged: instant-pack 11/11, slip pagination 11/11, package-routing 10/10. Live read-only on both reported orders: coupon cart (492158/492160) now `flags.coupon=true`; `_splitIntoSubOrders` excludes it; the gate sees only real prints (all with photos) → would NOT fire. **Live two-sided field check on 112885/112886 (operator-confirmed):** both processed cleanly, no phantom $0 coupon line on the packing slip, ShipStation order weight reflects only real items.
+
+Files: `server/services/sytistDbService.js`, `server/services/processingService.js`, `server/services/darkroomService.js`, `server/services/packingSlipService.js`, `server/services/shipstationService.js`, `server/routes/shipstation.js`, `server/scripts/verify-failclose-gate.js`, `CLAUDE.md`.

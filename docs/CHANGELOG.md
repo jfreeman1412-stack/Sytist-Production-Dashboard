@@ -491,6 +491,17 @@ Format: phase number → short title → what shipped → key files touched.
 
 ---
 
+## Phase 69 — Coupon line skip-flag (fail-closed false-block fix, third instance of the non-product-line pattern)
+
+- **Bug:** orders 112885 and 112886 false-blocked by the Phase 61 fail-closed gate. Both contained a Sytist coupon line in `ms_cart` (cart 492158 "Harberts10", cart 492160 "Melanie95") with no SKU, no product name, no photo, and **none** of the existing skip-flags. The coupon line survived `printableItems`, hit the download loop, returned `no_photo_url`, and hard-failed the whole order — real prints held hostage. Third instance of the same recurring pattern: digital-by-config 5D (Phase 61a) → pre-registration (Phase 64) → coupon (Phase 69). **The Phase 64 landmine — "audit `cart_*` columns for siblings" — caught this on first report; the rule earns its keep.**
+- **Discriminator:** `ms_cart.cart_coupon > 0`. Live DB profile across both `ms_cart` + `ms_cart_archive`: **2,635 coupon rows, 0 with photo, 0 with SKU, 0 with `cart_download=1`, 0 with product name, 0 counterexamples** — clean type signal that can never drop a real print.
+- **Fix:** new `flags.coupon` (from `cart_coupon > 0`) at both line-item construction sites in `sytistDbService` (with `cart_coupon` added to all 3 SELECTs). Wired into every skip set in lockstep with `preRegister`: `processingService` `SKIP_FLAGS` (fixes the gate), `darkroomService`, `packingSlipService`, `shipstationService`, `INSTANT_PACK_SKIP_FLAGS`, and the inline eligibility check in `routes/shipstation.js`. Identity-not-photo invariant preserved (a real print never has `cart_coupon > 0`; missing-photo on a real print still hard-fails). Full wiring was deliberate — `processingService`-only would have left the coupon as a phantom $0 line on the packing slip and a phantom ShipStation line item.
+- **CLAUDE.md landmine updated** to include `coupon` in the recurring-pattern type list and explicitly note that the "audit `cart_*` siblings" rule successfully predicted/caught this third instance.
+- **Verification:** `verify-failclose-gate.js` 12/12 (added cases 10/11 mirroring Phase 64's 8/9 — coupon + real prints completes; real-print-no-photo still hard-fails alongside excluded coupon). Adjacent harnesses unchanged: instant-pack 11/11, slip pagination 11/11, package-routing 10/10. Live read-only on both reported orders: `flags.coupon=true` on the coupon line; `_splitIntoSubOrders` excludes it; gate would NOT fire. **Live two-sided field check on 112885/112886 (operator-confirmed):** both processed cleanly, no phantom $0 coupon line on the packing slip, ShipStation order weight reflects only real items.
+- Files: `server/services/sytistDbService.js`, `server/services/processingService.js`, `server/services/darkroomService.js`, `server/services/packingSlipService.js`, `server/services/shipstationService.js`, `server/routes/shipstation.js`, `server/scripts/verify-failclose-gate.js`, `CLAUDE.md`
+
+---
+
 ## Reversed / removed
 
 - **Phase 31**: auto-push packaging during adopt — reversed in Phase 33 after it conflicted with the upstream "Sportsline UI" tool's payload
