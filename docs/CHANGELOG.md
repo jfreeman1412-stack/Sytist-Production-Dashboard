@@ -502,6 +502,22 @@ Format: phase number → short title → what shipped → key files touched.
 
 ---
 
+## Phase 70 — `resolveSheetMeta` helper + three client sites swapped (Phase 57A drift fix; SKU 22 list-vs-editor)
+
+- **Bug:** the operator edited SKU 22's composite from 8×10.25 to 8×10.5 in the layout designer. Editor preview showed 8×10.5 (correct — designer resolves variant-first); the composites list "Size" column still showed 8×10.25. The JSON file on disk has both: variant value `10.5` and deprecated root value `10.25`. The list read root only — exactly the failure mode the Phase 57A landmine warned against (*"don't read root directly for render"*).
+- **Three drift sites confirmed.** Initial audit grep flagged four; one (`OrderDetailPage.js:3282`) turned out to be a false positive — it displays **imposition** info (`{info.layout.cols}×{info.layout.rows} on {info.layout.sheetWidth}×{info.layout.sheetHeight}″`), and imposition is single-variant by design (root is authoritative there). The three actual composite-layout drift sites:
+  - `client/src/pages/settings/CompositesSettings.js:445` — list "Size" column (the reported case).
+  - `client/src/pages/settings/OverrideEditorPage.js:928` — override-editor canvas aspect ratio (silent: would render the canvas at wrong proportions for any layout with diverged variants).
+  - `client/src/pages/settings/OverrideEditorPage.js:1034-1035` — `sheetWidth`/`sheetHeight` props to `QuickEditPanel`.
+- **Fix — shared helper `client/src/utils/resolveSheetMeta.js`.** Variant-first / root-fallback / hardcoded-default for all four Phase 57A-named fields (`sheetWidth`, `sheetHeight`, `dpi`, `backgroundColor`). Pattern mirrors `LayoutCanvas.js:120-133`'s existing-correct inline exactly: `!= null` checks for numeric fields, `||`-chain for backgroundColor, defaults `dpi=300` / `backgroundColor='#ffffff'`. **`backgroundColor` included even though no current drift site reads it** — Phase 57A names all four fields as variant-first; excluding it would invite the next reader to re-inline the precedence and recreate the bug class for that field. The helper is the canonical "resolve sheet meta for variant X" function on the client.
+- **List column: vertical-primary + `(V/H differ)` marker.** Resolves from the `vertical` variant (the historical default; ~95% of composites don't diverge V vs H in practice). When vertical-resolved dims don't agree with horizontal-resolved dims, a small italic `(V/H differ)` marker appears inline and the cell's `title` carries both variants' resolved dims as a tooltip. Decision over a per-variant column: marker handles divergence without bloating the column for the common case.
+- **Scope discipline — `LayoutCanvas` + `LayoutDesignerPage` left alone.** Their existing inlined resolvers are correct; helper is available for them later if a future refactor consolidates.
+- **CLAUDE.md Phase 57A landmine updated** to point at `resolveSheetMeta` as the canonical client-side resolver, document the three drifted sites Phase 70 fixed, and tell the next reader: any new client surface that displays composite-layout dimensions for a specific variant must use this helper — don't re-inline the precedence.
+- **Verification:** offline drive of the helper against the live SKU 22 layout — root `8 × 10.25`, vertical resolved `8 × 10.5`, horizontal resolved `8 × 10.25` (variant fallback to root, since horizontal has no override). `differs=true`. List cell would render `8″ × 10.5″ @ 300dpi (V/H differ)`. Live two-sided field check post-commit: refresh the composites page, confirm SKU 22 row shows the corrected size with the marker, hover-tooltip shows both variants.
+- Files: `client/src/utils/resolveSheetMeta.js` (new), `client/src/pages/settings/CompositesSettings.js`, `client/src/pages/settings/OverrideEditorPage.js`, `CLAUDE.md`
+
+---
+
 ## Reversed / removed
 
 - **Phase 31**: auto-push packaging during adopt — reversed in Phase 33 after it conflicted with the upstream "Sportsline UI" tool's payload

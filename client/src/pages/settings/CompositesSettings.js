@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import api from '../../services/api';
+import { resolveSheetMeta } from '../../utils/resolveSheetMeta';
 import {
   PageHeader,
   Section,
@@ -11,6 +12,41 @@ import {
   StatusBanner,
   settingsStyles,
 } from '../../components/SettingsForm';
+
+// Phase 70: the list "Size" column resolves from the vertical variant (the
+// historical default) using the canonical resolveSheetMeta helper, and shows a
+// small "(V/H differ)" marker + tooltip when the horizontal variant resolves to
+// different dimensions or dpi. Pre-Phase-70 this read `l.sheetWidth/.sheetHeight/.dpi`
+// from root directly, which silently disagreed with the engine + editor for any
+// layout whose variants had diverged (the bug Phase 70 fixed). backgroundColor
+// isn't compared here — it doesn't affect what the Size column displays.
+function SizeCell({ layout }) {
+  const v = resolveSheetMeta(layout, 'vertical');
+  const h = resolveSheetMeta(layout, 'horizontal');
+  const differs =
+    v.sheetWidth !== h.sheetWidth ||
+    v.sheetHeight !== h.sheetHeight ||
+    v.dpi !== h.dpi;
+  const tooltip = differs
+    ? `Vertical: ${v.sheetWidth}″ × ${v.sheetHeight}″ @ ${v.dpi}dpi\nHorizontal: ${h.sheetWidth}″ × ${h.sheetHeight}″ @ ${h.dpi}dpi`
+    : undefined;
+  return (
+    <span title={tooltip}>
+      {v.sheetWidth}″ × {v.sheetHeight}″ @ {v.dpi}dpi
+      {differs && (
+        <span
+          style={{
+            marginLeft: 4,
+            color: 'var(--text-muted)',
+            fontStyle: 'italic',
+          }}
+        >
+          (V/H differ)
+        </span>
+      )}
+    </span>
+  );
+}
 
 /**
  * Phase 8b — Composites settings page.
@@ -442,7 +478,7 @@ function LayoutsSection() {
                     </td>
                     <td style={settingsStyles.td}>{l.name}</td>
                     <td style={{ ...settingsStyles.td, fontSize: 11 }}>
-                      {l.sheetWidth}″ × {l.sheetHeight}″ @ {l.dpi}dpi
+                      <SizeCell layout={l} />
                     </td>
                     <td style={{ ...settingsStyles.td, fontSize: 11 }}>
                       {Object.keys(l.variants || {}).join(', ') || '—'}

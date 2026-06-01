@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import api from '../../services/api';
+import { resolveSheetMeta } from '../../utils/resolveSheetMeta';
 import {
   PageHeader,
   Section,
@@ -924,8 +925,14 @@ export default function OverrideEditorPage() {
                 onSlotSelect={setSelectedIndex}
                 onSlotChange={handleSlotChange}
                 width={700}
+                // Phase 70: aspect ratio MUST resolve variant-first; reading
+                // layout.sheetHeight/.sheetWidth at root would render the canvas
+                // at the pre-divergence proportions for any variant that has
+                // overridden them in the layout designer.
                 height={Math.round(
-                  700 * (layout.sheetHeight / layout.sheetWidth)
+                  700 *
+                    (resolveSheetMeta(layout, variant).sheetHeight /
+                      resolveSheetMeta(layout, variant).sheetWidth)
                 )}
                 sampleTokens={sampleTokens}
                 snapEnabled={snapEnabled}
@@ -1031,8 +1038,12 @@ export default function OverrideEditorPage() {
                     baseLayout?.variants?.[variant]?.slots?.[selectedIndex] || null
                   }
                   tokens={sampleTokens}
-                  sheetWidth={layout.sheetWidth}
-                  sheetHeight={layout.sheetHeight}
+                  // Phase 70: variant-first per the same rule as the LayoutCanvas
+                  // height above. Pre-Phase-70 these read root directly and any
+                  // QuickEditPanel coordinate math could silently use the wrong
+                  // canvas dimensions when the active variant diverged from root.
+                  sheetWidth={resolveSheetMeta(layout, variant).sheetWidth}
+                  sheetHeight={resolveSheetMeta(layout, variant).sheetHeight}
                   onChange={(newSlot) =>
                     handleSlotChange(selectedIndex, newSlot)
                   }
