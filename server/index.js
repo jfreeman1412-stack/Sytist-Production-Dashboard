@@ -75,8 +75,17 @@ setInterval(() => {
 // ─── Express app ───────────────────────────────────────────
 const app = express();
 
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+// Phase 71: 25mb cap accommodates the override editor's base64-in-JSON image
+// uploads. Base64 inflates binary by ~4/3, so 25mb JSON ≈ ~18.7mb raw image —
+// the client pre-flight in OverrideEditorPage.uploadSlotAsset caps the raw
+// file at 18mb (with margin for the JSON wrapper). This global parser runs
+// BEFORE any per-route express.json(...) middleware — raising a per-route
+// limit without raising this one is a no-op (the original Phase 50 author hit
+// this; we removed the vestigial 15mb route parser in Phase 71). If a future
+// upload uses multipart/form-data instead, multer has its own fileSize limit
+// independent of this one.
+app.use(express.json({ limit: '25mb' }));
+app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
 app.use(
   cors({

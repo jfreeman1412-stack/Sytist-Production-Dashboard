@@ -3550,19 +3550,16 @@ router.post(
  * orderAssetOverrideService. The routes are thin: validate ids, hand off
  * to the service, return a structured response.
  *
- * Scoped 15 MB JSON parser on POST: a 10 MB image base64-encodes to
- * ~13.4 MB, which exceeds the global 10 MB express.json limit at
- * server/index.js:78. Mirrors the graphicUploadJsonParser pattern below
- * at the composite/graphics route — keeps the higher cap scoped to just
- * this endpoint instead of widening the global resource-exhaustion
- * surface.
+ * Phase 71: a vestigial per-route `express.json({ limit: '15mb' })` parser
+ * lived here, intended to scope a higher body-size limit to this endpoint.
+ * It was DEAD CODE — the global `app.use(express.json(...))` in
+ * server/index.js runs FIRST and 413s before any per-route parser sees
+ * the body. The global is the only knob that matters; it's set to 25mb to
+ * cover this base64-in-JSON upload (see server/index.js for the math).
  */
-const orderAssetUploadJsonParser = express.json({ limit: '15mb' });
-
 router.post(
   '/order-overrides/:orderId/:cartId/assets/:slotIndex',
   requireRole('admin', 'operator'),
-  orderAssetUploadJsonParser,
   async (req, res) => {
     try {
       const orderId = parseInt(req.params.orderId, 10);
@@ -4157,19 +4154,16 @@ router.get(
  * Updates layout.graphics[key] in the layout JSON to reflect the new
  * file. Both writes happen in this handler — service stays decoupled.
  *
- * Phase 9e-hotfix: per-route body-parser with 15 MB limit. The default
- * express.json() middleware caps at 100kb which silently truncates
- * large image uploads. 15 MB = enough headroom for a 10 MB binary
- * base64-encoded (~13.3 MB) plus JSON overhead. Without this, an 8×10
- * @ 300 DPI PNG (3-7 MB raw, 4-9 MB base64) would either fail with a
- * 413 or come through empty depending on Express version.
+ * Phase 9e-hotfix added a per-route `express.json({ limit: '15mb' })` parser
+ * here for the same reason the asset-upload route had one. Phase 71 removed
+ * it: same dead-code issue (global parser runs first; per-route limits
+ * don't override the global). The note about default express.json capping
+ * at 100kb was a red herring — the app has always set the global with an
+ * explicit `limit:` since Phase 1. Global is at 25mb (server/index.js).
  */
-const graphicUploadJsonParser = express.json({ limit: '15mb' });
-
 router.post(
   '/composite/layouts/:layoutId/graphics/:key',
   requireRole('admin'),
-  graphicUploadJsonParser,
   async (req, res) => {
     try {
       const { layoutId, key } = req.params;

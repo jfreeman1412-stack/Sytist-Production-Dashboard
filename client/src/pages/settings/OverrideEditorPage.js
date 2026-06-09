@@ -536,6 +536,24 @@ export default function OverrideEditorPage() {
   // — future storage-sweep follow-up will clean these up.
   async function uploadSlotAsset(slotIndex, file) {
     if (!file || !layout) return;
+
+    // Phase 71: pre-flight raw-size check. The server's express.json cap is
+    // 25mb (server/index.js); base64 inflates binary by ~4/3, so the raw-file
+    // ceiling is ~18.7mb. Cap at a clean 18mb with margin for the JSON wrapper
+    // around dataBase64 (filename, slotKind, JSON braces). Reject BEFORE the
+    // FileReader read so the operator gets instant feedback instead of waiting
+    // for the upload to fail. If this constant ever moves, the server limit
+    // must move proportionally (raw × ~1.33 + wrapper) — see CLAUDE.md.
+    const MAX_UPLOAD_RAW_BYTES = 18 * 1024 * 1024;
+    if (file.size > MAX_UPLOAD_RAW_BYTES) {
+      const sizeMb = (file.size / 1024 / 1024).toFixed(1);
+      window.alert(
+        `Image too large — max 18 MB. This file is ${sizeMb} MB. ` +
+          `Please resize and try again.`
+      );
+      return;
+    }
+
     setActionLoading(`upload-${slotIndex}`);
     setActionError(null);
     setActionResult(null);
@@ -621,7 +639,18 @@ export default function OverrideEditorPage() {
         sizeBytes: newOverrideImage.sizeBytes,
       });
     } catch (err) {
-      setActionError(err.message || String(err));
+      // Phase 71: defense in depth — if the client pre-flight cap and the
+      // server JSON cap ever drift, a 413 still produces a clear, actionable
+      // message rather than a generic "Request failed (413)" banner.
+      if (err && err.status === 413) {
+        const sizeMb = (file.size / 1024 / 1024).toFixed(1);
+        window.alert(
+          `Image too large — max 18 MB. This file is ${sizeMb} MB. ` +
+            `Please resize and try again.`
+        );
+      } else {
+        setActionError(err.message || String(err));
+      }
     } finally {
       setActionLoading(null);
     }

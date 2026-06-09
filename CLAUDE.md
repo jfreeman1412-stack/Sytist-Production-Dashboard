@@ -302,6 +302,14 @@ If Process leaves an order Open with no `.txt`, no ShipStation order, and a red 
 
 **Invariant — key on item identity, NEVER on "missing photo".** Excluding on "no photo" would re-open the Phase 61 gate's guard: a *real* print whose photo genuinely failed to download must still hard-fail. The dedicated-column check preserves that (a real print never has `cart_pre_register_id > 0` / `cart_coupon > 0` etc.). The empty-`cart_sku` edge is a Sytist data gap — assign the SKU, don't add productName-substring matching.
 
+### Body-parser limits: global `express.json` runs first, per-route limits don't override it (Phase 71)
+
+`app.use(express.json({ limit: ... }))` in `server/index.js` is **global middleware** — it runs on every request *before* any route-specific `express.json(...)` parser. So a per-route `express.json({ limit: '15mb' })` doesn't "scope a higher limit to one endpoint" — the global parser sees the body first, returns 413 if oversized, and the route-specific parser never runs. **Phase 9e-hotfix and Phase 50 both made this mistake** (at the composite/graphics route and the order-asset upload route); both added 15mb per-route parsers that were dead code from the moment they were committed. Phase 71 removed both and bumped the global to 25mb. **The global is the only knob that matters for `express.json` size limits**; raise/lower it there or not at all.
+
+If a future upload route needs a *different* size cap from the global, you can't do it with per-route `express.json(...)` — you'd need to (a) use multipart/form-data + multer (whose `fileSize` limit is independent of `express.json`), or (b) skip the global parser on that route via conditional middleware. Neither has been needed yet.
+
+**Base64-in-JSON inflation factor: 4/3.** The override editor's image upload (`OverrideEditorPage.uploadSlotAsset`) reads the file with `FileReader.readAsDataURL` and POSTs `{ dataBase64, filename, slotKind }` JSON. A raw N MB image becomes ~1.33×N MB on the wire, plus a small JSON-wrapper overhead. So **the client's raw-MB cap must lead the server's JSON-MB cap by that factor** or 413 will fall through to a generic error: today, **server 25mb JSON ⇒ client `MAX_UPLOAD_RAW_BYTES = 18 * 1024 * 1024`** (~18.7mb wire-equivalent, rounded down to 18 for wrapper margin), enforced by a pre-flight `file.size` check + a popup, with a 413 catch as defense in depth. If you move one, move both.
+
 ### Composite text token vocabulary lives in THREE places (Phase 67 — `{customer.phoneFormatted}`)
 
 The token vocabulary used in composite text slots (`{customer.firstName}`, `{year}`, `{customer.phoneFormatted}`, etc.) is **duplicated across three files that must stay in sync** — add a new token in all three or the editor's preview will silently disagree with what production renders:

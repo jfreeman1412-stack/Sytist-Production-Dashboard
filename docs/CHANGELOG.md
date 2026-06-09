@@ -518,6 +518,21 @@ Format: phase number → short title → what shipped → key files touched.
 
 ---
 
+## Phase 71 — Override editor image upload: 25 MB JSON cap + 18 MB client pre-flight popup (and removed two dead per-route parsers)
+
+- **Bug:** override editor image replacement returned `413 Payload Too Large` on a 9 MB raw JPEG. Base64-in-JSON inflates binary by ~4/3, so 9 MB raw becomes ~12 MB JSON body — exceeded the global `express.json({ limit: '10mb' })` at `server/index.js:78`.
+- **Latent footgun discovered during audit.** `routes/sytist.js:3571` had a per-route `orderAssetUploadJsonParser = express.json({ limit: '15mb' })` and `:4178` had a sibling `graphicUploadJsonParser` at the composite/graphics route — **both were dead code** from the moment they were committed (Phase 50 and Phase 9e-hotfix respectively). Both authors believed a per-route parser would "scope" a higher limit to one endpoint; in fact `app.use(express.json(...))` is global middleware that runs *before* any per-route parser sees the body. The next person who tried to "fix" the 413 by raising either per-route limit would have wasted hours.
+- **Fix:**
+  - **Server:** `express.json` + `express.urlencoded` in `server/index.js` raised from `'10mb'` to `'25mb'`. With base64 inflation that's a ~18.7 MB raw image ceiling — comfortable headroom for camera JPEGs.
+  - **Cleanup:** removed `orderAssetUploadJsonParser` (`:3571`) and `graphicUploadJsonParser` (`:4178`) plus their misleading rationale comments. Global is now the only `express.json` cap in the codebase.
+  - **Client pre-flight popup:** `uploadSlotAsset` in `OverrideEditorPage.js` checks `file.size` *before* the FileReader read. If > **18 MB** (operator-facing cap; rounded down from 18.7 with margin for the JSON wrapper), shows a native `window.alert`: *"Image too large — max 18 MB. This file is X.X MB. Please resize and try again."* No upload attempt — instant feedback.
+  - **Defense in depth:** the existing `try/catch` also detects `err.status === 413` (the `api.js` wrapper attaches `.status` to thrown errors) and shows the same popup. If the client raw cap and server JSON cap ever drift, the operator still gets the actionable message rather than a generic "Request failed (413)" banner.
+- **CLAUDE.md landmine added** documenting the three interconnected gotchas: (a) global `express.json` runs first / per-route limits don't override it; (b) base64 inflation factor 4/3; (c) client raw-MB cap must lead the server JSON-MB cap by that factor or 413 falls through to a generic error.
+- **Verification:** the 9 MB file that triggered the report would now succeed (12 MB JSON < 25 MB cap; 9 MB raw < 18 MB cap). Live two-sided field check post-commit: (a) upload a < 18 MB image, succeeds without 413; (b) try a > 18 MB image, see the popup with the actual size and the cap, no upload attempted.
+- Files: `server/index.js`, `server/routes/sytist.js`, `client/src/pages/settings/OverrideEditorPage.js`, `CLAUDE.md`
+
+---
+
 ## Reversed / removed
 
 - **Phase 31**: auto-push packaging during adopt — reversed in Phase 33 after it conflicted with the upstream "Sportsline UI" tool's payload
