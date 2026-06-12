@@ -533,6 +533,19 @@ Format: phase number → short title → what shipped → key files touched.
 
 ---
 
+## Phase 72 — Photo URLs encoded at construction (S3 `+` in filename → 403 fix)
+
+- **Bug:** order 114148 Team 2 failed processing with `403 Forbidden` on its two Ireland photos. The Sytist team name "6th+ Co Ed Ireland" went into the photo filenames as `original_..._6th+_Co_Ed_Ireland.jpg`. `sytistDbService.buildPhotoUrls` built the S3 URL by raw string concat — the bare `+` in the path was interpreted by S3's signature validation as a space, returning 403. The `[PhotoThumb] Source fetch failed` error in the log was the same root cause hitting the photo-thumb proxy transitively.
+- **Scope of the bug class:** 1,114 of 2.86M lifetime `ms_photos` rows have `+` in `pic_full`. Sytist's upload sanitizer already strips spaces, `&`, `#`, `?`, apostrophes (0 rows for each), but `+` slips through. Latent for years — only triggered when a team name or customer name with `+` hits processing.
+- **Fix:** `encodeURIComponent` on the filename segment in `buildPhotoUrls` for all three URL fields (`fullUrl`, `largeUrl`, `thumbUrl`). Single-spot change at the canonical URL construction point. Every consumer (`processingService._downloadFile`, photo-thumb proxy, green-screen, imposition, slip, every route-handler `fetch(...fullUrl)`) reads URLs from this output and is fixed transitively — **no consumer touches needed.**
+- **Why `encodeURIComponent` over alternatives:** `encodeURI` would NOT fix the bug (`+` is RFC 3986 sub-delim, allowed unescaped in path segments, encodeURI leaves it). `replace(/\+/g, '%2B')` is too narrow — covers `+` but not future Sytist sanitizer changes. `encodeURIComponent` is safe because (1) `pic_full` is always a flat filename — zero rows have internal `/` to preserve, (2) zero rows are pre-encoded — no double-encoding risk, (3) it covers any future URL-special char too.
+- **CLAUDE.md landmine added:** photo URLs are encoded ONCE at construction; no consumer should re-encode or build photo URLs from raw `pic_full` directly.
+- **Verification:** offline math — Ireland photos correctly contain `%2B`, Germany/United_States files unchanged. Live read-only HEAD fetches on all four order 114148 cart photos (including both Ireland files) + package constituents + known-good non-`+` controls: **200 on all**. The two Ireland files that 403'd pre-fix now return 200.
+- **Multi-team gap (Phase 61 "Known gap") confirmed live, not theoretical:** order 114148 Team 1 (3rd Girls United States) succeeded BEFORE Team 2 (6th+ Co Ed Ireland) failed, leaving Team 1's `.txt` + slip + imposed prints on disk while the order as a whole was incomplete. Operator deleted them manually. The strict "no team prints unless every team succeeds" two-pass restructure remains deferred but is now field-confirmed.
+- Files: `server/services/sytistDbService.js`, `CLAUDE.md`
+
+---
+
 ## Reversed / removed
 
 - **Phase 31**: auto-push packaging during adopt — reversed in Phase 33 after it conflicted with the upstream "Sportsline UI" tool's payload

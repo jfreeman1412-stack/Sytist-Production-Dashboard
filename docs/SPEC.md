@@ -2380,3 +2380,51 @@ Files: `client/src/utils/resolveSheetMeta.js` (new), `client/src/pages/settings/
 **Verification.** The 9 MB JPEG that triggered the report would now succeed (~12 MB JSON < 25 MB cap; 9 MB raw < 18 MB cap). Live two-sided field check post-commit: (a) **positive** — upload a < 18 MB image, succeeds without 413, override slot updates; (b) **negative** — try a > 18 MB image, see the popup with the file's actual size and the cap, no upload attempted, slot unchanged.
 
 Files: `server/index.js`, `server/routes/sytist.js`, `client/src/pages/settings/OverrideEditorPage.js`, `CLAUDE.md`.
+
+## 72. Photo URLs encoded at construction (S3 `+` in filename → 403 fix)
+
+**The bug.** Order 114148 Team 2 failed processing with `403 Forbidden` on its two Ireland photos. Trace: the Sytist team name "6th+ Co Ed Ireland" went into the photo filenames as `original_..._6th+_Co_Ed_Ireland.jpg`. `sytistDbService.buildPhotoUrls` (lines 726–728, pre-fix) built the S3 URL by raw string concat:
+```js
+fullUrl: `${baseUrl}/${photoRow.pic_full}`,
+```
+The bare `+` in the path was interpreted by S3's signature validation as a space (the `application/x-www-form-urlencoded` convention), the signature failed to validate, S3 returned 403. The photo-thumb proxy at `routes/sytist.js:176` failed transitively: it fetches whatever URL the dashboard built, and Express's query-decoding step preserves the raw `+`.
+
+**Scope of the bug class.** Lifetime audit across 2,863,896 `ms_photos` rows:
+
+| Special char in `pic_full` | Count |
+|---|---|
+| `+` | **1,114** |
+| space | 0 (sanitized → `_`) |
+| `&`, `#`, `?`, apostrophe | 0 (sanitized away) |
+| pre-encoded (`%XX`) | 0 |
+| internal `/` | 0 |
+
+Sytist's upload sanitizer covers most URL-special chars but lets `+` through. Latent for years — only triggered when a team name (or customer name) with `+` hits processing.
+
+**Fix — `encodeURIComponent` on the filename segment in `buildPhotoUrls`.** All three URL fields (`fullUrl`, `largeUrl`, `thumbUrl`) wrapped in `encodeURIComponent(...)`. Single-spot change at the **canonical URL construction point** — every dashboard consumer reads URLs from the canonical `buildPhotoUrls` output (`processingService._downloadFile`, the photo-thumb proxy, green-screen, imposition, slip, and a dozen route-handler `fetch(...fullUrl)` sites), so no consumer change is needed; the fix propagates transitively. `processingService.js` and `darkroomService.js` are not touched (Phase 63 holdout safe).
+
+**Why `encodeURIComponent` over alternatives.**
+- **`encodeURI`** would NOT fix the bug. `+` is an RFC 3986 sub-delim, allowed unescaped in path segments; `encodeURI` leaves it alone (it's intended to preserve URL structure characters). Disqualified.
+- **`new URL()` parse + manual path encode** is mechanically equivalent to the proposal with more ceremony; `new URL()` doesn't auto-encode unsafe chars in an already-built string, so we'd still call `encodeURIComponent` on the filename.
+- **`replace(/\+/g, '%2B')`** is too narrow. Covers `+` today but leaves the door open for any future Sytist sanitizer change — a single config tweak on their side could let spaces/`&`/etc. through and we'd be back here in a year debugging the same class.
+- **`encodeURIComponent`** is the right size because: (1) `pic_full` is always a flat filename — zero of 2.86M rows have an internal `/`, so encoding everything not in the unreserved set can't break path structure; (2) zero rows are pre-encoded, so no double-encoding risk; (3) it covers any URL-special char including future ones if Sytist's policy changes.
+
+**Why the thumbnail proxy needed no separate change.** The proxy at `routes/sytist.js:176` reads `req.query.src`, which the client constructs from the dashboard-built `thumbUrl`. When `thumbUrl` is raw `…+…`, the proxy fetches raw `…+…` → S3 403. When `thumbUrl` is `…%2B…` (post-fix), the proxy fetches `…%2B…`, S3 sees the encoding, signs correctly, returns 200. Single fix at the source, both download and thumbnail paths corrected.
+
+**CLAUDE.md landmine.** Photo URLs are encoded ONCE at construction in `buildPhotoUrls`. Every consumer reads the already-encoded URL — no consumer should re-encode or build photo URLs directly from `pic_full` (would double-encode, breaking working URLs). If Sytist eventually adds a new path-component field (per-event subfolders, year buckets, etc.) and we wire it into the URL builder, that new segment also needs `encodeURIComponent` at construction. `pic_full` is always a flat filename today; if it ever gains internal `/`, the fix shape changes (split / encode segments / rejoin so internal `/` is preserved).
+
+**Verification.** Offline math drove `buildPhotoUrls` against the failing order 114148 rows and known-good controls:
+- Cart 498066 + 498067 (Ireland, `+` in name): URL now contains `%2B`. ✓
+- Cart 498064 + 498065 (United States, no `+`): URL unchanged. ✓
+- Germany controls (no `+`): URL **byte-identical** to pre-fix (zero diff). ✓ No regression on the common case.
+
+Live read-only HEAD fetches against the new URLs:
+- All 4 cart photos for order 114148 (including both Ireland files that 403'd pre-fix): **200**. ✓
+- Package constituents (`498064-pkg-27`, `498067-pkg-12`, etc.): **200**. ✓
+- Known-good non-`+` controls: **200**. ✓
+
+Live two-sided field check post-commit: reprocess order 114148, confirm both teams succeed end-to-end (Team 1 + Team 2), no 403 in the log.
+
+**Multi-team gap (Phase 61 "Known gap") confirmed live.** Order 114148 surfaced the deferred concern from Phase 61's documentation: Team 1 (3rd Girls United States) processed and wrote its `.txt` + packing slip + imposed prints to disk BEFORE Team 2 (6th+ Co Ed Ireland) failed on the URL bug; the order-level `allOk = false` short-circuited subsequent gates and the SS auto-create, but Team 1's already-written artifacts remained on disk. The operator deleted them manually. The "no team prints unless every team succeeds" two-pass restructure remains deferred per the original Phase 61 design decision, but is **now field-confirmed, not theoretical** — on the visible follow-up list.
+
+Files: `server/services/sytistDbService.js`, `CLAUDE.md`.

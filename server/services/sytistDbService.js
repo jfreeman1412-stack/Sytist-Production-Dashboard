@@ -718,14 +718,26 @@ function buildPhotoUrls(photoRow) {
 
   const baseUrl = `https://${photoRow.pic_amazon_endpoint}/${photoRow.pic_bucket}/${photoRow.pic_bucket_folder}`;
 
+  // Phase 72: encode the filename. Sytist's upload sanitizer strips spaces,
+  // &, #, ?, apostrophes — they never appear in pic_full — but lets `+`
+  // through (1,114 of 2.86M lifetime rows). S3 signature validation
+  // interprets a bare `+` in the path as a space, returns 403, and any
+  // downstream consumer (download, photo-thumb proxy, green-screen,
+  // imposition, slip) fails. encodeURIComponent is safe here because (1)
+  // pic_full is always a flat filename — zero rows have an internal `/`
+  // to preserve, (2) zero rows are pre-encoded — no double-encoding risk,
+  // (3) it covers any future Sytist sanitizer change too (if `&`/`#`/etc.
+  // ever start slipping through, this stays correct). One change at the
+  // canonical URL construction point fixes every consumer transitively —
+  // see CLAUDE.md "Photo URLs are encoded once at construction".
   return {
     isS3: true,
     originalFilename: photoRow.pic_org || '',
     width: photoRow.pic_width || 0,
     height: photoRow.pic_height || 0,
-    fullUrl: photoRow.pic_full ? `${baseUrl}/${photoRow.pic_full}` : null,
-    largeUrl: photoRow.pic_large ? `${baseUrl}/${photoRow.pic_large}` : null,
-    thumbUrl: photoRow.pic_th ? `${baseUrl}/${photoRow.pic_th}` : null,
+    fullUrl: photoRow.pic_full ? `${baseUrl}/${encodeURIComponent(photoRow.pic_full)}` : null,
+    largeUrl: photoRow.pic_large ? `${baseUrl}/${encodeURIComponent(photoRow.pic_large)}` : null,
+    thumbUrl: photoRow.pic_th ? `${baseUrl}/${encodeURIComponent(photoRow.pic_th)}` : null,
   };
 }
 
