@@ -26,6 +26,9 @@ import PackagingPage from '../pages/settings/PackagingPage';
 import PackagesPage from '../pages/settings/PackagesPage';
 // Phase 15b: addon mappings (co_opt_id → SKU expansion)
 import AddonsPage from '../pages/settings/AddonsPage';
+// Phase 73: user management (admin-only) + per-user profile
+import UsersSettings from '../pages/settings/UsersSettings';
+import ProfilePage from '../pages/ProfilePage';
 // Phase 13f: dedicated ShipStation page (pending/shipped/failed)
 import ShipStationPage from '../pages/ShipStationPage';
 
@@ -38,7 +41,7 @@ import ShipStationPage from '../pages/ShipStationPage';
  * Phase 4.5: adds /settings sub-routes (admin-gated inside SettingsLayout).
  * Phase 4.7: production-mode banner across the top + Process History.
  */
-export default function AppLayout({ user, onLogout }) {
+export default function AppLayout({ user, onLogout, onUserUpdate }) {
   // Phase 4.7 — fetch the current path mode so we can show the
   // PRODUCTION banner. We refetch periodically (every 30s) so a mode
   // change made in another tab/session reflects here without a reload.
@@ -78,7 +81,7 @@ export default function AppLayout({ user, onLogout }) {
     >
       {pathMode === 'production' && <ProductionBanner />}
 
-      <Header user={user} onLogout={onLogout} pathMode={pathMode} />
+      <Header user={user} onLogout={onLogout} pathMode={pathMode} /* Phase 73: header username links to /profile */ />
 
       <main
         style={{
@@ -92,6 +95,13 @@ export default function AppLayout({ user, onLogout }) {
           <Route path="/" element={<HomePage />} />
           <Route path="/orders" element={<OrdersListPage />} />
           <Route path="/orders/:orderId" element={<OrderDetailPage />} />
+          {/* Phase 73: profile is top-level — every authenticated user can
+              reach it via the clickable header username. NOT under /settings/*
+              because that subtree is admin-gated by SettingsLayout. */}
+          <Route
+            path="/profile"
+            element={<ProfilePage user={user} onUserUpdate={onUserUpdate} />}
+          />
           {/* Phase 13f: dedicated ShipStation page */}
           <Route path="/shipstation" element={<ShipStationPage />} />
           <Route path="/shipstation/:tab" element={<ShipStationPage />} />
@@ -128,6 +138,11 @@ export default function AppLayout({ user, onLogout }) {
             <Route path="packages" element={<PackagesPage />} />
             {/* Phase 15b: addon mappings */}
             <Route path="addons" element={<AddonsPage />} />
+            {/* Phase 73: user management (admin-only inherited from SettingsLayout) */}
+            <Route
+              path="users"
+              element={<UsersSettings currentUser={user} />}
+            />
           </Route>
 
           {/* Unknown paths fall back to home. Could be a 404 page later. */}
@@ -190,10 +205,24 @@ function Header({ user, onLogout, pathMode }) {
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         {pathMode && <ModeChip mode={pathMode} />}
-        <div style={{ textAlign: 'right' }}>
+        {/* Phase 73: username/display block links to /profile so any
+            authenticated user can change their own password + display name
+            without needing admin Settings access. Block is wrapped in a
+            NavLink rather than a button — same visual, navigable. */}
+        <NavLink
+          to="/profile"
+          style={{
+            textAlign: 'right',
+            textDecoration: 'none',
+            color: 'inherit',
+            padding: '4px 8px',
+            borderRadius: 6,
+          }}
+          title="Edit your profile"
+        >
           <div style={{ fontSize: 13 }}>{user.displayName || user.username}</div>
           <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{user.role}</div>
-        </div>
+        </NavLink>
         <button
           className="btn btn-secondary"
           onClick={onLogout}

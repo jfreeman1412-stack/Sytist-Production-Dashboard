@@ -56,7 +56,7 @@ function App() {
     return <LoginPage onLogin={setUser} />;
   }
 
-  return <AppLayout user={user} onLogout={handleLogout} />;
+  return <AppLayout user={user} onLogout={handleLogout} onUserUpdate={setUser} />;
 }
 
 export default App;

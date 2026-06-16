@@ -133,6 +133,25 @@ function Sidebar() {
           History
         </div>
         <SidebarLink to="process-history" label="Process History" />
+
+        {/* Phase 73: user management — admin-only, gated by SettingsLayout's
+            top-level role check. Self-service profile changes live at
+            /profile (top-level route, not here). */}
+        <div
+          style={{
+            margin: '12px 12px 8px',
+            paddingTop: 8,
+            borderTop: '1px solid var(--border-color)',
+            fontSize: 10,
+            fontWeight: 600,
+            textTransform: 'uppercase',
+            letterSpacing: 0.5,
+            color: 'var(--text-muted)',
+          }}
+        >
+          Administration
+        </div>
+        <SidebarLink to="users" label="Users" />
       </nav>
     </aside>
   );

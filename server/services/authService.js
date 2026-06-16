@@ -111,6 +111,31 @@ class AuthService {
     const user = this.db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
     if (!user) throw new Error('User not found');
 
+    // Phase 73: last-admin invariant — at least one active admin must always
+    // exist. Otherwise the system bricks: admin-only endpoints (incl. user
+    // management) become unreachable, and recovery requires shell access to
+    // run scripts/add-user.js. This is the load-bearing server-side guard;
+    // UsersSettings mirrors it client-side for friendly button tooltips, but
+    // the server is authoritative. Fires when an UPDATE would convert this
+    // user from an active admin to either inactive OR a non-admin role.
+    const wouldRemoveActiveAdmin =
+      user.role === 'admin' &&
+      user.active === 1 &&
+      ((updates.active !== undefined && !updates.active) ||
+        (updates.role !== undefined && updates.role !== 'admin'));
+    if (wouldRemoveActiveAdmin) {
+      const otherAdmins = this.db
+        .prepare(
+          "SELECT COUNT(*) AS c FROM users WHERE role = 'admin' AND active = 1 AND id != ?"
+        )
+        .get(userId);
+      if (otherAdmins.c === 0) {
+        throw new Error(
+          'Cannot deactivate or demote the last active admin'
+        );
+      }
+    }
+
     const fields = [];
     const values = [];
 
