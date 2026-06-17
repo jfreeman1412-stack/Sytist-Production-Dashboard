@@ -2465,3 +2465,75 @@ Files: `server/services/sytistDbService.js`, `CLAUDE.md`.
 **Browser-side UI walkthrough is the operator's** to perform (the client React app builds + runs in their browser; this verification can't drive it live): create test_user via the UI, edit, deactivate, reactivate, log in as test_user, change own password via /profile, log out, log back in with the new password. End-to-end through the new UI.
 
 Files: `server/services/authService.js`, `server/.env`, `client/src/App.js`, `client/src/components/AppLayout.js`, `client/src/pages/settings/SettingsLayout.js`, `client/src/pages/settings/UsersSettings.js` (new), `client/src/pages/ProfilePage.js` (new), `CLAUDE.md`.
+
+## 74. Rotation for photo + graphic slot kinds (composite layout designer)
+
+**The gap, audit-confirmed.** The composite layout designer (`LayoutDesignerPage.js`) had a Rotation control in `QuickEditPanel`'s `FormRow`, but it was inside an `{isText && (…)}` block — only text slots had rotation, in the designer and on render. The other five slot kinds (`playerPhoto`, `playerBackground`, `teamPhoto`, `logo`, and `staticGraphic`/overlay) had no rotation surface at all. Phase 22 had added rotation for text slots (extending the SVG to the slot diagonal); the symmetric photo/graphic side was never built. The presenting bug — "team photo slot rotation doesn't work" — turned out to be that nothing was ever implemented, not a regression.
+
+**Scope decision: do all five at once.** Joey opted for the symmetric build over a teamPhoto-only spot-fix: each kind walks the same code shape (a single render branch in `compositeService` + the shared `LayoutCanvas` `<image>` element); the marginal cost of doing five vs one is low, and the alternative was returning here multiple times.
+
+**Render semantic chosen: stable bounding box, corners clip.** A rotated photo keeps its declared w × h slot rect; pixels that rotate outside the rect are dropped at the slot edge. This is **deliberately different from Phase 22's text path**, which extends the SVG to the slot diagonal (`Math.ceil(sqrt(w² + h²))`) so the rotated string is never clipped. The asymmetry is intentional and load-bearing:
+
+- A rotated text label spilling outside its rect is harmless — the text-slot rect was always notional, used only for layout pivot, and a 90°-rotated label "Smith #14" needs its full string width regardless of the slot box. The original layout never assumed the text rect was a hard frame.
+- A rotated photo spilling outside its rect would overlap neighboring slots and break print alignment. Memory Mate / template layouts pack photos against each other; a rotated team photo whose corners spill onto a player photo's edge is visually broken even at small rotation angles.
+
+Both paths share `slot.rotation` (number, degrees, clockwise per SVG convention) — no separate field. The render branch decides the semantic.
+
+**Server implementation.** New helper `compositeService._applyRotationToBox(buffer, w, h, angleDeg)`:
+
+```js
+async _applyRotationToBox(buffer, w, h, angleDeg) {
+  if (!angleDeg) return buffer;                     // fast path: byte-identical to pre-74
+  const rotated = await sharp(buffer)
+    .rotate(angleDeg, { background: { r:0, g:0, b:0, alpha:0 } })
+    .png()
+    .toBuffer();
+  const meta = await sharp(rotated).metadata();
+  const rW = meta.width  || w;
+  const rH = meta.height || h;
+  if (rW >= w && rH >= h) {
+    return await sharp(rotated)
+      .extract({ left: Math.round((rW-w)/2), top: Math.round((rH-h)/2),
+                 width: w, height: h })
+      .png().toBuffer();
+  }
+  // rW<w or rH<h: composite-onto-fresh (defensive — angle ≡ 0 mod 360 cases)
+  return await sharp({ create:{ width:w, height:h, channels:4,
+                                background:{r:0,g:0,b:0,alpha:0} } })
+    .composite([{ input:rotated,
+                  top:  Math.max(0, Math.round((h-rH)/2)),
+                  left: Math.max(0, Math.round((w-rW)/2)) }])
+    .png().toBuffer();
+}
+```
+
+Sharp's `rotate` returns a larger bounding box (rW × rH where rW ≥ w, rH ≥ h for any non-90°-multiple rotation). `extract` cuts the central w × h region — content that rotated outside the slot box is dropped at the slot edges. That's the "stable bounding box, corners clip" semantic in one primitive. Wired in between the existing `fitted` step and `_clipToCanvas` in **all five photo branches** (search `_applyRotationToBox` for the call sites — playerPhoto, playerBackground, teamPhoto, logo, staticGraphic). Text path `_textSvg` is untouched, preserving Phase 22.
+
+**Bug the harness caught.** The first implementation tried to composite the rotated (larger) buffer onto a fresh w × h transparent canvas with negative `top`/`left` offsets — the natural way to express "center it and clip." `sharp.composite` REFUSES inputs larger than the destination canvas and throws `"Image to composite must have same dimensions or smaller"`. The throw bubbled out of the helper, was swallowed by an upstream `try/catch` (the same one that catches per-slot render errors so one bad slot doesn't kill the sheet), and `_clipToCanvas` was never reached — every rotated render produced an entirely transparent slot. The canvas background painted through and the harness saw `(0,0,0)` everywhere instead of the fill color. Without the harness this would have shipped as "rotation makes the slot disappear." The `extract` primitive is the right one — it produces exactly w × h in one operation, with no composite-size constraint, and the central-region semantic is a precise match for the design.
+
+**Client designer canvas (`LayoutCanvas.js`).** The same semantic is mirrored in SVG so the designer preview matches the server render. For each non-text slot:
+
+- Compute `rotation = Number(slot.rotation) || 0`, pivot at slot center (`pivotX = x + w/2`, `pivotY = y + h/2`).
+- `imageTransform = rotation !== 0 ? \`rotate(${rotation} ${pivotX} ${pivotY})\` : undefined`.
+- A per-slot `<defs><clipPath id="slot-clip-{idx}" clipPathUnits="userSpaceOnUse"><rect x={x} y={y} width={w} height={h}/></clipPath></defs>` defines the un-rotated slot rect as the clip region.
+- All three `<image>` elements (graphicUrl branch, liveLogoForThisSlot branch, livePhotoForThisSlot branch) get `transform={imageTransform}` AND `clipPath={clipPathRef}`.
+
+Result: the rotated `<image>` is clipped to the original slot rect — same semantic as the server's extract-the-central-w×h. `idx` is threaded through from the parent loop (`SlotShape` call site, line ~504) so each slot gets a unique clipPath ID. The text path (`SlotText`) is unchanged — it already handles rotation per Phase 22.
+
+**Placeholder branch also rotates (bug caught during live verification).** The designer has a fourth render branch for photo / graphic slots: when there's no live photo URL, no uploaded graphic, and no backdrop, the slot renders as a **colored placeholder rect + label** (e.g. for a fresh `playerPhoto` slot in a brand-new layout). The first cut only wired `transform` / `clipPath` to the three `<image>` elements (graphicUrl / liveLogoForThisSlot / livePhotoForThisSlot), so setting rotation on a fresh slot looked like a no-op until the operator opened it in the override editor with real data — visibly the Rotation field's button did nothing in the layout designer's main use case. Fix: apply the same `transform` + `clipPath` to the placeholder `<rect>` and its `<text>` label so the operator sees an accurate rotated preview without needing live data. Hit testing still works against the un-rotated `<g>` bounds (no separate axis-aligned outline rect is drawn in this branch).
+
+**Designer UI (`LayoutDesignerPage.js`).** The Rotation `FormRow` is hoisted out of `{isText && (…)}` in `QuickEditPanel`, placed between the geometry block (X/Y/W/H grid) and the `{isImage && (Fit mode)}` block. A multi-line comment at the new location records the universal-slot-property + text-vs-photo render-semantic distinction so the next reader doesn't move it back. `numericFields` already included `'rotation'` (line ~1486), so no field-schema change was needed.
+
+**Backward compatibility — fast path is byte-identical.** Existing composite-layouts have no `rotation` field on photo/graphic slots; `Number(undefined) || 0 === 0` → helper short-circuits → buffer flows to `_clipToCanvas` exactly as it did pre-74. The harness `rotation: 0` cases assert this. Don't add normalization or re-encode in the helper that would touch the no-rotation buffer.
+
+**Verification.** `server/scripts/verify-rotation.js` 20/20 — for each of the 5 photo kinds, three cases:
+
+1. **rotation 0°** — slot center is the kind's fill color (fast-path proof: the helper is a no-op and the existing render is unchanged).
+2. **rotation 30°** — slot center is still the fill color (slot stays in frame) AND a pixel 2 px inside the un-rotated slot's top-left corner is **not** the fill color (the rotated content has cleared that corner = stable-box-clip proof).
+3. **rotation 90°** — render succeeds, center is fill color (proves the helper runs without error at a multiple of 90 where sharp's rotation is a fast hardware path).
+
+Per-kind fill colors (red/green/blue/yellow/magenta) uniquely identify which render branch produced the center pixel. JPEG compression tolerance (±10 per channel) on color comparisons — the sheet buffer is JPEG (3 channels, lossy), so pure 255 reads back as ~254. Pre-existing fixtures unaffected — no layout in `composite-layouts.json` carries `rotation` on a photo/graphic slot today, so the first time the helper does anything is when an operator adds rotation via the designer.
+
+**Out of scope (intentional, recorded so a future audit knows why).** OverrideEditorPage rotation UI is a separate surface (the override editor is for editing text content/color, not for changing layout-author geometry). Sub-pixel anti-alias smoothing of rotated edges (sharp's default bilinear is acceptable at the photo sizes involved — 80–800 px slot widths at 300 DPI). The text path's "extends, no clip" semantic stays exactly as Phase 22 shipped it — Phase 74 does not touch `_textSvg`. `processingService.js` and `darkroomService.js` are not modified — rotation is a `compositeService` render concern, no manifest changes.
+
+Files: `server/services/compositeService.js`, `client/src/components/LayoutCanvas.js`, `client/src/pages/settings/LayoutDesignerPage.js`, `server/scripts/verify-rotation.js` (new), `CLAUDE.md`.

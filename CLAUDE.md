@@ -330,6 +330,20 @@ Three rules to keep in mind around the auth stack (`server/services/authService.
 
 `SESSION_SECRET` in `.env` was dead config (no source reference) and was deleted in Phase 73. The actual session machinery uses `uuid` (npm package) for opaque session IDs and `bcrypt` for password hashes — neither needs a shared secret. Don't reintroduce `SESSION_SECRET` thinking it's load-bearing.
 
+### Photo rotation clips, text rotation extends — same `slot.rotation` field, two render paths (Phase 22 + 74)
+
+The composite layout's `slot.rotation` (degrees, clockwise per SVG convention) is shared by every slot kind, but the **render semantic differs by design** and the two paths must not be unified:
+
+- **Text slots (Phase 22) — rotation EXTENDS the bounding box.** `compositeService._textSvg` enlarges the SVG to the slot's diagonal (`Math.ceil(sqrt(w² + h²))`) and rotates the `<text>` around the slot center. The extended SVG is then `_clipToCanvas`'d at the sheet edge but NOT at the slot edge — the rotated text can spill past the original w × h box (intended: a 90°-rotated label should fit its full string).
+- **Photo / graphic slots (Phase 74) — rotation keeps the box FIXED and CLIPS corners.** `compositeService._applyRotationToBox(buffer, w, h, angleDeg)` rotates the fitted buffer (sharp returns a larger bounding box), then `extract`s the central w × h region — content that pokes outside the original slot box is dropped at the slot edges. The 5 kinds it covers: `playerPhoto`, `playerBackground`, `teamPhoto`, `logo`, `staticGraphic`/overlay. The fast path `if (!angleDeg) return buffer;` is critical for byte-identical output on existing layouts (no `rotation` field or explicit `0`).
+
+Why different: a rotated text label spilling outside the slot is normal layout behavior (and harmless — the slot rect was always notional for text); a rotated photo spilling outside the slot would overlap neighboring slots and break print alignment. The designer canvas matches each path: text-slot SVGs use `transform` on the rotated `<text>` directly (no clip), while `LayoutCanvas.js`' `<image>` elements get both `transform="rotate(angle pivotX pivotY)"` and `clipPath="url(#slot-clip-N)"` (per-slot `clipPathUnits="userSpaceOnUse"` rect at the slot's box). The Rotation FormRow in `LayoutDesignerPage.js`'s `QuickEditPanel` is hoisted out of `{isText && ...}` so it shows for every kind.
+
+**Two landmines on the photo path specifically:**
+
+1. **`sharp.composite` REFUSES inputs larger than the destination canvas** (`"Image to composite must have same dimensions or smaller"`). The Phase 74 harness's first cut tried compositing the rotated (larger) buffer onto a fresh w × h canvas with negative top/left — every rotated render returned an entirely transparent slot (the throw was being swallowed upstream and `_clipToCanvas` was never reached, so the canvas background painted through). The fix that landed uses `sharp(rotated).extract({ left, top, width, height })` to crop centrally — that's the correct primitive for "stable bounding box, corners clip." Don't reintroduce the negative-composite path.
+2. **The fast path is byte-identical, not approximately.** Existing layouts have no `rotation` field; `Number(undefined) || 0 === 0` → helper short-circuits → buffer flows to `_clipToCanvas` exactly as it did pre-Phase-74. Don't add any normalization or re-encode in the helper that would touch the no-rotation buffer.
+
 ### Composite text token vocabulary lives in THREE places (Phase 67 — `{customer.phoneFormatted}`)
 
 The token vocabulary used in composite text slots (`{customer.firstName}`, `{year}`, `{customer.phoneFormatted}`, etc.) is **duplicated across three files that must stay in sync** — add a new token in all three or the editor's preview will silently disagree with what production renders:

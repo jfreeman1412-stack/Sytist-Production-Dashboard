@@ -502,6 +502,7 @@ export default function LayoutCanvas({
           return (
             <SlotShape
               key={idx}
+              idx={idx}
               slot={slot}
               sampleTokens={sampleTokens}
               isSelected={selectedIndex === idx}
@@ -580,6 +581,7 @@ export default function LayoutCanvas({
 
 function SlotShape({
   slot,
+  idx,
   sampleTokens,
   isSelected,
   interactive,
@@ -600,6 +602,25 @@ function SlotShape({
   const h = slot.h || 0;
 
   if (w <= 0 || h <= 0) return null;
+
+  // Phase 74: rotation for photo / graphic slots. Mirrors the server's
+  // `_applyRotationToBox` semantics — content rotates around the slot center;
+  // the rotated `<image>` is clipped to the un-rotated slot box via clipPath;
+  // the outline `<rect>` and the resize handles stay axis-aligned on the box
+  // so hit testing keeps working (same convention as Phase 22 text rotation,
+  // but with clipping instead of the SVG-extension that text uses — see the
+  // CLAUDE.md "Photo rotation clips, text rotation extends" landmine).
+  //
+  // Fast path: when rotation === 0, the clipPath and transform are both
+  // undefined and the existing render is byte-identical to pre-Phase-74.
+  const rotation = Number(slot.rotation) || 0;
+  const pivotX = x + w / 2;
+  const pivotY = y + h / 2;
+  const imageTransform =
+    rotation !== 0 ? `rotate(${rotation} ${pivotX} ${pivotY})` : undefined;
+  const clipId =
+    rotation !== 0 ? `slot-clip-${idx != null ? idx : `${x}-${y}-${w}-${h}`}` : null;
+  const clipPathRef = clipId ? `url(#${clipId})` : undefined;
 
   // Phase 9e: locked slots have no mouse interaction. We tolerate null
   // onMouseDown/onSelect by guarding all calls — keeps the parent from
@@ -746,6 +767,18 @@ function SlotShape({
       onMouseDown={handleMouseDown}
       onClick={handleClick}
     >
+      {/* Phase 74: rotation clip-path. Declared once per slot when rotation !== 0,
+          shared across whichever <image> branch below renders. The <rect> uses
+          the un-rotated slot bounds so the rotated image is clipped to the
+          original box edges (stable-box-clip semantics). Zero overhead when
+          rotation === 0 (clipId is null, this block is skipped). */}
+      {clipId && (
+        <defs>
+          <clipPath id={clipId} clipPathUnits="userSpaceOnUse">
+            <rect x={x} y={y} width={w} height={h} />
+          </clipPath>
+        </defs>
+      )}
       {graphicUrl ? (
         // Uploaded graphic — render the real image, sized to the slot.
         // preserveAspectRatio respects fit mode: 'contain' lets the
@@ -765,6 +798,8 @@ function SlotShape({
                 ? 'xMidYMid slice'
                 : 'xMidYMid meet'
             }
+            transform={imageTransform}
+            clipPath={clipPathRef}
             opacity={1}
           />
           <rect
@@ -785,6 +820,8 @@ function SlotShape({
                 ? 'xMidYMid slice'
                 : 'xMidYMid meet'
             }
+            transform={imageTransform}
+            clipPath={clipPathRef}
             opacity={1}
           />
           <rect
@@ -811,6 +848,8 @@ function SlotShape({
                 ? 'xMidYMid slice'
                 : 'xMidYMid meet'
             }
+            transform={imageTransform}
+            clipPath={clipPathRef}
             opacity={1}
           />
           <rect
@@ -834,6 +873,20 @@ function SlotShape({
           strokeDasharray={isSelected ? '0' : '0.04 0.03'}
         />
       ) : (
+        // Designer placeholder branch — no live photo / uploaded graphic /
+        // backdrop, so we draw a colored rect with the slot-kind label so
+        // the operator can see/select the slot.
+        //
+        // Phase 74: the placeholder ALSO needs rotation feedback, otherwise
+        // setting rotation on a fresh slot looks like a no-op until the
+        // operator opens it in the override editor with real data. Apply
+        // the same transform + clipPath to the placeholder rect AND the
+        // label (rotating both together is the right preview — the label
+        // rotates with its "container" so the operator sees the slot's
+        // future orientation). The outline-stroke on this rect is part of
+        // the rotating placeholder by design here (no separate axis-aligned
+        // outline rect is drawn in this branch — selection/hit testing
+        // still works through the <g> wrapper at the un-rotated bounds).
         <>
           <rect
             x={x} y={y} width={w} height={h}
@@ -841,6 +894,8 @@ function SlotShape({
             stroke={strokeColor}
             strokeWidth={strokeWidth}
             opacity={fillOpacity}
+            transform={imageTransform}
+            clipPath={clipPathRef}
           />
           {!hasBackdrop && (
             <text
@@ -849,6 +904,8 @@ function SlotShape({
               fontSize={labelFontSize}
               fill="white" fontFamily="Arial, sans-serif" fontWeight="500"
               pointerEvents="none"
+              transform={imageTransform}
+              clipPath={clipPathRef}
             >
               {isStaticGraphic ? `${style.label} (no upload)` : style.label}
             </text>

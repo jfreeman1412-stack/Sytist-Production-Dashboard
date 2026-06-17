@@ -452,8 +452,12 @@ class CompositeService {
           const fitted = await sharp(playerPhoto)
             .resize(w, h, { fit: slot.fit || 'cover' })
             .toBuffer();
+          // Phase 74: photo rotation (no-op when slot.rotation is 0 or missing).
+          const rotatedToBox = await this._applyRotationToBox(
+            fitted, w, h, Number(slot.rotation) || 0
+          );
           const clipped = await this._clipToCanvas(
-            fitted, x, y, w, h, sheetWidthPx, sheetHeightPx
+            rotatedToBox, x, y, w, h, sheetWidthPx, sheetHeightPx
           );
           if (clipped) composites.push(clipped);
         } else if (slot.kind === 'playerBackground') {
@@ -473,8 +477,12 @@ class CompositeService {
           const fitted = await sharp(playerBackground)
             .resize(w, h, { fit: slot.fit || 'cover' })
             .toBuffer();
+          // Phase 74: photo rotation (no-op when slot.rotation is 0 or missing).
+          const rotatedToBox = await this._applyRotationToBox(
+            fitted, w, h, Number(slot.rotation) || 0
+          );
           const clipped = await this._clipToCanvas(
-            fitted, x, y, w, h, sheetWidthPx, sheetHeightPx
+            rotatedToBox, x, y, w, h, sheetWidthPx, sheetHeightPx
           );
           if (clipped) composites.push(clipped);
         } else if (slot.kind === 'teamPhoto') {
@@ -491,8 +499,12 @@ class CompositeService {
           const fitted = await sharp(teamPhoto)
             .resize(w, h, { fit: slot.fit || 'cover' })
             .toBuffer();
+          // Phase 74: photo rotation (no-op when slot.rotation is 0 or missing).
+          const rotatedToBox = await this._applyRotationToBox(
+            fitted, w, h, Number(slot.rotation) || 0
+          );
           const clipped = await this._clipToCanvas(
-            fitted, x, y, w, h, sheetWidthPx, sheetHeightPx
+            rotatedToBox, x, y, w, h, sheetWidthPx, sheetHeightPx
           );
           if (clipped) composites.push(clipped);
         } else if (slot.kind === 'logo') {
@@ -513,8 +525,12 @@ class CompositeService {
             })
             .png()
             .toBuffer();
+          // Phase 74: rotation (no-op when slot.rotation is 0 or missing).
+          const rotatedToBox = await this._applyRotationToBox(
+            fitted, w, h, Number(slot.rotation) || 0
+          );
           const clipped = await this._clipToCanvas(
-            fitted, x, y, w, h, sheetWidthPx, sheetHeightPx
+            rotatedToBox, x, y, w, h, sheetWidthPx, sheetHeightPx
           );
           if (clipped) composites.push(clipped);
         } else if (slot.kind === 'text') {
@@ -571,8 +587,12 @@ class CompositeService {
             })
             .png()
             .toBuffer();
+          // Phase 74: rotation (no-op when slot.rotation is 0 or missing).
+          const rotatedToBox = await this._applyRotationToBox(
+            fitted, w, h, Number(slot.rotation) || 0
+          );
           const clipped = await this._clipToCanvas(
-            fitted, x, y, w, h, sheetWidthPx, sheetHeightPx
+            rotatedToBox, x, y, w, h, sheetWidthPx, sheetHeightPx
           );
           if (clipped) composites.push(clipped);
         } else {
@@ -627,6 +647,87 @@ class CompositeService {
   }
 
   // ─── Helpers ──────────────────────────────────────────
+
+  /**
+   * Phase 74: rotate a fitted photo/graphic buffer around its center and clip
+   * the result back to the original slot box. "Stable bounding box, corners
+   * clip" semantics: rotation around the slot's geometric center, content
+   * extending past the original w × h gets clipped, corners of the un-rotated
+   * box that the rotated content no longer covers become transparent.
+   *
+   * This is DELIBERATELY different from the text-slot rotation path in
+   * `_textSvg` (Phase 22). Text rotation enlarges the SVG to fit the rotated
+   * glyphs without clipping (the bounding box grows to the slot diagonal);
+   * photo rotation here keeps the slot's footprint fixed and clips at the
+   * edges (the bounding box stays w × h). The two paths share the `slot.rotation`
+   * field but apply different render semantics by design — see CLAUDE.md
+   * "Photo rotation clips, text rotation extends" for the rationale.
+   *
+   * @param {Buffer} buffer    The slot's already-fitted photo bytes
+   *                           (exactly w × h, pre-rotation).
+   * @param {number} w         Slot width in pixels.
+   * @param {number} h         Slot height in pixels.
+   * @param {number} angleDeg  Rotation in degrees (positive = clockwise,
+   *                           matching SVG `rotate()` convention and what the
+   *                           designer canvas previews).
+   * @returns {Promise<Buffer>} A w × h PNG buffer with the rotated content
+   *                            centered on the slot center and clipped at
+   *                            the box edges. Transparent outside the rotated
+   *                            content's bounding box.
+   */
+  async _applyRotationToBox(buffer, w, h, angleDeg) {
+    if (!angleDeg) {
+      // Fast path: zero rotation returns the input unchanged. Critical for
+      // byte-identical output on existing layouts (no `rotation` field, or
+      // explicit `rotation: 0`) — the entire Phase 74 codepath is skipped.
+      return buffer;
+    }
+    // Rotate the fitted buffer. Sharp returns a LARGER buffer (the bounding
+    // box of the rotated input) with transparent fill outside the rotated
+    // content. We extract the central w × h region — that crop IS the stable-
+    // bounding-box-clip semantic: rotated content that pokes outside the
+    // original slot box is dropped at the slot edges.
+    const rotated = await sharp(buffer)
+      .rotate(angleDeg, { background: { r: 0, g: 0, b: 0, alpha: 0 } })
+      .png()
+      .toBuffer();
+    const meta = await sharp(rotated).metadata();
+    const rW = meta.width || w;
+    const rH = meta.height || h;
+    // If sharp returned a buffer that's somehow smaller than the slot (would
+    // be unusual but possible for angle ≡ 0 mod 360 + size-preserving paths),
+    // composite-onto-fresh-canvas instead — `extract` would fail on
+    // negative offsets. Both code paths produce exactly w × h, suitable for
+    // the downstream `_clipToCanvas` step which expects the slot's dimensions.
+    if (rW >= w && rH >= h) {
+      return await sharp(rotated)
+        .extract({
+          left: Math.round((rW - w) / 2),
+          top: Math.round((rH - h) / 2),
+          width: w,
+          height: h,
+        })
+        .png()
+        .toBuffer();
+    }
+    return await sharp({
+      create: {
+        width: w,
+        height: h,
+        channels: 4,
+        background: { r: 0, g: 0, b: 0, alpha: 0 },
+      },
+    })
+      .composite([
+        {
+          input: rotated,
+          top: Math.max(0, Math.round((h - rH) / 2)),
+          left: Math.max(0, Math.round((w - rW) / 2)),
+        },
+      ])
+      .png()
+      .toBuffer();
+  }
 
   /**
    * Phase 25: crop a fitted slot buffer to the canvas bounds.

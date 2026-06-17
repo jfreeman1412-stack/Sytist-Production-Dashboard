@@ -1549,6 +1549,33 @@ function SlotEditorBody({
         </FormRow>
       </div>
 
+      {/* Phase 74: Rotation is a UNIVERSAL slot property — applies to text
+          (existing Phase 22 behavior) and to all photo / graphic kinds
+          (new Phase 74 behavior). Previously this FormRow lived inside the
+          {isText && ...} block; hoisted out here so photo / graphic slots
+          get it too without nine-line duplication.
+
+          Note the two render semantics intentionally differ:
+            - text   → rotation EXTENDS the bounding box (no clip) so glyphs
+                       can extend past the original w × h without being cropped
+                       (`compositeService._textSvg` enlarges the SVG to the
+                       slot diagonal)
+            - photo  → rotation CLIPS to the bounding box (corners cut off)
+                       (`compositeService._applyRotationToBox` keeps the
+                       footprint fixed at w × h)
+          See CLAUDE.md "Photo rotation clips, text rotation extends" for
+          the rationale. */}
+      <FormRow
+        label="Rotation (°)"
+        hint="0 = horizontal · 90 = sideways up · 180 = upside down · -90 / 270 = sideways down"
+      >
+        <NumberInput
+          value={slot.rotation ?? 0}
+          onChange={(v) => update('rotation', v)}
+          step="1"
+        />
+      </FormRow>
+
       {isImage && (
         <FormRow
           label="Fit mode"
@@ -1675,16 +1702,8 @@ function SlotEditorBody({
                 Shrink to fit
               </label>
             </FormRow>
-            <FormRow
-              label="Rotation (°)"
-              hint="0 = horizontal · 90 = sideways up · 180 = upside down · -90 / 270 = sideways down"
-            >
-              <NumberInput
-                value={slot.rotation ?? 0}
-                onChange={(v) => update('rotation', v)}
-                step="1"
-              />
-            </FormRow>
+            {/* Phase 74: Rotation FormRow hoisted out of this block to be
+                universal — see the FormRow above the Fit mode block. */}
           </div>
         </>
       )}
