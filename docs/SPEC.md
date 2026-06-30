@@ -2765,3 +2765,106 @@ Parity coverage:
 Operator-facing live verification owed (per [[live-verify-gate-changes]]): (a) toggle ON → only ⚡-badged rows visible, "N orders match" reflects the eligible-only total. (b) toggle OFF → returns to the un-filtered view. (c) stacks correctly with other filters (e.g. Workflow + Instant-Ship Only). (d) Page reload → toggle off (no URL persistence).
 
 Files: `server/services/sytistDbService.js`, `server/routes/sytist.js`, `client/src/pages/OrdersListPage.js`, `server/scripts/verify-instant-pack-eligible.js`, `CLAUDE.md`.
+
+## 78. Customer-notes "💬 Note" badge on the orders list
+
+**Operator pain.** During morning batch processing, an order carrying a customer-entered note ("spell name with two N's", "ship before March 15 please", "please fix flyaway hair on left side of Coach Liz's head") needs the operator's eye before it gets fast-tracked through the batch. Today the orders list shows nothing — the operator has to click into each order detail to see whether a note exists. The order-detail page already renders the notes (`NotesBlocks` in `OrderDetailPage.js:1738` shows both customer + admin notes); Phase 78 surfaces the existence + first ~150 chars as a row-level badge so the operator catches them at a glance.
+
+**Two sources, logical OR.**
+
+| Source | Sytist column(s) | Customer or operator? | Scope |
+|---|---|---|---|
+| Order-level checkout note | `ms_orders.order_notes` | customer | the whole order |
+| Per-line-item customer note | `ms_cart.cart_notes`, `ms_cart_archive.cart_notes` | customer | specific line item |
+| **NOT INCLUDED** — operator/admin entries | `ms_orders.order_admin_notes` | operator | excluded by spec — different surface (already on detail page via `NotesBlocks`) |
+| **NOT INCLUDED** — system activity log | `ms_notes` (`note_table='ms_orders' AND note_table_id=orderId`) | system | "[Dashboard] Order processed", "Carrier: USPS" — operator-facing only via the activity card |
+
+The two customer sources are evaluated as a logical OR — the badge shows iff *either* has substantive (non-whitespace-only) content. The tooltip composes both when both are present.
+
+**The audit-driven REGEXP-not-TRIM whitespace parity rule.** This is the load-bearing pre-code catch and the reason the audit-first discipline earns its keep again. MySQL's `TRIM()` strips only ASCII spaces; JS's `.trim()` strips all `\s` whitespace (space, tab, newline, carriage return, form feed, vertical tab). Verified live during audit on MySQL 8.0.43:
+
+| Note content | JS `.trim().length > 0` | SQL `TRIM(x) != ''` | SQL `x REGEXP '[^[:space:]]'` |
+|---|---|---|---|
+| `"hello"` | ✓ | ✓ | ✓ |
+| `"   "` (spaces) | ✗ | ✗ | ✗ |
+| `"\t\t"` (tabs only) | ✗ | **✓ ⚠** | ✗ |
+| `"\r\n"` (newlines only) | ✗ | **✓ ⚠** | ✗ |
+| `" \t\n "` (mixed whitespace) | ✗ | **✓ ⚠** | ✗ |
+
+Using `TRIM != ''` would silently over-flag orders whose notes contain only tabs/newlines as "has content" while the client's `.trim()` correctly classifies them empty — operator-visible JS↔SQL drift. **The fix:** use `REGEXP '[^[:space:]]'` — the POSIX `[:space:]` class matches JS `\s` exactly. Single-source helper `_lineItemNotesExistsSql(cartAlias)` keeps the rule in one place; every consumer (`getOrdersByWorkflow`, `getOrderById`) goes through it. This is the same parity discipline Phase 77 introduced for skip-flag set lockstep.
+
+**Why the defensive archive check.** Steady-state Queue today: 21 open orders, all in `ms_cart`, zero in `ms_cart_archive`. The defensive `OR EXISTS … ms_cart_archive` clause is unnecessary for Queue specifically. But every other "has X in cart" query in `sytistDbService.js` checks both tables (`_physicalItemExistsSql`, Phase 77's `_buildInstantPackSqlPredicate`, the gallery-filter EXISTS, etc.) because Sytist moves cart rows between live/archive at some lifecycle point that the dashboard doesn't directly observe. Consistency with the existing pattern beats skipping one cheap subquery; the EXISTS short-circuits when no archived rows match (the common case).
+
+**Server: three new computed columns on the canonical shape.**
+
+```sql
+-- Same pattern in both getOrdersByWorkflow and getOrderById SELECTs:
+SELECT o.*, st.status_name AS productionStatusName,
+  (NOT ${_physicalItemExistsSql(digitalSkuList)}) AS isDigitalOnly,
+  (
+    EXISTS (SELECT 1 FROM ms_cart c
+             WHERE c.cart_order = o.order_id AND ${liveNotesExists})
+    OR EXISTS (SELECT 1 FROM ms_cart_archive ca
+                WHERE ca.cart_order = o.order_id AND ${archiveNotesExists})
+  ) AS hasLineItemNotes,
+  (
+    SELECT LEFT(notes, 100) FROM (
+      SELECT c.cart_notes AS notes FROM ms_cart c
+       WHERE c.cart_order = o.order_id AND ${liveNotesExists}
+      UNION ALL
+      SELECT ca.cart_notes FROM ms_cart_archive ca
+       WHERE ca.cart_order = o.order_id AND ${archiveNotesExists}
+    ) t LIMIT 1
+  ) AS lineItemNotesPreview,
+  (
+    SELECT COUNT(*) FROM (
+      SELECT 1 FROM ms_cart c
+       WHERE c.cart_order = o.order_id AND ${liveNotesExists}
+      UNION ALL
+      SELECT 1 FROM ms_cart_archive ca
+       WHERE ca.cart_order = o.order_id AND ${archiveNotesExists}
+    ) t
+  ) AS lineItemNotesCount
+```
+
+Three correlated subqueries per row. `EXISTS` short-circuits when no rows match (the common case at ~98% of orders). `LEFT(notes, 100)` truncates the preview server-side — clients only get the snippet, never multi-KB note bodies. `COUNT(*)` is exact because the tooltip's "+N more" path needs to know N precisely.
+
+`customerNotes: o.order_notes || ''` was already on the canonical shape since well before Phase 78 (lines 1947 / 2488). Zero work needed there. The three new fields land alongside in the same shape mapper for both endpoints.
+
+**Performance check (Joey's explicit ship/no-ship gate: <300ms added).** Pure SQL elapsed on Queue page=50 (24 open orders):
+
+| | Run 1 | Run 2 | Run 3 | Avg |
+|---|---|---|---|---|
+| Baseline (no new columns) | 177ms | 187ms | 184ms | **183ms** |
+| With Phase 78 columns | 196ms | 200ms | 196ms | **197ms** |
+
+**+14ms delta**, well under the 300ms threshold. CTE optimisation deferred — not needed at this scale (3 subqueries × 24 rows = 72 lookups, all indexed on `cart_order`). Full `getOrdersByWorkflow` response time (including package + addon expansion in JS) is ~650-700ms warm, dominated by the existing per-row processing, not the new SQL.
+
+**Client: `CustomerNotesBadge` + `buildCustomerNoteTooltip`.**
+
+The component is small — show/hide decision + styled `<div>` with `title=` attribute. The tooltip rule lives in a named export, `buildCustomerNoteTooltip(order)`, so the verification harness can drive it directly without rendering React (the client file is a JSX module that won't load in plain Node without a bundler). The two encodings — the client helper and the harness's mirror — are commented as parallel; if the rule changes, change both.
+
+Tooltip rule (verbatim per spec):
+
+| Source state | Tooltip content |
+|---|---|
+| `order_notes` only | `[order_notes truncated to 150]` |
+| `cart_notes` only | `Line item notes: [first cart_note truncated to 100] (+N more)` when N>1 |
+| both | `[order_notes truncated to 150] · Line item notes: [first cart_note truncated to 80] (+N more)` when N>1 |
+
+The cart-note preview is shorter (80 vs 100) in the "both" case so the order-level note (typically the operator's primary signal — the customer wrote it about the whole order, not a specific item) doesn't get squeezed off the tooltip.
+
+**Badge ordering in the cell** (semantic priority — Joey's call): `CustomerNotesBadge` renders BEFORE `InstantPackBadge`. The Note badge is "stop and read"; the Instant-Ship badge is "fast-track candidate." Read order: `LastProcessBadge` (failed/partial — biggest signal, "previously broke") → `CustomerNotesBadge` ("stop and read") → `InstantPackBadge` ("fast-track candidate") → `WorkflowBadge` (existing routing classifier).
+
+**Color: `#fd7e14`** (deeper orange). Distinct from `LastProcessBadge` partial `#e0901b` AND `InstantPackBadge` blue `#4263eb` AND the Phase 77 InstantShip filter amber `rgba(224,179,65,…)`. Visually unambiguous next to any of them.
+
+**Verification.**
+
+- **Offline** `server/scripts/verify-customer-notes-badge.js` **13/13**: Joey's 8 spec cases (order-only / cart-only / multi-cart / both / both-multi / whitespace-only / empty / long-truncation × 2) + 3 guard cases against silent drift (whitespace-only preview composes oddly but doesn't crash, single-count omits "(+N more)", defensive count=0 path).
+- **Live SQL smoke-test** on three known orders during audit:
+  - 113274 (cart_notes only, 2 notes from prior audit) → `hasLineItemNotes=true, preview="Please use the level 4 team photo", count=2` ✓
+  - 115429 Lora Loch (order_notes only) → `customerNotes` populated, `hasLineItemNotes=false, count=0` ✓
+  - 115221 (no notes expected) → all-empty ✓
+- **Operator-facing live verification owed:** open the orders list, find a Queue order with a note, confirm the 💬 badge renders + the tooltip shows the truncated note on hover. Confirm orders WITHOUT notes show no badge. Confirm InstantPack + LastProcess badges still render alongside without visual collision.
+
+**Files:** `server/services/sytistDbService.js`, `client/src/pages/OrdersListPage.js`, `server/scripts/verify-customer-notes-badge.js` (new), `CLAUDE.md`.

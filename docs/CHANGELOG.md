@@ -603,6 +603,27 @@ Format: phase number → short title → what shipped → key files touched.
 
 ---
 
+## Phase 78 — Customer-notes "💬 Note" badge on the orders list
+
+- **Why:** during morning batch processing, an order carrying a customer-entered note ("spell name with two N's", "ship before March 15", "please fix flyaway hair") needs the operator's eye before it gets fast-tracked. The order-detail page already renders customer notes via `NotesBlocks`; the badge surfaces the existence + first ~150 chars on the orders LIST so the operator catches them without clicking through.
+- **Two sources, logical OR**: `ms_orders.order_notes` (order-level checkout note) AND `ms_cart.cart_notes` / `ms_cart_archive.cart_notes` (per-line-item customer note). System-generated `ms_notes` and operator-entered `order_admin_notes` are explicitly OUT of scope.
+- **Server (`sytistDbService.js`, clean file):**
+  - New helper `_lineItemNotesExistsSql(cartAlias)` — single source of truth for the parity rule. Returns `${c}.cart_notes IS NOT NULL AND ${c}.cart_notes REGEXP '[^[:space:]]'` for the given alias.
+  - **REGEXP-not-TRIM whitespace parity** (the load-bearing audit catch — same JS↔SQL discipline as Phase 77's `_physicalForInstantPackSqlFragment`). MySQL's `TRIM()` strips only ASCII spaces; JS `.trim()` strips all `\s`. The naive `TRIM(cart_notes) != ''` would over-flag tabs/newlines-only notes; `REGEXP '[^[:space:]]'` matches JS exactly. Confirmed live on MySQL 8.0.43 at audit time (POSIX class fully supported).
+  - Three new computed columns in both `getOrdersByWorkflow` and `getOrderById` SELECTs, each UNION-ALLing `ms_cart` with `ms_cart_archive`: `hasLineItemNotes` (boolean), `lineItemNotesPreview` (`LEFT(notes, 100)` from the first matching row), `lineItemNotesCount` (`COUNT(*)`). Defensive archive check matches the existing "always both tables" pattern (`_physicalItemExistsSql`, Phase 77 predicate, gallery filter, etc.) even though steady-state Queue today sits 100% in `ms_cart` (21 of 21 open orders at audit time).
+  - `customerNotes: o.order_notes || ''` was already on the canonical shape since well before Phase 78; zero work needed for the order-level source. The three new fields land alongside on both endpoints.
+- **Client (`OrdersListPage.js`, Phase 63 holdout — hunk-staged):**
+  - `CustomerNotesBadge({ order })` component. `#fd7e14` deeper-orange background — distinct from both `LastProcessBadge` partial `#e0901b` and `InstantPackBadge` blue `#4263eb`. 💬 glyph + "Note" label, matches existing badge sizing pattern.
+  - Renders BEFORE `InstantPackBadge` in the order-number cell by semantic priority — "stop and read" > "fast-track candidate." `LastProcessBadge` stays first (largest signal: previously broke).
+  - `buildCustomerNoteTooltip(order)` exported as named helper — the tooltip rule's single client source: `order_notes` only → up to 150 chars; cart_notes only → `Line item notes: [first up to 100 chars] (+N more)` if N>1; both → 150 chars + ` · Line item notes: [first up to 80 chars] (+N more)` if N>1. Shorter (80) cart-note cap in the "both" case so the order-level note doesn't get squeezed off the tooltip. Native HTML `title=` attribute (matches the existing pattern).
+- **Verification:**
+  - Offline `verify-customer-notes-badge.js` **13/13** — Joey's 8 spec cases (order-only / cart-only / multi-cart / both / both-multi / whitespace / empty / long-truncation × 2) + 3 guard cases (whitespace-only preview falls through, single-count no "(+N more)", defensive count=0 path).
+  - Live SQL smoke-test on three known orders: 113274 (cart_notes only, 2 notes) → `hasLineItemNotes=true, preview="Please use the level 4 team photo", count=2`. 115429 (order_notes only) → `customerNotes` populated, `hasLineItemNotes=false`. 115221 (neither) → all-empty. All three matched expectations exactly.
+  - **Perf check (Joey's explicit gate):** pure SQL elapsed on Queue page=50 — **baseline 183ms avg, with Phase 78 columns 197ms avg → +14ms delta**. Well under Joey's 300ms ship/no-ship threshold; CTE optimisation deferred (not needed at this scale). 24 of 24 open orders at audit time; 0 currently carry notes (matches the 1.7%-of-90d population rate).
+- **Files:** `server/services/sytistDbService.js`, `client/src/pages/OrdersListPage.js`, `server/scripts/verify-customer-notes-badge.js` (new), `CLAUDE.md`
+
+---
+
 ## Reversed / removed
 
 - **Phase 31**: auto-push packaging during adopt — reversed in Phase 33 after it conflicted with the upstream "Sportsline UI" tool's payload

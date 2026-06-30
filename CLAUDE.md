@@ -358,6 +358,26 @@ Why different: a rotated text label spilling outside the slot is normal layout b
 1. **`sharp.composite` REFUSES inputs larger than the destination canvas** (`"Image to composite must have same dimensions or smaller"`). The Phase 74 harness's first cut tried compositing the rotated (larger) buffer onto a fresh w × h canvas with negative top/left — every rotated render returned an entirely transparent slot (the throw was being swallowed upstream and `_clipToCanvas` was never reached, so the canvas background painted through). The fix that landed uses `sharp(rotated).extract({ left, top, width, height })` to crop centrally — that's the correct primitive for "stable bounding box, corners clip." Don't reintroduce the negative-composite path.
 2. **The fast path is byte-identical, not approximately.** Existing layouts have no `rotation` field; `Number(undefined) || 0 === 0` → helper short-circuits → buffer flows to `_clipToCanvas` exactly as it did pre-Phase-74. Don't add any normalization or re-encode in the helper that would touch the no-rotation buffer.
 
+### Customer-notes badge spans TWO columns + REGEXP-not-TRIM whitespace parity (Phase 78)
+
+The orders-list "💬 Note" badge is driven by **two** customer-entered Sytist columns, evaluated as a logical OR. Forgetting one half breaks the badge silently:
+
+1. **`ms_orders.order_notes`** — order-level checkout note. Already on the canonical shape as `customerNotes` since before Phase 78.
+2. **`ms_cart.cart_notes`** (AND `ms_cart_archive.cart_notes` — defensive parity with every other "check both" query in the codebase, even though steady-state Queue today sits 100% in `ms_cart`) — per-line-item customer note. Precomputed into the order shape as three fields: `hasLineItemNotes` (bool), `lineItemNotesPreview` (string, ≤100 chars), `lineItemNotesCount` (int).
+
+**Do NOT remove `order_admin_notes`** from anywhere — that column is operator-entered (`adminNotes`), **deliberately excluded** from the customer-notes badge by Joey's spec. It still renders on the order-detail page via `NotesBlocks`. The Phase 78 fields on the order shape are `customerNotes` / `hasLineItemNotes` / `lineItemNotesPreview` / `lineItemNotesCount` — admin notes are NOT a fifth field for this badge.
+
+**The whitespace-trim parity rule (load-bearing, same shape as Phase 77's discipline):** MySQL's `TRIM()` strips only ASCII spaces. JS `.trim()` strips ALL `\s` whitespace (space, tab, newline, CR, FF, VT). A naive `TRIM(cart_notes) != ''` SQL check would over-flag notes containing only tabs/newlines as "has content," while the client's `.trim()` would correctly classify them empty — silent JS↔SQL divergence. **Use `REGEXP '[^[:space:]]'` instead** — the POSIX `[:space:]` class matches JS `\s` exactly. Confirmed live on MySQL 8.0.43 at Phase 78 audit time. The single-source helper is `_lineItemNotesExistsSql(cartAlias)` in `sytistDbService.js`; every consumer (both `getOrdersByWorkflow` and `getOrderById` use it) goes through that helper so the rule lives in one place. Don't substitute `TRIM()` back in — it's the wrong primitive here.
+
+**Tooltip priority rule (the load-bearing UX, `buildCustomerNoteTooltip` in `OrdersListPage.js`):**
+- `order_notes` only → `[order_notes up to 150 chars + ellipsis]`
+- `cart_notes` only → `Line item notes: [first cart_note up to 100 chars] (+N more)` (when N>1)
+- both → `[order_notes up to 150] · Line item notes: [first cart_note up to 80 chars] (+N more)` (when N>1)
+
+The cart_note preview is shorter in the "both" case (80 vs 100) so the order-level note (the operator's primary signal) doesn't get squeezed off the tooltip. The `buildCustomerNoteTooltip` helper is exported as a named JS function and the harness `verify-customer-notes-badge.js` mirrors it; if the rule changes, change both — same parallel-encoding discipline as Phase 77's `_evaluateInstantPackSqlAlgorithmFromCartRows`.
+
+**Badge ordering in the cell:** `CustomerNotesBadge` renders BEFORE `InstantPackBadge` in the order-number cell, by semantic priority — "stop and read" > "fast-track candidate" > "previously broke" (`LastProcessBadge` stays even earlier, first in the cell). Color `#fd7e14` deeper orange — distinct from both `LastProcessBadge` partial `#e0901b` and `InstantPackBadge` blue `#4263eb`.
+
 ### Terminal-status guard — `!shippingFields` is the discriminator, do not change it (Phase 75)
 
 `sytistDbService.updateOrderStatus(orderId, statusId, shippingFields = null)` refuses to flip an order **out of** a terminal status (`TERMINAL_STATUSES = {39 Shipped}`) to a non-terminal one when `shippingFields` is falsy. This blocks the order-114242 incident class: processed once, SS+scheduler advanced status 0→40→39, then reprocessed by mistake — the second process silently flipped 39→40, corrupting Sytist's state to "in Printing" for an order that was already delivered.

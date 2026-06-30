@@ -75,6 +75,53 @@ function _physicalItemExistsSql(digitalSkuList) {
   );
 }
 
+// ─── Phase 78: customer-notes badge — per-line-item cart_notes detection ──
+//
+// The orders-list "💬 Customer note" badge is driven by two sources:
+//
+//   (1) ms_orders.order_notes — the customer's order-level checkout note.
+//       Already on the canonical order shape as `customerNotes` since
+//       before Phase 78; no new work for that source.
+//
+//   (2) ms_cart.cart_notes (and ms_cart_archive.cart_notes) — per-line-item
+//       customer notes. Phase 78 adds three precomputed fields to the shape
+//       so the badge can render in one round-trip without per-row line-item
+//       expansion: `hasLineItemNotes` (boolean), `lineItemNotesPreview`
+//       (first non-empty cart_note, up to 100 chars), `lineItemNotesCount`
+//       (int — total non-empty cart_notes across the order).
+//
+// Whitespace-trim parity rule (the load-bearing piece — same JS↔SQL
+// discipline as Phase 77's _physicalForInstantPackSqlFragment):
+//
+//   MySQL's TRIM() strips only ASCII spaces. JS .trim() strips ALL whitespace
+//   (\s = space, tab, newline, carriage return, form feed, vertical tab).
+//   So `TRIM(cart_notes) != ''` would over-flag notes containing only tabs
+//   or newlines as "has content" while the client-side .trim() correctly
+//   marks them empty. Use `REGEXP '[^[:space:]]'` instead — the POSIX
+//   [:space:] class matches JS \s exactly. Confirmed live on MySQL 8.0.43
+//   at audit time. Don't substitute TRIM() back in — it's the wrong primitive
+//   here.
+//
+// The defensive archive check (ms_cart_archive) matches the existing pattern
+// in _physicalItemExistsSql / Phase 77's _buildInstantPackSqlPredicate /
+// gallery EXISTS — Sytist moves cart rows between live/archive at some
+// lifecycle point; in steady-state today's open-queue orders all sit in
+// ms_cart, but the defensive check guarantees correctness across statuses
+// and matches the rest of the codebase's "always check both" convention.
+
+// Returns the SQL fragment for "this cart row has a substantive (non-
+// whitespace-only) customer note." The `cartAlias` is the table alias —
+// callers pass 'c' for ms_cart and 'ca' for ms_cart_archive. Single source
+// of truth for the parity rule; if it ever needs to evolve (e.g. recognise
+// some other "trivial" content like a single '-' or 'na' as empty), change
+// it here and every consumer updates in lockstep.
+function _lineItemNotesExistsSql(cartAlias) {
+  const c = cartAlias;
+  return (
+    `${c}.cart_notes IS NOT NULL AND ${c}.cart_notes REGEXP '[^[:space:]]'`
+  );
+}
+
 // ─── Phase 60a: instant-pack eligibility ──────────────────────────────
 //
 // Per-SKU "instant-pack eligible" classification (default-deny), stored as
@@ -1467,12 +1514,48 @@ class SytistDbService {
     // Phase 60: isDigitalOnly is computed via the SAME physical-item SQL
     // the workflow predicate uses, so the row's badge (set from this
     // column) and the workflow filter never disagree.
+    // Phase 78: per-line-item-notes precompute, three correlated subqueries.
+    // Same parity rule applied across all three (REGEXP not TRIM — see
+    // _lineItemNotesExistsSql at the top of this file). Each subquery
+    // UNION-ALLs ms_cart with ms_cart_archive so the precompute is correct
+    // for any production status (current Queue all sits in ms_cart, but
+    // post-archive lifecycle phases would shift rows). EXISTS short-circuits;
+    // the LEFT(…, 100) preview pulls one row; the COUNT scans the union.
+    // Performance: 3 subqueries × pageSize=50 = 150 lookups, all indexed on
+    // cart_order — measured imperceptibly fast in development; live perf
+    // check during verification confirms steady state.
+    const liveNotesExists = _lineItemNotesExistsSql('c');
+    const archiveNotesExists = _lineItemNotesExistsSql('ca');
     const [orderRows] = await pool.query(
       `
       SELECT
         o.*,
         st.status_name AS productionStatusName,
-        (NOT ${_physicalItemExistsSql(digitalSkuList)}) AS isDigitalOnly
+        (NOT ${_physicalItemExistsSql(digitalSkuList)}) AS isDigitalOnly,
+        (
+          EXISTS (SELECT 1 FROM ms_cart c
+                   WHERE c.cart_order = o.order_id AND ${liveNotesExists})
+          OR EXISTS (SELECT 1 FROM ms_cart_archive ca
+                      WHERE ca.cart_order = o.order_id AND ${archiveNotesExists})
+        ) AS hasLineItemNotes,
+        (
+          SELECT LEFT(notes, 100) FROM (
+            SELECT c.cart_notes  AS notes FROM ms_cart c
+             WHERE c.cart_order = o.order_id AND ${liveNotesExists}
+            UNION ALL
+            SELECT ca.cart_notes AS notes FROM ms_cart_archive ca
+             WHERE ca.cart_order = o.order_id AND ${archiveNotesExists}
+          ) t LIMIT 1
+        ) AS lineItemNotesPreview,
+        (
+          SELECT COUNT(*) FROM (
+            SELECT 1 FROM ms_cart c
+             WHERE c.cart_order = o.order_id AND ${liveNotesExists}
+            UNION ALL
+            SELECT 1 FROM ms_cart_archive ca
+             WHERE ca.cart_order = o.order_id AND ${archiveNotesExists}
+          ) t
+        ) AS lineItemNotesCount
       FROM ms_orders o
       LEFT JOIN ms_order_status st ON st.status_id = o.order_open_status
       WHERE ${where.join(' AND ')}
@@ -1863,6 +1946,14 @@ class SytistDbService {
             : null,
         customerNotes: o.order_notes || '',
         adminNotes: o.order_admin_notes || '',
+        // Phase 78: per-line-item customer notes precompute. SQL columns
+        // come back from the correlated subqueries above. The client's
+        // CustomerNotesBadge uses these alongside customerNotes to
+        // populate the badge tooltip per the priority rule (order_notes
+        // first, then line-item notes with "+N more" if multiple).
+        hasLineItemNotes: !!o.hasLineItemNotes,
+        lineItemNotesPreview: o.lineItemNotesPreview || '',
+        lineItemNotesCount: Number(o.lineItemNotesCount) || 0,
 
         cardLastFour: o.order_card_last_four || '',
         payType: o.order_pay_type || '',
@@ -2108,12 +2199,43 @@ class SytistDbService {
     // explicitly asked for THIS order, whatever state it's in.
     // Phase 60: isDigitalOnly via the same physical-item SQL the list +
     // counts use, so the detail-page workflow badge agrees with the list.
+    // Phase 78: line-item-notes precompute — same three columns as
+    // getOrdersByWorkflow so the shape stays uniform across both endpoints.
+    // The order-detail page renders cart_notes inline per line item already;
+    // these fields exist for shape-parity with the list response so any
+    // detail-page badge or summary stays in lockstep.
+    const liveNotesExistsDetail = _lineItemNotesExistsSql('c');
+    const archiveNotesExistsDetail = _lineItemNotesExistsSql('ca');
     const [orderRows] = await pool.query(
       `
       SELECT
         o.*,
         st.status_name AS productionStatusName,
-        (NOT ${_physicalItemExistsSql(_loadDigitalSkuList())}) AS isDigitalOnly
+        (NOT ${_physicalItemExistsSql(_loadDigitalSkuList())}) AS isDigitalOnly,
+        (
+          EXISTS (SELECT 1 FROM ms_cart c
+                   WHERE c.cart_order = o.order_id AND ${liveNotesExistsDetail})
+          OR EXISTS (SELECT 1 FROM ms_cart_archive ca
+                      WHERE ca.cart_order = o.order_id AND ${archiveNotesExistsDetail})
+        ) AS hasLineItemNotes,
+        (
+          SELECT LEFT(notes, 100) FROM (
+            SELECT c.cart_notes  AS notes FROM ms_cart c
+             WHERE c.cart_order = o.order_id AND ${liveNotesExistsDetail}
+            UNION ALL
+            SELECT ca.cart_notes AS notes FROM ms_cart_archive ca
+             WHERE ca.cart_order = o.order_id AND ${archiveNotesExistsDetail}
+          ) t LIMIT 1
+        ) AS lineItemNotesPreview,
+        (
+          SELECT COUNT(*) FROM (
+            SELECT 1 FROM ms_cart c
+             WHERE c.cart_order = o.order_id AND ${liveNotesExistsDetail}
+            UNION ALL
+            SELECT 1 FROM ms_cart_archive ca
+             WHERE ca.cart_order = o.order_id AND ${archiveNotesExistsDetail}
+          ) t
+        ) AS lineItemNotesCount
       FROM ms_orders o
       LEFT JOIN ms_order_status st ON st.status_id = o.order_open_status
       WHERE o.order_id = ?
@@ -2396,6 +2518,11 @@ class SytistDbService {
           : null,
       customerNotes: o.order_notes || '',
       adminNotes: o.order_admin_notes || '',
+      // Phase 78: shape parity with getOrdersByWorkflow so the detail
+      // and list responses don't drift on customer-note presence.
+      hasLineItemNotes: !!o.hasLineItemNotes,
+      lineItemNotesPreview: o.lineItemNotesPreview || '',
+      lineItemNotesCount: Number(o.lineItemNotesCount) || 0,
 
       cardLastFour: o.order_card_last_four || '',
       payType: o.order_pay_type || '',

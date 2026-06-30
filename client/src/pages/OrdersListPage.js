@@ -1553,6 +1553,11 @@ function OrderRow({ order, galleryLogos, subGalleryFilter, isSelected, onToggleS
             📦 Bundle ships together
           </div>
         )}
+        {/* Phase 78: customer notes (order-level order_notes OR per-line-item
+            cart_notes). Sits BEFORE InstantPackBadge by semantic priority —
+            "stop and read this" > "fast-track candidate" > "previously broke."
+            The badge gets the eye-attention closest to the order number. */}
+        <CustomerNotesBadge order={order} />
         {/* Phase 60a: instant-pack eligibility — every physical item in the
             order is marked Instant-Ship Eligible in Settings → Packaging.
             Display-only in 60a (bulk actions land in 60b). */}
@@ -1645,6 +1650,94 @@ function InstantPackBadge() {
     >
       <span>⚡</span>
       <span>Instant-Ship</span>
+    </div>
+  );
+}
+
+// Phase 78: "stop and read" badge for orders carrying customer-entered notes.
+//
+// Two sources, with priority encoded in the tooltip text (the load-bearing UX
+// rule — see SPEC §78). The badge is rendered iff at least one source has
+// substantive (non-whitespace-only) content:
+//
+//   (1) order.customerNotes — order-level checkout note from ms_orders.order_notes.
+//   (2) order.hasLineItemNotes + lineItemNotesPreview + lineItemNotesCount —
+//       per-line-item customer notes precomputed server-side from ms_cart
+//       (and ms_cart_archive) cart_notes via _lineItemNotesExistsSql. The
+//       SQL-side parity check uses REGEXP '[^[:space:]]' to match JS's
+//       .trim() semantic exactly — see SPEC §78 / the sytistDbService
+//       comment block at _lineItemNotesExistsSql for the parity rule.
+//
+// Tooltip priority rule (verbatim per Phase 78 spec):
+//   - order_notes only      → tooltip = order_notes (up to 150 chars + ellipsis)
+//   - cart_notes only       → tooltip = "Line item notes: [first cart_note, 100 chars] (+N more)" when N>1
+//   - both                  → tooltip = order_notes (150) + " · Line item notes: [first cart_note, 80 chars] (+N more)" when N>1
+//
+// `buildCustomerNoteTooltip(order)` is exported as a named helper alongside
+// the component so verify-customer-notes-badge.js drives the same string
+// builder the badge renders, without rendering React. The function is the
+// single source of truth for the tooltip rule; the component only handles
+// the show/hide decision and the styled <div>.
+const ORDER_NOTES_TRUNCATE_ALONE = 150;
+const ORDER_NOTES_TRUNCATE_BOTH = 150;
+const LINE_NOTES_TRUNCATE_ALONE = 100;
+const LINE_NOTES_TRUNCATE_BOTH = 80;
+
+export function buildCustomerNoteTooltip(order) {
+  const cn = (order.customerNotes || '').trim();
+  const hasOrder = cn.length > 0;
+  const hasLine = !!order.hasLineItemNotes;
+  if (!hasOrder && !hasLine) return null;
+
+  const truncate = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
+
+  const linePreview = (order.lineItemNotesPreview || '').trim();
+  const lineCount = Number(order.lineItemNotesCount) || 0;
+  const moreSuffix = lineCount > 1 ? ` (+${lineCount - 1} more)` : '';
+
+  if (hasOrder && hasLine) {
+    return (
+      truncate(cn, ORDER_NOTES_TRUNCATE_BOTH) +
+      ' · Line item notes: ' +
+      truncate(linePreview, LINE_NOTES_TRUNCATE_BOTH) +
+      moreSuffix
+    );
+  }
+  if (hasOrder) {
+    return truncate(cn, ORDER_NOTES_TRUNCATE_ALONE);
+  }
+  // hasLine only
+  return (
+    'Line item notes: ' + truncate(linePreview, LINE_NOTES_TRUNCATE_ALONE) + moreSuffix
+  );
+}
+
+function CustomerNotesBadge({ order }) {
+  const tooltip = buildCustomerNoteTooltip(order);
+  if (!tooltip) return null;
+  return (
+    <div
+      title={tooltip}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 4,
+        marginTop: 4,
+        padding: '2px 8px',
+        // Phase 78: amber-orange #fd7e14 — distinct from LastProcessBadge's
+        // partial #e0901b and InstantPackBadge's blue #4263eb. "Needs
+        // attention" tone, not "warning" red, not "fast-track" blue.
+        background: '#fd7e14',
+        color: '#fff',
+        borderRadius: 10,
+        fontSize: 11,
+        fontWeight: 600,
+        whiteSpace: 'nowrap',
+        lineHeight: 1.2,
+      }}
+    >
+      <span>💬</span>
+      <span>Note</span>
     </div>
   );
 }
