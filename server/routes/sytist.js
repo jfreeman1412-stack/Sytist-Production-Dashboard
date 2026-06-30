@@ -722,6 +722,17 @@ router.put(
       res.json({ success: true, ...result });
     } catch (err) {
       console.error('[sytist/orders/:orderId/status]', err);
+      // Phase 75: the terminal-status guard inside updateOrderStatus throws
+      // with err.code = 'TERMINAL_STATUS_LOCKED' when a caller tries to flip
+      // an already-shipped order (status=39) to a non-terminal status
+      // without going through the explicit ship/unship path. Map that to
+      // 409 Conflict — semantically a state-machine guard violation, NOT
+      // a 400 malformed request. Operator-facing message ("Refusing to
+      // change status of shipped order N: ... unship action.") is already
+      // human-readable; pass through as-is.
+      if (err.code === 'TERMINAL_STATUS_LOCKED') {
+        return res.status(409).json({ error: err.message, code: err.code });
+      }
       const isClientError =
         /not found|invalid|erased|does not exist/i.test(err.message);
       res.status(isClientError ? 400 : 500).json({

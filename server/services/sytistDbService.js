@@ -2069,6 +2069,54 @@ class SytistDbService {
     const previousStatusName =
       previousStatusId === 0 ? STATUS_OPEN_NAME : currentRow.currentStatusName || '';
 
+    // Phase 75: refuse to flip OUT of a terminal status to a non-terminal one
+    // when shippingFields is null. The discriminator is deliberate: the
+    // shipping-fields path (orderStatusService.shipOrder / .unshipOrder —
+    // explicit operator-driven ship/unship actions, OR the scheduler's
+    // auto-shipped sync which carries the same shape) carries
+    // shippingFields !== null and is allowed any transition; everything else
+    // (processingService's "process → 40", the manual PUT /status route)
+    // passes shippingFields=null and is gated against silently reverting a
+    // shipped order. The Phase-63-era order 114242 incident — processed
+    // twice, the second time after SS+scheduler had already marked it
+    // Shipped (39), with the second process silently flipping it back to
+    // Printing (40) — is exactly what this guard blocks.
+    //
+    // Do NOT broaden TERMINAL_STATUSES to include the "attention needed"
+    // statuses (12 / 28 / 73) — those are *requests for operator action*,
+    // and a reprocess fulfilling them is correct behavior, not a violation.
+    // Today {39 Shipped} is the only terminal status in ms_order_status.
+    //
+    // Callers above this layer that need to bypass the guard for an
+    // explicit operator-driven unship-then-reprocess flow must go through
+    // orderStatusService.unshipOrder (which passes shippingFields).
+    //
+    // The thrown error carries err.code = 'TERMINAL_STATUS_LOCKED' so the
+    // route layer in routes/sytist.js can map it to HTTP 409 Conflict
+    // (semantically a state-machine guard violation, not a malformed
+    // request). processingService's existing try/catch around
+    // updateOrderStatus (lines ~383-403) catches the throw and surfaces
+    // it as result.statusUpdateError + statusUpdated:false WITHOUT
+    // breaking the rest of the processing flow — the print artifacts
+    // (.txt, slip, etc.) already succeeded by the time we reach the
+    // status-update step. The verify-status-guard.js harness asserts
+    // that contract explicitly so a future processingService refactor
+    // can't silently break it.
+    const TERMINAL_STATUSES = new Set([39]);
+    if (
+      !shippingFields &&
+      TERMINAL_STATUSES.has(previousStatusId) &&
+      !TERMINAL_STATUSES.has(newStatusId)
+    ) {
+      const lockedErr = new Error(
+        `Refusing to change status of shipped order ${id}: ` +
+          `${previousStatusId} (${previousStatusName}) → ${newStatusId} (${newStatusName}). ` +
+          `Terminal status requires an explicit unship action.`
+      );
+      lockedErr.code = 'TERMINAL_STATUS_LOCKED';
+      throw lockedErr;
+    }
+
     // 3. The actual write. Single row, by primary key, no triggers we control.
     //
     // Phase 30: when `shippingFields` is provided, write the shipping

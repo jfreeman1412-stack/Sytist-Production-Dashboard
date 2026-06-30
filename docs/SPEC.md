@@ -2537,3 +2537,76 @@ Per-kind fill colors (red/green/blue/yellow/magenta) uniquely identify which ren
 **Out of scope (intentional, recorded so a future audit knows why).** OverrideEditorPage rotation UI is a separate surface (the override editor is for editing text content/color, not for changing layout-author geometry). Sub-pixel anti-alias smoothing of rotated edges (sharp's default bilinear is acceptable at the photo sizes involved — 80–800 px slot widths at 300 DPI). The text path's "extends, no clip" semantic stays exactly as Phase 22 shipped it — Phase 74 does not touch `_textSvg`. `processingService.js` and `darkroomService.js` are not modified — rotation is a `compositeService` render concern, no manifest changes.
 
 Files: `server/services/compositeService.js`, `client/src/components/LayoutCanvas.js`, `client/src/pages/settings/LayoutDesignerPage.js`, `server/scripts/verify-rotation.js` (new), `CLAUDE.md`.
+
+## 75. Terminal-status guard in `updateOrderStatus`
+
+**The bug, by incident.** Order 114242 (Allison Hennen, 2026-06-12) processed twice on 2026-06-15: first batch at 13:49 UTC by `joey` (50 orders) → Sytist status 0→40 Printing → SS order created → shipped via stamps.com/USPS at ~15:05 UTC with tracking `9400150206217735907471` → scheduler at 15:12 UTC auto-detected the SS shipped status and synced Sytist 40→39. Then at 17:06 UTC the same operator ran a second batch of 10 orders that happened to include this already-shipped order. Phase 33's "adopt without push" path correctly identified the SS order already existed and refused to create a duplicate — but `sytistDbService.updateOrderStatus` had **no current-status check**, so the post-process status flip wrote Sytist 39→40 silently, leaving a delivered order misrepresented as "Printing." `ms_notes` audit log shows the two "Order processed" entries three hours apart with status both times set to Printing; ShipStation shows exactly one shipment (not voided, tracking present); the only damaged surface is `ms_orders.order_open_status`.
+
+**Why the audit caught this and the data store didn't.** `ms_orders` accepted the write because `updateOrderStatus` validates only (a) the target status exists in `ms_order_status`, (b) the order isn't erased — never the *current* status. The state-machine guard simply wasn't there. Phase 33's adopt path also doesn't check Sytist's status; it checks SS-side existence and decides not to re-create. The two checks are at different layers and neither covered "I'm about to flip Shipped backwards."
+
+**The fix (small, isolated).** A guard in `sytistDbService.updateOrderStatus`, placed after the existing read-current-state block (~line 2068) and before the write path selection (~line 2080):
+
+```js
+const TERMINAL_STATUSES = new Set([39]);
+if (
+  !shippingFields &&
+  TERMINAL_STATUSES.has(previousStatusId) &&
+  !TERMINAL_STATUSES.has(newStatusId)
+) {
+  const lockedErr = new Error(
+    `Refusing to change status of shipped order ${id}: ` +
+      `${previousStatusId} (${previousStatusName}) → ${newStatusId} (${newStatusName}). ` +
+      `Terminal status requires an explicit unship action.`
+  );
+  lockedErr.code = 'TERMINAL_STATUS_LOCKED';
+  throw lockedErr;
+}
+```
+
+**`TERMINAL_STATUSES = {39}` only — not the "attention needed" statuses.** The complete `ms_order_status` enum at audit time was {0 Queue [implicit], 12 Office Attention Needed, 14 Open Invoice, 26 Digital Image to process, 28 Flagged-For Customer Reply, 37 16x20 to Print In House, 39 Shipped, 40 Printing and Production, 73 Atten Needed-Specialty Item}. 39 is the only delivered/done state. The 12 / 28 / 73 "attention needed" statuses are *requests for operator action* — a reprocess fulfilling them is correct behavior, not a guard violation. Cancelled is handled via `order_erased=1` (separate column, already thrown on earlier in the function). Don't broaden the set.
+
+**The `!shippingFields` discriminator.** This is the load-bearing design decision. The argument distinguishes intent-classes by call-site convention, NOT by content:
+- **Carries `shippingFields` (truthy)** — explicit shipping-state actions through `orderStatusService.shipOrder` / `.unshipOrder`. Reachable from the dashboard's manual ship/unship modals (operator-driven) and from `schedulerService` calling `orderStatusService.shipOrder({force:true})` on an SS-detected-shipped order. These callers have already decided the transition is correct AND are passing the 5 shipping columns to write alongside the status. **Allowed any transition.**
+- **Passes `null` or omits the arg (falsy)** — `processingService` (post-process flip-to-Printing at lines 391 + 795), `routes/sytist.js` PUT `/orders/:id/status` (manual status change from the dashboard UI). These callers don't know or care about the order's shipping state. **Gated against terminal-out reverts.**
+
+The predicate mirrors the existing `if (shippingFields)` decision at line ~2080 that already chooses between the 6-column shipping write path and the legacy 1-column path. Same predicate, same callers gated, intentional symmetry. **Critical: don't replace `!shippingFields` with a `caller==='processing'` flag, role check, or any other in-band signal.** Adding a new flag would split the discriminator from the write-path predicate; the next caller that gets the new flag wrong (or that adds a new write path) silently re-opens the 114242 bug class. The discriminator and the write-path-selector must move together — they're the same logical check expressed twice.
+
+**Bypass path for legitimate "unship then reprocess".** Operators occasionally need to "I shipped this by mistake, undo it, and reprocess as Printing." The flow is: operator un-ships through the dashboard UI → that calls `orderStatusService.unshipOrder` → which calls `updateOrderStatus(orderId, 0, shippingFields={cleared})` → guard predicate is false (shippingFields is truthy) → status flips back to 0 (or whatever target). Subsequent reprocess sees current=0, target=40 — both non-terminal, guard predicate false, write proceeds normally. No special "force" flag at the `updateOrderStatus` layer — the bypass is implicit in routing through `orderStatusService`. That's deliberate; the only legitimate way to undo Shipped is to also clear the shipping columns, which is exactly what `unshipOrder` does.
+
+**Route mapping — HTTP 409 Conflict.** `routes/sytist.js` PUT `/orders/:orderId/status` catch block checks `err.code === 'TERMINAL_STATUS_LOCKED'` *first*, returns 409 with the operator-readable message intact. 409 is semantically correct (state-machine guard violation, not a malformed request — the request was well-formed, the current state just doesn't permit it). The existing `/not found|invalid|erased|does not exist/` regex stays put for the other client-error cases (400). Two-line addition, single hunk.
+
+**`processingService.js` NOT touched — clean isolation, no Phase-63 hunk-stage dance needed.** The existing try/catch around `updateOrderStatus` at lines ~383-403:
+
+```js
+try {
+  await sytistDb.updateOrderStatus(workOrder.orderId, settings.targetStatusId);
+  result.statusUpdated = true;
+  result.newStatusId = settings.targetStatusId;
+  console.log(`[Processing] Order ${workOrder.orderId}: status → ${settings.targetStatusId}`);
+} catch (err) {
+  console.warn(`[Processing] Status update failed for ${workOrder.orderId}: ${err.message}`);
+  result.statusUpdateError = err.message;
+}
+```
+
+…already handles the throw correctly: catches it, surfaces the message in `result.statusUpdateError`, leaves `result.statusUpdated = false`, never sets `result.newStatusId`. Every field populated *before* the status-update step (sub-orders, txtPath, slipPath, SS adopt outcome) is untouched — they already succeeded. **The designed behavior when the guard fires on a reprocess of an already-shipped order:** the print artifacts re-render (the operator may want them for a reprint pass), SS adopt returns "already exists, skipped," Sytist's status is left at 39 Shipped where it belongs, the batch result shows `statusUpdated:false` + the human-readable error message so the operator sees *why* the status didn't move. **This is correct, not a degradation.** `verify-status-guard.js` case (B) mirrors lines 383-403 verbatim and asserts the result-shape contract — any future refactor of that block that breaks "guard fires + rest succeeds" fails the harness before it ships.
+
+**Verification.** `server/scripts/verify-status-guard.js` 7/7. Six guard cases (the full truth table) + the integration-contract case:
+
+| Case | Current | New | shippingFields | Outcome |
+|------|---------|-----|----------------|---------|
+| A1 | 39 | 40 | null | THROW `TERMINAL_STATUS_LOCKED`, no UPDATE (the 114242 bug class) |
+| A2 | 39 | 0 | null | THROW (the guard catches any non-terminal target, not just Printing) |
+| A3 | 39 | 40 | `{…}` | PASS, UPDATE runs (unship-and-reprocess via shipping path) |
+| A4 | 0 | 40 | null | PASS, UPDATE runs (normal Processing path) |
+| A5 | 39 | 39 | null | PASS, UPDATE runs (both terminal, predicate false, idempotent no-op) |
+| A6 | 40 | 39 | null | PASS, UPDATE runs (advancing INTO terminal is fine — guard only catches reverts OUT OF terminal) |
+| B  | — | — | — | processingService try/catch surfaces guard error in `result.statusUpdateError`, leaves other result fields intact |
+
+A small mock-pool stubs the three SQL shapes `updateOrderStatus` runs (status-enum lookup, current-row read, the UPDATE) so the harness is purely offline — no MySQL, no network, byte-deterministic.
+
+**Order 114242 manual repair — explicit operator action, deferred until Phase 75 is live.** Per the verification sequence: Phase 75 ships and is live-verified → then a one-off SQL `UPDATE ms_orders SET order_open_status=39, order_shipped_track='9400150206217735907471' WHERE order_id=114242` (both columns are inside the Phase 30 write allow-list). Repairing before the guard is in place would re-break on the next accidental reprocess. The repair is not part of this commit.
+
+**Phase 76 still ahead — tracking-number sync bug.** Bug 1 from the order-114242 audit (scheduler reads `ssOrder.shipments[].trackingNumber` from `/orders`, which doesn't include the nested shipments array — should call `/shipments`). Corrected impact: **952 affected orders** (`package_code='package'` shipped rows with SS tracking present, local null) between 2026-05-13 and 2026-06-24 (the period the scheduler-driven auto-sync has been losing tracking). Backfill of those 952 is the final step of Phase 76, AFTER the go-forward fix is verified live — explicitly not bundled into Phase 76's first commit.
+
+Files: `server/services/sytistDbService.js`, `server/routes/sytist.js`, `server/scripts/verify-status-guard.js` (new), `CLAUDE.md`.
