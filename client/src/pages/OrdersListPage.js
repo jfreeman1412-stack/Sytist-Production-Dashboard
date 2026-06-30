@@ -79,6 +79,16 @@ export default function OrdersListPage() {
   const [error, setError] = useState(null);
   const [softCapHit, setSoftCapHit] = useState(false);
 
+  // Phase 77: "⚡ Instant-Ship Only" filter toggle. Deliberately useState
+  // (NOT a URL search-param) so the toggle does NOT persist across reloads —
+  // the operator's intent here is a momentary "show me what's safe to instant-
+  // pack right now," not a saved filter. Defaults off on page load. Composed
+  // server-side as an additional AND with the other filters via the
+  // `instantShipOnly` query param; pagination + total counts stay honest
+  // because the SQL predicate runs before LIMIT/OFFSET. See SPEC §77 for the
+  // JS↔SQL parity story.
+  const [instantShipOnly, setInstantShipOnly] = useState(false);
+
   // Phase 4.6 — batch processing state
   // selectedOrderIds: which orders the operator has checked. Cleared
   // automatically whenever filters change (so a filter-then-process
@@ -143,6 +153,9 @@ export default function OrdersListPage() {
     if (subGalleryId) qs.set('subGalleryId', subGalleryId);
     if (shippingOption) qs.set('shippingOption', shippingOption);
     qs.set('sort', sort);
+    // Phase 77: only send the param when ON; the server treats absent as
+    // default off, so the OFF case is byte-identical to pre-77 requests.
+    if (instantShipOnly) qs.set('instantShipOnly', 'true');
 
     if (pageSize === 'all') {
       qs.set('limit', '1000');
@@ -179,14 +192,19 @@ export default function OrdersListPage() {
     page,
     sort,
     reloadCounter,
+    instantShipOnly,
   ]);
 
   // Phase 4.6 — clear selection when filters change so the operator
   // never accidentally batch-processes orders from a prior filter view.
+  // Phase 77: instantShipOnly added to the dependency set for the same
+  // reason — toggling it shrinks/expands the visible set, and a stale
+  // selection from the prior view would silently apply to "Process all
+  // selected" after the toggle.
   useEffect(() => {
     setSelectedOrderIds(new Set());
     setLastSelectedIndex(null); // Phase 54: drop the stale range anchor
-  }, [workflow, productionStatus, galleryId, subGalleryId, shippingOption]);
+  }, [workflow, productionStatus, galleryId, subGalleryId, shippingOption, instantShipOnly]);
 
   // Phase 4.6 — poll the active batch job for progress every 2s.
   useEffect(() => {
@@ -478,6 +496,12 @@ export default function OrdersListPage() {
       if (galleryId) qs.set('galleryId', galleryId);
       if (subGalleryId) qs.set('subGalleryId', subGalleryId);
       if (shippingOption) qs.set('shippingOption', shippingOption);
+      // Phase 77: include the instant-ship filter in the "Process all filtered"
+      // fetch so the batch operates on exactly the visible subset. Without
+      // this the batch would pull the un-filtered set even though the UI
+      // shows the eligible-only view, which is exactly the kind of silent
+      // mismatch the toggle is supposed to prevent.
+      if (instantShipOnly) qs.set('instantShipOnly', 'true');
       qs.set('limit', '500');
       qs.set('offset', '0');
       try {
@@ -496,11 +520,29 @@ export default function OrdersListPage() {
       return;
     }
 
+    // Phase 63: team dividers are batch-level and need the team identity (a
+    // team batch is single-team). Take it from the active Team filter; block
+    // clearly if dividers are requested without a team selected.
+    let team = null;
+    if (generateDivider) {
+      if (!subGalleryId) {
+        alert(
+          'Team dividers require a single-team batch — filter by Team first, then process.'
+        );
+        return;
+      }
+      const sg = (availableSubGalleries || []).find(
+        (s) => String(s.subId) === String(subGalleryId)
+      );
+      team = { subGalleryId, subGalleryName: sg ? sg.subName : '' };
+    }
+
     try {
       const response = await api.post('/api/sytist/process/batch', {
         orderIds,
         generateDivider,
         generateQrSheet,
+        team,
       });
       setActiveJobId(response.jobId);
       setActiveJob({
@@ -954,11 +996,63 @@ export default function OrdersListPage() {
           </select>
         </FilterGroup>
 
+        {/* Phase 77: Instant-Ship Only toggle. Visually distinct from the
+            <select> filters (it's a yes/no, not a value picker) and uses the
+            same ⚡ glyph as the per-row InstantPackBadge so the operator
+            reads "this filter shows what the ⚡ badge shows" at a glance.
+            Toggling resets pagination to page 1 — otherwise an operator on
+            page 5 of the un-filtered view who toggles ON could land on a
+            page-5 view of a much shorter filtered set (or past the end).
+            Highlighted background when ON so it's obvious the list is a
+            narrowed view; calm border when OFF so it blends with the row. */}
+        <FilterGroup label="Instant-ship">
+          <button
+            onClick={() => {
+              setInstantShipOnly((v) => !v);
+              setSearchParams(
+                (p) => {
+                  const next = new URLSearchParams(p);
+                  next.delete('page');
+                  return next;
+                },
+                { replace: false }
+              );
+            }}
+            aria-pressed={instantShipOnly}
+            title={
+              instantShipOnly
+                ? 'Showing instant-ship-eligible orders only. Click to show all.'
+                : 'Show only orders that can be instant-shipped (every physical item is on the eligible list).'
+            }
+            style={{
+              padding: '6px 12px',
+              fontSize: 13,
+              background: instantShipOnly
+                ? 'rgba(224,179,65,0.18)'
+                : 'var(--bg-input)',
+              color: instantShipOnly ? '#e0b341' : 'var(--text-primary)',
+              border: `1px solid ${
+                instantShipOnly ? 'rgba(224,179,65,0.55)' : 'var(--border-color)'
+              }`,
+              borderRadius: 4,
+              cursor: 'pointer',
+              fontFamily: 'inherit',
+              fontWeight: instantShipOnly ? 600 : 400,
+            }}
+          >
+            ⚡ Instant-Ship Only{instantShipOnly ? ' · ON' : ''}
+          </button>
+        </FilterGroup>
+
         {/* Clear all filters shortcut */}
         {(galleryId || subGalleryId || shippingOption || workflow !== 'all') && (
           <button
             onClick={() => {
               setSearchParams({ productionStatus: '0' }, { replace: false });
+              // Phase 77: Clear filters also drops the instant-ship toggle —
+              // matches operator expectation that "Clear filters" returns to
+              // the default un-narrowed view.
+              setInstantShipOnly(false);
             }}
             style={{
               padding: '6px 10px',
@@ -1017,9 +1111,28 @@ export default function OrdersListPage() {
               productionStatus !== 'all' ||
               galleryId ||
               subGalleryId ||
-              shippingOption
+              shippingOption ||
+              instantShipOnly
                 ? ' your filters'
                 : ''}
+              {/* Phase 77: explicit ⚡ chip when the instant-ship filter is on,
+                  so the count is unambiguous about WHY it's narrower than the
+                  default view. Sits inline so it doesn't shift layout. */}
+              {instantShipOnly && (
+                <span
+                  style={{
+                    marginLeft: 6,
+                    padding: '1px 6px',
+                    fontSize: 11,
+                    background: 'rgba(224,179,65,0.18)',
+                    color: '#e0b341',
+                    border: '1px solid rgba(224,179,65,0.4)',
+                    borderRadius: 3,
+                  }}
+                >
+                  ⚡ instant-ship only
+                </span>
+              )}
               {pageSize !== 'all' &&
                 total > orders.length &&
                 ` (showing ${orders.length} on this page)`}

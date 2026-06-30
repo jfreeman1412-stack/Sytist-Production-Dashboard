@@ -2610,3 +2610,158 @@ A small mock-pool stubs the three SQL shapes `updateOrderStatus` runs (status-en
 **Phase 76 still ahead — tracking-number sync bug.** Bug 1 from the order-114242 audit (scheduler reads `ssOrder.shipments[].trackingNumber` from `/orders`, which doesn't include the nested shipments array — should call `/shipments`). Corrected impact: **952 affected orders** (`package_code='package'` shipped rows with SS tracking present, local null) between 2026-05-13 and 2026-06-24 (the period the scheduler-driven auto-sync has been losing tracking). Backfill of those 952 is the final step of Phase 76, AFTER the go-forward fix is verified live — explicitly not bundled into Phase 76's first commit.
 
 Files: `server/services/sytistDbService.js`, `server/routes/sytist.js`, `server/scripts/verify-status-guard.js` (new), `CLAUDE.md`.
+
+## 77. Orders-list "⚡ Instant-Ship Only" filter toggle (the Phase-60a-deferred SQL parity)
+
+**The work Phase 60a parked.** Phase 60a shipped the per-SKU `instantPackEligible` flag + the orders-list ⚡ Instant-Ship badge as a display-only classification — and explicitly recorded a landmine: *"When 60b adds an Instant-Pack filter tab or count badge, it MUST gain a `_buildWorkflowSqlPredicate`-style SQL counterpart… otherwise the tab's count silently disagrees with the badge."* Phase 77 is that moment. The orders page gains an "⚡ Instant-Ship Only" toggle for the morning instant-pack workflow — the operator filters the visible orders down to the eligible-only subset to bulk-process. The toggle would have silently produced wrong counts and per-page artifacts if implemented as the audit's initial assumption ("just filter the loaded array, the orders are already on-page") because pagination is server-side; the SQL predicate fulfils the parity the landmine warned about.
+
+**Audit-decision matrix (recorded so the trade-off is visible to a future reader).** Three options were evaluated:
+
+- **A1 — Full JS↔SQL parity including add-ons.** SQL predicate joins `ms_cart_options` and a precomputed addon-mapping list to evaluate addon synthetic line items the same way JS does. ~150 server LOC + harness fixture covering addon-only edge cases. Strictest parity, no per-row divergence.
+- **A2 — Skip flags + packages now, add-ons deferred.** SQL handles the seven `cart_*` skip-flag columns + package parent SKU passing-list (precomputed: a package SKU is eligible iff every non-digital constituent is individually eligible AND ≥1 non-digital constituent exists) + digital-by-config exclusion. Add-ons NOT joined. Documented divergence direction on the ~3.1% of recent open orders carrying any addon. ~80 server LOC.
+- **A3 — Joey's literal initial spec.** Compose against `_physicalItemExistsSql` (which only checks `cart_download` + digital-SKU exclusion) + an eligible-SKU list. ~50 server LOC but silently re-introduces the Phase 64/69 non-product-line bug class: an order with a gift cert / pre-reg / coupon as a separate cart row would be falsely blocked by the SQL (the non-product cart row's SKU isn't on the eligible list) even though JS correctly skips it via `INSTANT_PACK_SKIP_FLAGS`. Rejected because it re-opens the bug pattern that fired twice in this same session.
+
+**Initially locked at A2 with the undercount preference.** Then re-scoped during live verification: see "The 50% lesson" below.
+
+### The 50% lesson — addon divergence sizes against in-filter population, not overall
+
+The A1/A2/A3 audit selected A2 on the assumption that "3.1% of recent open orders carry an addon" was the divergence rate. Live smoke-test against the real Sytist DB on Queue showed something different: **50% overcount in the SQL-filtered set** — of 6 SQL-eligible orders, only 3 had the JS-computed badge=true. The other 3 were Memory Mate (eligible parent SKU 6) + magnet addon (mapped to ineligible SKU 19) — exactly the documented-divergence case in the harness, just much more frequent in production than the in-population audit suggested.
+
+The denominator was wrong. **Addons cluster on exactly the parent SKUs that pass the parent-level eligibility filter.** Memory Mate is the canonical instant-pack candidate (small, light, flat); Memory Mate buyers commonly add the 2-magnet upsell at +$8.49; the magnet addon is default-deny ineligible because magnets aren't `instantPackEligible:true` in `packaging-config.json`. So among orders the SQL filter would have shown the operator, a high fraction would have been wrong. In-population stats undersize this by ~10x relative to in-filter stats.
+
+**Recorded as a generalisable forensic rule (CLAUDE.md landmine):** when estimating divergence cost for any future JS↔SQL parity work, size against the population the filter will actually return — not the overall population. A 3% overall rate can be a 50% in-filter rate if the affected attribute clusters on the filter-passing attribute.
+
+### Option X — extend with blocking-side addon parity
+
+Same phase, same commit. Closes the OVERCOUNT direction by precomputing a blocking-addon `opt_id` list and adding two NOT EXISTS clauses to the SQL predicate.
+
+**`_loadInstantPackBlockingAddonOptIds(eligibleSkuList, digitalSkuList)`:** reads `addon_mappings` synchronously from the dashboard's local SQLite (the addon mappings table — `opt_id`, `type`, `sku`). For each `type='product'` mapping (modifiers don't become line items, ignored), classify the target SKU:
+
+- Target SKU in `digitalSkuList` → addon synthetic gets `flags.download=true` in JS expansion (Phase 43 hotfix 1) → skipped → NOT a blocker.
+- Target SKU in eligible passing list → addon synthetic is physical and eligible → NOT a blocker.
+- Target SKU is non-digital AND not eligible → addon synthetic is physical and ineligible → BLOCKING.
+
+Returns the inline list of `opt_id`s (validated `^\d+$`, emitted unquoted since `ms_cart_options.co_opt_id` is INT — quoting would force MySQL coercion in the IN check). Returns `null` when no blocking mappings exist; the predicate omits the addon clauses entirely (a no-op AND TRUE conjunct would just give the planner extra work).
+
+**Two new NOT EXISTS clauses** in `_buildInstantPackSqlPredicate` (live + archive):
+
+```sql
+AND NOT EXISTS (SELECT 1 FROM ms_cart c2
+                JOIN ms_cart_options x2 ON x2.co_cart_id = c2.cart_id
+                WHERE c2.cart_order = o.order_id
+                  AND <physical predicate for c2>
+                  AND x2.co_opt_id IN (<blockingOptIds>)
+                  AND x2.co_download = 0)
+AND NOT EXISTS (same for ms_cart_archive ca2)
+```
+
+Each clause asserts: no `ms_cart_options` row sits on a *physical* parent (the parent isn't itself skip-flagged) with `co_download = 0` (defensive — a download option wouldn't contribute) and a blocking `opt_id`. The parent-physical guard is what implements the addon-flag-inheritance semantic from `_expandAddonLineItems` (`...li.flags` spread): a skip-flagged parent's addons are inherited-skipped in JS, so SQL must also ignore them.
+
+**Result:** 0% overcount on the previously-affected live set. The 3 magnet-on-Memory-Mate orders that triggered the original 50% overcount are now correctly classified ineligible by both JS and SQL.
+
+### What's still deferred — the UNDERCOUNT direction (structurally empty today)
+
+Theoretically: an order whose only eligible item is a product-type addon (parent is skip-flagged AND has an eligible product addon). JS sees the parent skipped, but the addon synthetic would inherit the parent's skip flag via `...li.flags` and *also* be skipped → JS ineligible. SQL: parent isn't physical so no contribution; addon's positive contribution isn't checked (we only added the blocking-side clause). SQL ineligible. Both agree.
+
+**So the deferred undercount surface is empty under the current `_expandAddonLineItems` semantics.** The "Phase 77b" follow-up only matters if a future expansion change makes addons NOT inherit parent skip flags. Until then, parity is strict in both directions on real data.
+
+**SQL predicate construction** (final shape, post-Option-X).
+
+```js
+function _buildInstantPackSqlPredicate(eligibleSkuList, digitalSkuList, blockingAddonOptIds = null) {
+  if (!eligibleSkuList) return 'FALSE';        // no eligible SKUs → no orders pass
+  const physLive = _physicalForInstantPackSqlFragment('c',  digitalSkuList);
+  const physArch = _physicalForInstantPackSqlFragment('ca', digitalSkuList);
+
+  // (C) Option-X addon clauses — only when blocking opt_ids exist; otherwise
+  //     omit the subqueries entirely (no planner cost).
+  const addonClause = blockingAddonOptIds
+    ? ` AND NOT EXISTS (SELECT 1 FROM ms_cart c2 ` +
+      `JOIN ms_cart_options x2 ON x2.co_cart_id = c2.cart_id ` +
+      `WHERE c2.cart_order = o.order_id ` +
+      `AND ${_physicalForInstantPackSqlFragment('c2', digitalSkuList)} ` +
+      `AND x2.co_opt_id IN (${blockingAddonOptIds}) AND x2.co_download = 0)` +
+      ` AND NOT EXISTS (SELECT 1 FROM ms_cart_archive ca2 ` +
+      `JOIN ms_cart_options x3 ON x3.co_cart_id = ca2.cart_id ` +
+      `WHERE ca2.cart_order = o.order_id ` +
+      `AND ${_physicalForInstantPackSqlFragment('ca2', digitalSkuList)} ` +
+      `AND x3.co_opt_id IN (${blockingAddonOptIds}) AND x3.co_download = 0)`
+    : '';
+
+  return (
+    '(' +
+    // (A) ≥1 physical eligible row in either cart table:
+    `(EXISTS (SELECT 1 FROM ms_cart c WHERE c.cart_order = o.order_id AND ${physLive} AND UPPER(c.cart_sku) IN (${eligibleSkuList}))` +
+    ` OR EXISTS (SELECT 1 FROM ms_cart_archive ca WHERE ca.cart_order = o.order_id AND ${physArch} AND UPPER(ca.cart_sku) IN (${eligibleSkuList})))` +
+    // (B) no physical INELIGIBLE row in either cart table:
+    ` AND NOT EXISTS (SELECT 1 FROM ms_cart c WHERE c.cart_order = o.order_id AND ${physLive} AND UPPER(c.cart_sku) NOT IN (${eligibleSkuList}))` +
+    ` AND NOT EXISTS (SELECT 1 FROM ms_cart_archive ca WHERE ca.cart_order = o.order_id AND ${physArch} AND UPPER(ca.cart_sku) NOT IN (${eligibleSkuList}))` +
+    // (C) no blocking addon on a physical parent in either cart table:
+    addonClause +
+    ')'
+  );
+}
+```
+
+The `(A) AND (B) AND (C)` shape is exactly the JS rule "≥1 physical item AND blockingSkus.length === 0 AND no blocking addon on a physical parent" expressed in SQL. Inlined lists: SKU lists validated `[A-Z0-9 _-]+`, opt_id list validated `^\d+$` and emitted unquoted (ms_cart_options.co_opt_id is INT). All trusted local-config, no injection surface. Both cart tables checked because shipped/archived orders' rows live in `ms_cart_archive` and the filter must work for any production status, not just queue.
+
+**`_physicalForInstantPackSqlFragment` is the JS↔SQL maintenance contract that MUST hold.** The current set of skip-flag columns checked:
+
+| JS flag (`INSTANT_PACK_SKIP_FLAGS`) | SQL column (must be `= 0`) | Sytist column type |
+|---|---|---|
+| `download` | `cart_download` | NOT NULL int default 0 |
+| `giftCert` | `cart_gift_certificate` | NOT NULL int default null |
+| `creditProduct` | `cart_credit_product` | NOT NULL int default null |
+| `booking` | `cart_booking` | NOT NULL int default null |
+| `preSell` | `cart_pre_sell` | NOT NULL int default null |
+| `preRegister` | `cart_pre_register_id` | NOT NULL int default null |
+| `coupon` | `cart_coupon` | NOT NULL int default 0 |
+
+When a new non-product line type appears in Sytist's `ms_cart` with its own `cart_*` column (Phase 64 pre-registration, Phase 69 coupon — the pattern recurs), add it to BOTH the JS const AND `_physicalForInstantPackSqlFragment` in the same commit, alongside every other skip-flag consumer (`processingService` `SKIP_FLAGS`, `darkroomService`, `packingSlipService`, `shipstationService`, `routes/shipstation.js _computeEligibility`). The Phase 64 audit-`cart_*`-columns-for-siblings landmine in CLAUDE.md now lists `_physicalForInstantPackSqlFragment` explicitly. Skipping any one of these silently re-opens the JS↔SQL drift the Phase 60a landmine warned about, and the divergence becomes *larger* than the documented 3.1% addon gap.
+
+**Package parent inclusion in the passing list.** `_loadInstantPackEligibleSkuList()` does the package-expansion work at config-read time so the SQL doesn't have to join MySQL ⨝ SQLite (packages live in local SQLite per Phase 16). Algorithm:
+
+1. Read `packaging-config.json` `productWeights`. Individual SKU is in the passing list iff `category !== 'digital'` AND `instantPackEligible === true`.
+2. Read SQLite `packages` + `package_items` synchronously (`better-sqlite3` is sync, no `await`).
+3. For each package parent: filter constituents to non-digital. If zero non-digital constituents remain → the package is 100% digital → NOT in passing list (an order containing only this package has zero physical items so JS would also say ineligible by the ≥1 rule). Else if every non-digital constituent is individually eligible → the package IS in the passing list.
+4. Validate each SKU against `[A-Z0-9 _-]+` (same as `_loadDigitalSkuList`'s injection-surface treatment), uppercase, return SQL-safe comma-joined single-quoted inline list.
+
+The "include the parent SKU in the passing list" trick is what gives parity without expanding in SQL: JS skips the parent (`isPackageHeader`) and checks each constituent individually; SQL sees the parent's row (with `cart_sku = 'SILVER'` or whatever) and asks "is SILVER in the precomputed list?" — and SILVER is in the list precisely because the JS path would have said yes.
+
+**Client (`OrdersListPage.js`).** `useState` (NOT a URL search-param) — defaults off, doesn't persist across reloads (per spec). Toggle UI sits in the existing filter bar as a `FilterGroup` label "Instant-ship" + a yes/no button styled with the ⚡ glyph to match the per-row `InstantPackBadge`. Amber highlight when active (the `· ON` suffix makes the active state unambiguous). On toggle, page resets to 1 (otherwise an operator on page 5 of an un-filtered view who toggles ON could land past the end of a much shorter filtered set), the selection clears (matching the Phase 4.6 "filters change ⇒ clear selection" pattern — toggling shrinks/expands the visible set so a stale selection would silently apply to the wrong rows), and "Process all filtered" carries the param so the batch operates on exactly the visible subset. The existing per-row badge stays put — every visible row has it when the toggle is ON.
+
+**The "X orders match" indicator.** Updated to include `instantShipOnly` in the "your filters" predicate, plus an inline `⚡ instant-ship only` chip when the toggle is ON so the operator reads at a glance *why* the count is narrower than the default view. Existing soft-cap warning (1000-row ceiling on `pageSize='all'`) is unchanged — the cap applies regardless of which filter narrows.
+
+**Verification.** `server/scripts/verify-instant-pack-eligible.js` **27/27** — the 11 existing Phase 60a JS-side cases (all still pass) PLUS 16 JS↔SQL parity cases driving both `_computeInstantPackEligibility` (the canonical JS) and `_evaluateInstantPackSqlAlgorithmFromCartRows` (the JS encoding of `_buildInstantPackSqlPredicate`'s algorithm — two encodings of the same SQL, code-reviewed for match, harness-verified for behavior). The JS encoding takes the same inputs the SQL would: raw cart rows + raw `ms_cart_options` rows + the eligible/digital/blocking-opt-id lists.
+
+Parity coverage:
+
+1. Two eligible prints
+2. Print + specialty (statuette, default-deny)
+3. Gift cert + eligible print (the Phase-64-class case that A3 would have broken)
+4. Every skip-flag column as its own row + eligible print (each must be skipped or parity breaks)
+5. Digital-by-config (5D, the Phase 45 `cart_download=0` landmine) + eligible print
+6. Digital-only (5D alone, no physical items)
+7. Package parent with all-eligible constituents (SKU 1)
+8. Package with digital constituent (GOLD = 8 + 25; 25 is filtered out)
+9. Package with ineligible constituent (BADPKG = 8 + 20 mug; not in passing list)
+10. 100%-digital package (ALLDIGITAL = 25 + 5D; correctly NOT in passing list)
+
+**Option X — addon blocking-side cases:**
+
+11. Eligible print + ineligible magnet addon (the Memory Mate / magnet shape that drove Option X) → both ineligible
+12. Eligible print + modifier addon → both eligible (modifiers don't expand, not in blocking list)
+13. Eligible print + eligible product addon (opt → Wallets) → both eligible
+14. Eligible print + digital product addon (opt → Digital Download) → both eligible (digital addon synthetic gets download flag, not in blocking list)
+15. Skip-flagged parent + ineligible addon → both ineligible (parent-physical guard makes Option X clause skip; no physical items either side)
+16. Sanity: skip-flagged parent + ELIGIBLE product addon → both ineligible (under current flag-inheritance the addon synthetic also gets skipped; documents that the "deferred undercount" surface is structurally empty today)
+
+**Live two-sided verification (done in-session, before commit).**
+
+- **Pre-Option-X (A2 first cut):** Queue had 6 SQL-eligible orders; 3 had badge=true, **3 had badge=false** (Memory Mate + magnet addon shape). 50% overcount in the filtered set.
+- **Post-Option-X (final):** Queue has 3 SQL-eligible orders; 3 have badge=true, 0 have badge=false. **0% divergence on the previously-affected set.** The 3 magnet-on-Memory-Mate orders (115389 / 115494 / 115501) are now correctly excluded from the filter.
+- Toggle OFF: byte-identical to pre-77 behaviour (route omits `instantShipOnly` entirely; server-side WHERE clause unchanged). Verified by un-filtered Queue total = 28 orders (matches the existing per-row badge distribution; 21.4% of Queue is eligible).
+
+Operator-facing live verification owed (per [[live-verify-gate-changes]]): (a) toggle ON → only ⚡-badged rows visible, "N orders match" reflects the eligible-only total. (b) toggle OFF → returns to the un-filtered view. (c) stacks correctly with other filters (e.g. Workflow + Instant-Ship Only). (d) Page reload → toggle off (no URL persistence).
+
+Files: `server/services/sytistDbService.js`, `server/routes/sytist.js`, `client/src/pages/OrdersListPage.js`, `server/scripts/verify-instant-pack-eligible.js`, `CLAUDE.md`.

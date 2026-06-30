@@ -163,6 +163,381 @@ function _computeInstantPackEligibility(lineItems, predicates) {
   return { eligible, physicalCount: physical.length, blockingSkus };
 }
 
+// ─── Phase 77: SQL parity for the instant-pack badge (filter toggle) ────
+//
+// Background. Phase 60a shipped the eligibility computation as JS-only with
+// an explicit landmine: "The moment Phase 60b adds an Instant-Pack filter
+// tab or count badge, it MUST gain a _buildWorkflowSqlPredicate-style SQL
+// counterpart… otherwise the tab's count silently disagrees with the badge."
+// Phase 77 adds the orders-list "⚡ Instant-Ship Only" toggle, which is the
+// filter-tab case the landmine warned about. The SQL predicate below is the
+// counterpart.
+//
+// Scope (A2 — see SPEC §77 for the A1/A2/A3 decision matrix):
+//   - Skip flags: SQL checks ALL 7 of INSTANT_PACK_SKIP_FLAGS' columns
+//     (cart_download / cart_gift_certificate / cart_credit_product /
+//      cart_booking / cart_pre_sell / cart_pre_register_id / cart_coupon).
+//     This is a STRICTER physical predicate than _physicalItemExistsSql, which
+//     only checks cart_download. The two functions deliberately encode
+//     different definitions of "physical" — _physicalItemExistsSql is for
+//     the digital-only workflow bucket (Phase 60), this is for instant-pack
+//     eligibility. Don't unify them.
+//   - Packages: handled by precomputing the eligible-SKU list to include
+//     package parent SKUs whose ALL non-digital constituents are individually
+//     eligible AND ≥1 non-digital constituent exists. The JS computation
+//     evaluates this by expanding into constituents in-process; the SQL
+//     equivalent is "this package SKU is in the precomputed passing list."
+//     Packages live in local SQLite, individual eligibility lives in
+//     packaging-config.json — both are read each call so operator edits take
+//     effect without a restart (mirrors _loadDigitalSkuList's contract).
+//   - Digital SKUs: excluded via UPPER(cart_sku) NOT IN (digitalSkuList),
+//     same pattern as Phase 60.
+//   - ADD-ONS: deliberately NOT handled in SQL (deferred to a hypothetical
+//     Phase 77a). ~3.1% of recent open orders carry an add-on; for those, the
+//     JS computation evaluates the addon's mapped SKU as a synthetic line item
+//     and the SQL filter ignores it. Documented divergence: see CLAUDE.md
+//     "Instant-pack JS↔SQL parity (Phase 77)" landmine + SPEC §77. The badge
+//     is the per-row authority; the filter is the high-confidence subset.
+//
+// Maintenance contract (the load-bearing piece):
+//   The SQL skip-flag set MUST stay in lockstep with the JS
+//   INSTANT_PACK_SKIP_FLAGS const above. When a future skip-flag is added
+//   (Phase 64-style: a new non-product line type like "booking" /
+//   "preRegister" / "coupon" appears in ms_cart with its own cart_* column),
+//   it MUST be added to BOTH the JS skip set AND the SQL fragment below in
+//   the same commit, or the JS↔SQL divergence becomes larger than the
+//   documented addon gap. Audit ms_cart's cart_* columns for new siblings —
+//   same pattern as Phase 64/69. (Phase 77a, if it ships, would close the
+//   addon gap on the blocking side; the skip-flag-set parity is the
+//   permanent maintenance discipline.)
+
+// Returns a SQL fragment matching a cart row that is PHYSICAL for instant-
+// pack purposes — none of the skip flags is set AND the SKU isn't digital-
+// by-config. Mirrors _computeInstantPackEligibility's per-line physical
+// check (the INSTANT_PACK_SKIP_FLAGS loop + isDigitalSku check). Stricter
+// than _physicalItemExistsSql (which only checks cart_download). Param-free
+// from a security standpoint — digitalSkuList is the validated inline
+// string from _loadDigitalSkuList(). Caller-supplied `cartAlias` is one of
+// 'c' (ms_cart) or 'ca' (ms_cart_archive); the helper doesn't validate that
+// (only the two internal callers use it).
+function _physicalForInstantPackSqlFragment(cartAlias, digitalSkuList) {
+  const c = cartAlias;
+  const skuExclude = digitalSkuList
+    ? ` AND UPPER(${c}.cart_sku) NOT IN (${digitalSkuList})`
+    : '';
+  // The seven skip-flag columns. All are NOT NULL ints (verified at audit
+  // time); `= 0` is the safe comparison. When INSTANT_PACK_SKIP_FLAGS grows,
+  // add the corresponding cart_* column here in the same commit.
+  return (
+    `${c}.cart_download = 0 AND ` +
+    `${c}.cart_gift_certificate = 0 AND ` +
+    `${c}.cart_credit_product = 0 AND ` +
+    `${c}.cart_booking = 0 AND ` +
+    `${c}.cart_pre_sell = 0 AND ` +
+    `${c}.cart_pre_register_id = 0 AND ` +
+    `${c}.cart_coupon = 0` +
+    skuExclude
+  );
+}
+
+// Returns a SQL-safe, uppercased, single-quoted, comma-joined list of the
+// SKUs that should be treated as instant-pack ELIGIBLE at the cart-row
+// level — i.e. either:
+//   (a) individual non-digital SKUs flagged productWeights[sku]
+//       .instantPackEligible = true in packaging-config.json, OR
+//   (b) package parent SKUs (from the local SQLite packages / package_items
+//       tables — Phase 16's storage) whose ALL non-digital constituents are
+//       individually eligible AND ≥1 non-digital constituent exists.
+//
+// The case for (b) — "include the parent SKU" — is what gives us SQL parity
+// without expanding packages in SQL: the JS-side computation skips the
+// package header and checks each constituent's eligibility; the SQL-side
+// equivalent is "this parent SKU is in the precomputed passing list because
+// JS-side it would have classified eligible if expanded."
+//
+// Inlined into SQL (not bound) because the predicate uses it at multiple
+// positions (positive + negative side) and param-array juggling is
+// error-prone. Every SKU is validated [A-Z0-9 _-]+ — no injection surface
+// against trusted local config. Read fresh each call so operator edits take
+// effect without a restart. Returns null when no SKUs pass; callers should
+// treat that as "no orders are eligible" (predicate emits FALSE).
+function _loadInstantPackEligibleSkuList() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(PACKAGING_CONFIG_PATH, 'utf8'));
+    const weights = cfg.productWeights || {};
+
+    // Case-tolerant lookup, mirroring _makePackagingPredicates' rule.
+    const lookup = (sku) => {
+      if (!sku) return null;
+      const raw = String(sku);
+      const upper = raw.toUpperCase();
+      return weights[upper] || (raw !== upper ? weights[raw] : null) || null;
+    };
+    const isDigital = (sku) => {
+      const def = lookup(sku);
+      return !!(def && def.category === 'digital');
+    };
+    const isEligibleIndividual = (sku) => {
+      const def = lookup(sku);
+      return !!(def && def.instantPackEligible === true);
+    };
+
+    const passing = new Set();
+
+    // (a) Individual SKUs: non-digital + instantPackEligible=true.
+    for (const [sku, def] of Object.entries(weights)) {
+      if (!def) continue;
+      if (def.category === 'digital') continue;
+      if (def.instantPackEligible !== true) continue;
+      passing.add(String(sku).toUpperCase());
+    }
+
+    // (b) Package parent SKUs from local SQLite. Read synchronously via
+    // better-sqlite3 (the dashboard's DB handle) — no async needed. If the
+    // packages tables don't exist (fresh install, or DB not yet initialised
+    // in this process), the loop is a no-op and individual SKUs alone form
+    // the list.
+    let packageContents = {};
+    try {
+      const databaseService = require('./database');
+      const db = databaseService.getDb();
+      const rows = db
+        .prepare('SELECT package_sku, item_sku FROM package_items')
+        .all();
+      for (const r of rows) {
+        const pSku = String(r.package_sku);
+        const iSku = String(r.item_sku);
+        if (!packageContents[pSku]) packageContents[pSku] = [];
+        packageContents[pSku].push(iSku);
+      }
+    } catch {
+      // No packages configured / DB not available — fall through.
+    }
+
+    for (const [pkgSku, constituents] of Object.entries(packageContents)) {
+      // Match _expandPackageLineItems' digital-constituent handling: digital
+      // constituents flow through as flags.download=true (Phase 43 hotfix 1),
+      // so they're filtered out of the physical set in JS. Mirror that here.
+      const nonDigital = constituents.filter((s) => !isDigital(s));
+      if (nonDigital.length === 0) {
+        // 100%-digital package → expansion yields no physical items → JS
+        // computation would mark the order ineligible on the "≥1 physical"
+        // rule. So this package SKU does NOT belong in the passing list.
+        continue;
+      }
+      if (nonDigital.every(isEligibleIndividual)) {
+        passing.add(String(pkgSku).toUpperCase());
+      }
+    }
+
+    const validated = [...passing].filter((s) => /^[A-Z0-9 _-]+$/.test(s));
+    return validated.length ? validated.map((s) => `'${s}'`).join(',') : null;
+  } catch {
+    return null;
+  }
+}
+
+// Returns an inline SQL list of numeric co_opt_ids whose addon mapping
+// would create an INELIGIBLE physical synthetic line item — i.e. product-
+// type mappings (modifiers don't become line items, ignored) whose mapped
+// SKU is neither digital (the synthetic would be skipped via flags.download
+// from _expandAddonLineItems' isDigital override) nor in the eligible
+// passing list. Returns null when none, in which case the predicate omits
+// the blocking-addon clauses.
+//
+// Phase 77 Option X: the blocking-side addon parity. The first cut omitted
+// addon handling and showed a 50% overcount rate in the live filtered set —
+// product-type addons (magnets/mouse pads/etc.) cluster on exactly the
+// eligible parent SKUs (Memory Mate buyers commonly add 2 magnets), so the
+// audit's 3.1%-of-all-orders rate understated the in-filter divergence by
+// >10x. This loader + the two new NOT EXISTS clauses in
+// _buildInstantPackSqlPredicate close the OVERCOUNT direction. The
+// undercount direction (parent skip-flagged + eligible product addon → JS
+// eligible, SQL ineligible because addons can't contribute positively in
+// SQL) stays explicitly deferred — Joey's undercount-over-overcount
+// preference, see SPEC §77.
+//
+// Reads addon_mappings synchronously from the dashboard's SQLite DB so the
+// caller doesn't have to await. co_opt_id in ms_cart_options is an INT, so
+// we emit the list UNQUOTED (validated `^\d+$`) — quoting would force
+// MySQL to coerce on every row of the IN check. Loader fails closed
+// (returns null) if SQLite isn't initialised yet; the predicate then
+// skips the blocking-addon clause, which is the same as pre-Option-X
+// behaviour (overcount possible, but no crash).
+function _loadInstantPackBlockingAddonOptIds(eligibleSkuList, digitalSkuList) {
+  if (!eligibleSkuList) return null; // predicate will short-circuit to FALSE anyway
+  // Parse the inline strings (which look like "'8','10','12'") back to
+  // Sets of uppercase SKUs for membership lookup. The list values are
+  // trusted local-config + validated at construction; we just strip the
+  // wrapping single quotes.
+  const parseInlineSkuList = (s) => {
+    if (!s) return new Set();
+    return new Set(
+      s.split(',').map((p) => p.trim().replace(/^'|'$/g, '').toUpperCase())
+    );
+  };
+  const eligibleSet = parseInlineSkuList(eligibleSkuList);
+  const digitalSet = parseInlineSkuList(digitalSkuList);
+
+  let blocking;
+  try {
+    const databaseService = require('./database');
+    const db = databaseService.getDb();
+    const rows = db
+      .prepare(
+        "SELECT opt_id, sku FROM addon_mappings WHERE type = 'product' AND sku IS NOT NULL AND sku != ''"
+      )
+      .all();
+    blocking = rows
+      .filter((r) => {
+        const skuUp = String(r.sku).toUpperCase();
+        // Digital → addon synthetic gets flags.download=true in JS expansion
+        // (Phase 43 hotfix 1) → skipped → never contributes → not a blocker.
+        if (digitalSet.has(skuUp)) return false;
+        // Eligible → addon synthetic is physical and eligible → not a blocker.
+        if (eligibleSet.has(skuUp)) return false;
+        // Non-digital, not eligible → addon synthetic is physical and
+        // ineligible → BLOCKS the order under default-deny.
+        return true;
+      })
+      .map((r) => String(r.opt_id))
+      // co_opt_id is INT — only accept bare numeric opt_ids and emit
+      // unquoted. Any non-numeric mapping ID (shouldn't exist, but
+      // defensive) is dropped rather than risking a coercion bug or
+      // accidental injection surface.
+      .filter((id) => /^\d+$/.test(id));
+  } catch {
+    return null;
+  }
+  return blocking && blocking.length ? blocking.join(',') : null;
+}
+
+// Returns the SQL predicate that an order o.order_id is instant-pack
+// eligible. False (no orders pass) when no eligible SKUs are configured.
+// Composes against _physicalForInstantPackSqlFragment for the strict
+// physical predicate, then asserts:
+//   (A) ≥1 PHYSICAL ELIGIBLE cart row exists in either ms_cart or
+//       ms_cart_archive, AND
+//   (B) NO PHYSICAL INELIGIBLE cart row exists in either table, AND
+//   (C) NO ms_cart_options row on a physical parent maps to a blocking
+//       product-type addon (Option X: closes the overcount direction).
+// Default-deny: a physical row whose SKU is NOT in the passing list, OR
+// an addon whose mapped SKU is NOT in the passing list, blocks the whole
+// order (mirrors _computeInstantPackEligibility's "blockingSkus.length === 0"
+// rule after both package and addon expansion).
+function _buildInstantPackSqlPredicate(
+  eligibleSkuList,
+  digitalSkuList,
+  blockingAddonOptIds = null
+) {
+  if (!eligibleSkuList) {
+    // No eligible SKUs configured at all → predicate matches nothing.
+    return 'FALSE';
+  }
+  const physLive = _physicalForInstantPackSqlFragment('c', digitalSkuList);
+  const physArch = _physicalForInstantPackSqlFragment('ca', digitalSkuList);
+
+  // Build the addon-blocking clauses only when we have a non-empty list.
+  // Empty list ⇒ no addon is blocking, omit the NOT EXISTS subqueries
+  // entirely (a 1=1 conjunct would add work for the planner with no
+  // semantic effect). For each cart-table side, the clause is "no
+  // physical-parent row has a ms_cart_options row whose opt_id is in
+  // the blocking list AND whose co_download is 0" — the co_download=0
+  // guard mirrors _expandAddonLineItems' isDigital handling.
+  const addonClause = blockingAddonOptIds
+    ? ` AND NOT EXISTS (SELECT 1 FROM ms_cart c2 ` +
+      `JOIN ms_cart_options x2 ON x2.co_cart_id = c2.cart_id ` +
+      `WHERE c2.cart_order = o.order_id ` +
+      `AND ${_physicalForInstantPackSqlFragment('c2', digitalSkuList)} ` +
+      `AND x2.co_opt_id IN (${blockingAddonOptIds}) ` +
+      `AND x2.co_download = 0)` +
+      ` AND NOT EXISTS (SELECT 1 FROM ms_cart_archive ca2 ` +
+      `JOIN ms_cart_options x3 ON x3.co_cart_id = ca2.cart_id ` +
+      `WHERE ca2.cart_order = o.order_id ` +
+      `AND ${_physicalForInstantPackSqlFragment('ca2', digitalSkuList)} ` +
+      `AND x3.co_opt_id IN (${blockingAddonOptIds}) ` +
+      `AND x3.co_download = 0)`
+    : '';
+
+  return (
+    '(' +
+    // (A) ≥1 physical eligible row in either table.
+    `(EXISTS (SELECT 1 FROM ms_cart c WHERE c.cart_order = o.order_id ` +
+    `AND ${physLive} AND UPPER(c.cart_sku) IN (${eligibleSkuList}))` +
+    ` OR EXISTS (SELECT 1 FROM ms_cart_archive ca WHERE ca.cart_order = o.order_id ` +
+    `AND ${physArch} AND UPPER(ca.cart_sku) IN (${eligibleSkuList})))` +
+    // (B) No physical ineligible row in either table.
+    ` AND NOT EXISTS (SELECT 1 FROM ms_cart c WHERE c.cart_order = o.order_id ` +
+    `AND ${physLive} AND UPPER(c.cart_sku) NOT IN (${eligibleSkuList}))` +
+    ` AND NOT EXISTS (SELECT 1 FROM ms_cart_archive ca WHERE ca.cart_order = o.order_id ` +
+    `AND ${physArch} AND UPPER(ca.cart_sku) NOT IN (${eligibleSkuList}))` +
+    // (C) No blocking addon on a physical parent in either table.
+    addonClause +
+    ')'
+  );
+}
+
+// JS evaluator mirroring _buildInstantPackSqlPredicate's algorithm for the
+// offline harness. Same inputs the SQL would have (raw cart rows + raw
+// ms_cart_options rows + the eligible/digital lists + blocking-opt-id list),
+// same boolean answer. Two encodings of one algorithm; code review verifies
+// they match, harness verifies this encoding agrees with
+// _computeInstantPackEligibility on the parity fixture. Exposed via the
+// module instance for verify-instant-pack-eligible.js.
+//
+// Phase 77 Option X: cartOptions + blockingAddonOptIds added so the
+// blocking-side addon check is exercised by the harness in lockstep with
+// the SQL clauses.
+function _evaluateInstantPackSqlAlgorithmFromCartRows(cartRows, opts) {
+  const eligibleSet = new Set((opts.eligibleSkus || []).map((s) => String(s).toUpperCase()));
+  const digitalSet = new Set((opts.digitalSkus || []).map((s) => String(s).toUpperCase()));
+  const cartOptions = opts.cartOptions || [];
+  const blockingOptIds = new Set((opts.blockingAddonOptIds || []).map(String));
+  if (eligibleSet.size === 0) return { eligible: false };
+
+  const isPhysical = (row) => {
+    if ((row.cart_download || 0) !== 0) return false;
+    if ((row.cart_gift_certificate || 0) !== 0) return false;
+    if ((row.cart_credit_product || 0) !== 0) return false;
+    if ((row.cart_booking || 0) !== 0) return false;
+    if ((row.cart_pre_sell || 0) !== 0) return false;
+    if ((row.cart_pre_register_id || 0) !== 0) return false;
+    if ((row.cart_coupon || 0) !== 0) return false;
+    const skuUp = String(row.cart_sku || '').toUpperCase();
+    if (digitalSet.has(skuUp)) return false;
+    return true;
+  };
+
+  let hasEligible = false;
+  const physicalCartIds = new Set();
+  for (const row of cartRows) {
+    if (!isPhysical(row)) continue;
+    physicalCartIds.add(row.cart_id);
+    const skuUp = String(row.cart_sku || '').toUpperCase();
+    if (eligibleSet.has(skuUp)) {
+      hasEligible = true;
+    } else {
+      // Blocking ineligible physical row → order fails immediately.
+      return { eligible: false, blockingSku: row.cart_sku };
+    }
+  }
+
+  // Phase 77 Option X — addon blocking-side check. If any ms_cart_options
+  // row sits on a PHYSICAL parent (so the synthetic addon item would not
+  // be skip-inherited away), is product-type (mapped to a blocking SKU),
+  // and isn't itself a download option, the order is ineligible.
+  if (blockingOptIds.size > 0) {
+    for (const optRow of cartOptions) {
+      if ((optRow.co_download || 0) !== 0) continue;
+      if (!physicalCartIds.has(optRow.co_cart_id)) continue;
+      if (blockingOptIds.has(String(optRow.co_opt_id))) {
+        return { eligible: false, blockingAddonOptId: optRow.co_opt_id };
+      }
+    }
+  }
+  return { eligible: hasEligible };
+}
+
 let SHIPPING_MAP = {
   ship_to_home: [],
   ship_to_managers: [],
@@ -967,6 +1342,11 @@ class SytistDbService {
       subGalleryId = null,
       shippingOption = null,
       sort = 'date_asc',  // 'date_asc' (oldest first) | 'date_desc' (newest first)
+      // Phase 77: orders-list "⚡ Instant-Ship Only" filter toggle. When true,
+      // restricts the result set to orders the SQL predicate classifies as
+      // instant-pack eligible (A2 scope: skip flags + packages, addons
+      // deferred). Default false ⇒ no filter, byte-identical to pre-77.
+      instantShipOnly = false,
     } = opts;
 
     const pool = this.getPool();
@@ -1034,6 +1414,34 @@ class SytistDbService {
           ' OR EXISTS (SELECT 1 FROM ms_cart_archive ca WHERE ca.cart_order = o.order_id AND ca.cart_sub_gal_id = ?))'
       );
       params.push(subGalleryId, subGalleryId);
+    }
+
+    // Phase 77: instant-pack eligibility filter (the orders-list
+    // "⚡ Instant-Ship Only" toggle). Composes as AND with every other
+    // filter. _buildInstantPackSqlPredicate returns 'FALSE' when no
+    // eligible SKUs are configured — that's the right answer (no orders
+    // pass), and the COUNT(*) total falls to 0 in the same query so the
+    // operator sees "No orders match" rather than a misleading number.
+    // Reads packaging-config + local SQLite each call (mirrors
+    // _loadDigitalSkuList's no-restart-needed contract).
+    if (instantShipOnly) {
+      const eligibleSkuList = _loadInstantPackEligibleSkuList();
+      // Phase 77 Option X: precompute the blocking-addon opt_ids the SQL
+      // predicate needs. The list closes the overcount direction (parent
+      // eligible + ineligible product addon) — the addon-clusters-on-eligible-
+      // parents reality that made the no-addon-handling A2 fire 50% overcount
+      // in live data on Memory Mate / magnet orders.
+      const blockingAddonOptIds = _loadInstantPackBlockingAddonOptIds(
+        eligibleSkuList,
+        digitalSkuList
+      );
+      where.push(
+        _buildInstantPackSqlPredicate(
+          eligibleSkuList,
+          digitalSkuList,
+          blockingAddonOptIds
+        )
+      );
     }
 
     const limitSafe = Math.max(1, Math.min(parseInt(limit, 10) || 50, 1000));
@@ -2905,4 +3313,13 @@ _instance._categorizeShipping = categorizeShipping;
 // builds those predicates from a productWeights map for in-harness realism.
 _instance._computeInstantPackEligibility = _computeInstantPackEligibility;
 _instance._makePackagingPredicates = _makePackagingPredicates;
+// Phase 77: expose the SQL-parity helpers so verify-instant-pack-eligible.js
+// can drive them without a DB. The harness asserts that
+// _evaluateInstantPackSqlAlgorithmFromCartRows (the JS encoding of the SQL
+// predicate) agrees with _computeInstantPackEligibility on a fixture — that's
+// the load-bearing test the Phase 60a landmine specifically warned about.
+_instance._evaluateInstantPackSqlAlgorithmFromCartRows = _evaluateInstantPackSqlAlgorithmFromCartRows;
+_instance._buildInstantPackSqlPredicate = _buildInstantPackSqlPredicate;
+_instance._physicalForInstantPackSqlFragment = _physicalForInstantPackSqlFragment;
+_instance._loadInstantPackBlockingAddonOptIds = _loadInstantPackBlockingAddonOptIds;
 module.exports = _instance;

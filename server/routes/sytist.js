@@ -544,6 +544,15 @@ router.get('/orders', async (req, res) => {
       opts.subGalleryId = parseInt(req.query.subGalleryId, 10);
     if (req.query.shippingOption) opts.shippingOption = req.query.shippingOption;
     if (req.query.sort) opts.sort = req.query.sort;
+    // Phase 77: instant-pack-only filter toggle. Accept both 'true' and '1'
+    // so the client can use whichever URL-encoding flavor is convenient; any
+    // other value (including absent) is the default off. The toggle is
+    // intentionally NOT URL-persisted on the client (useState, not search
+    // params) so page reloads return to the default — but at the wire layer
+    // it's a normal query param.
+    if (req.query.instantShipOnly === 'true' || req.query.instantShipOnly === '1') {
+      opts.instantShipOnly = true;
+    }
 
     const result = await sytistDb.getOrdersByWorkflow(opts);
 
