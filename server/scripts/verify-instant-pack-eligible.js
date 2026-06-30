@@ -123,7 +123,12 @@ const cases = [
 let pass = 0;
 const fails = [];
 for (const [name, items, wantEligible, blockingMustContain] of cases) {
-  const got = compute(items, predicates);
+  // Phase 79: every existing case is a SKU-rule test (the section above
+  // covers the per-line physical / digital / package rules). Pass
+  // workflow='ship_to_home' so the Phase 79 gate is satisfied and the
+  // case exercises what it's intended to — the SKU logic. Workflow-gate
+  // coverage lives in its own section below.
+  const got = compute(items, predicates, 'ship_to_home');
   let ok = got.eligible === wantEligible;
   // When the case names blocking SKUs, every one must appear in blockingSkus.
   if (ok && Array.isArray(blockingMustContain) && blockingMustContain.length) {
@@ -140,7 +145,56 @@ for (const [name, items, wantEligible, blockingMustContain] of cases) {
   }
 }
 
-console.log(`\n${pass}/${cases.length} instant-pack eligibility cases pass`);
+// ─── Phase 79: workflow gate (JS-side _computeInstantPackEligibility) ─────
+//
+// The rule's first clause: workflow MUST be 'ship_to_home'. Literal allow-
+// list (not a deny-list), default-deny on missing/unknown, matches Phase 60a's
+// SKU default-deny discipline at a different layer. Explicit cases for each
+// non-home workflow so the rule's intent is documented in the harness, not
+// just implied by "not ship_to_home → fail".
+console.log('\n--- Phase 79 JS workflow gate ---');
+const workflowGateCases = [
+  // Positive: ship_to_home + eligible SKUs → eligible.
+  ['ship_to_home + eligible prints → eligible',
+    'ship_to_home', [li('8', {}), li('10', {})], true],
+  // The three non-home workflows: each ineligible regardless of SKU.
+  ['ship_to_managers + eligible prints → ineligible (gate fires)',
+    'ship_to_managers', [li('8', {}), li('10', {})], false],
+  ['ship_to_league + eligible prints → ineligible (gate fires)',
+    'ship_to_league', [li('8', {}), li('10', {})], false],
+  ['digital + eligible prints → ineligible (gate fires; explicit allow-list)',
+    'digital', [li('8', {}), li('10', {})], false],
+  // Missing / unknown workflow: default-deny (the principal Phase 60a/79 rule).
+  ['undefined workflow + eligible prints → ineligible (default-deny on missing)',
+    undefined, [li('8', {}), li('10', {})], false],
+  ['unknown workflow value + eligible prints → ineligible (default-deny on unknown)',
+    'ship_to_custom', [li('8', {}), li('10', {})], false],
+  // Combined: ship_to_home + ineligible SKU → still ineligible (rule 2 still fires
+  // under rule 1; the workflow gate is the OUTER guard, not a bypass).
+  ['ship_to_home + ineligible SKU (mug) → ineligible (rule 2 still applies)',
+    'ship_to_home', [li('8', {}), li('20', {})], false],
+];
+let wfPass = 0;
+const wfFails = [];
+for (const [name, workflow, items, wantEligible] of workflowGateCases) {
+  const got = compute(items, predicates, workflow);
+  const ok = got.eligible === wantEligible;
+  if (ok) {
+    wfPass++;
+    console.log(`  PASS  ${name}`);
+  } else {
+    wfFails.push(name);
+    console.log(`  FAIL  ${name}`);
+    console.log(`         got ${JSON.stringify(got)} want eligible=${wantEligible}`);
+  }
+}
+
+console.log(`\n${pass}/${cases.length} instant-pack SKU-rule cases pass`);
+console.log(`${wfPass}/${workflowGateCases.length} Phase 79 workflow-gate cases pass`);
+pass += wfPass;
+fails.push(...wfFails);
+const totalCases = cases.length + workflowGateCases.length;
+console.log(`\n${pass}/${totalCases} JS-side total`);
 
 // ─── Phase 77: SQL-parity section ──────────────────────────────────────
 //
@@ -393,12 +447,16 @@ let parityPass = 0;
 const parityFails = [];
 console.log('\n--- Phase 77 Option X: JS↔SQL parity (addon-blocking-side closed) ---');
 for (const [name, jsItems, cartRows, cartOptions, wantJs, wantSql, knownDivergence] of parityCases) {
-  const jsRes = compute(jsItems, predicates);
+  // Phase 79: every existing parity case targets SKU-rule parity. Pass
+  // workflow='ship_to_home' on both sides so the Phase 79 gate is
+  // satisfied; gate-specific parity coverage lives in the new section below.
+  const jsRes = compute(jsItems, predicates, 'ship_to_home');
   const sqlRes = sqlEval(cartRows, {
     eligibleSkus,
     digitalSkus,
     cartOptions,
     blockingAddonOptIds,
+    workflow: 'ship_to_home',
   });
   const jsOk = jsRes.eligible === wantJs;
   const sqlOk = sqlRes.eligible === wantSql;
@@ -419,12 +477,57 @@ for (const [name, jsItems, cartRows, cartOptions, wantJs, wantSql, knownDivergen
 
 console.log(`\n${parityPass}/${parityCases.length} Phase 77 JS↔SQL parity cases pass`);
 
-const totalPass = pass + parityPass;
-const totalCount = cases.length + parityCases.length;
+// ─── Phase 79: JS↔SQL workflow-gate parity ─────────────────────────────
+//
+// Eligible-SKU fixture intact (same cart row 8 used as the "would pass SKU
+// rules" case). Each case asserts: JS gate result = SQL gate result for the
+// given workflow value. The SKU rules are held constant (an eligible print);
+// only the workflow varies. The four classified workflows + the undefined +
+// the unknown-value case round out the gate's decision surface.
+console.log('\n--- Phase 79: JS↔SQL workflow-gate parity ---');
+const gateParityCases = [
+  // workflow, wantJs, wantSql
+  ['ship_to_home  → both eligible',      'ship_to_home',     true,  true],
+  ['ship_to_managers → both ineligible', 'ship_to_managers', false, false],
+  ['ship_to_league → both ineligible',   'ship_to_league',   false, false],
+  ['digital → both ineligible',          'digital',          false, false],
+  ['undefined → both ineligible (default-deny)', undefined,  false, false],
+  ['unknown value → both ineligible (default-deny)', 'ship_to_custom', false, false],
+];
+let gatePass = 0;
+const gateFails = [];
+for (const [name, workflow, wantJs, wantSql] of gateParityCases) {
+  const jsItems = [li('8', {})]; // eligible print, SKU rule satisfied
+  const cartRows = [row('8', { cart_id: 200 })];
+  const jsRes = compute(jsItems, predicates, workflow);
+  const sqlRes = sqlEval(cartRows, {
+    eligibleSkus,
+    digitalSkus,
+    cartOptions: [],
+    blockingAddonOptIds,
+    workflow,
+  });
+  const jsOk = jsRes.eligible === wantJs;
+  const sqlOk = sqlRes.eligible === wantSql;
+  const parityOk = jsRes.eligible === sqlRes.eligible;
+  if (jsOk && sqlOk && parityOk) {
+    gatePass++;
+    console.log('  PASS  ' + name);
+  } else {
+    gateFails.push(name);
+    console.log('  FAIL  ' + name);
+    console.log(`         js=${jsRes.eligible} want=${wantJs}; sql=${sqlRes.eligible} want=${wantSql}; parityOk=${parityOk}`);
+  }
+}
+
+console.log(`\n${gatePass}/${gateParityCases.length} Phase 79 workflow-gate parity cases pass`);
+
+const totalPass = pass + parityPass + gatePass;
+const totalCount = cases.length + workflowGateCases.length + parityCases.length + gateParityCases.length;
 console.log(`\n${totalPass}/${totalCount} total instant-pack cases pass`);
 
-if (fails.length || parityFails.length) {
-  console.error('FAILURES:\n  ' + [...fails, ...parityFails].join('\n  '));
+if (fails.length || parityFails.length || gateFails.length) {
+  console.error('FAILURES:\n  ' + [...fails, ...parityFails, ...gateFails].join('\n  '));
   process.exit(1);
 }
 process.exit(0);

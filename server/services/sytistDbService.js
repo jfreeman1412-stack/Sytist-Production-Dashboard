@@ -178,12 +178,34 @@ function _makePackagingPredicates(productWeights) {
 // they are ignored for free. Package constituents and product-type add-ons
 // are evaluated by their OWN sku (each synthetic line item carries its own).
 //
-// An order is instant-pack eligible iff it has ≥1 physical item AND every
-// physical item's sku is on the eligible list. blockingSkus lists the
-// physical SKUs that are NOT eligible (deduped, in first-seen order) — these
-// are exactly why an order with a physical item fails, including specialty /
-// drop-ship SKUs that pass isPhysical but are default-deny-ineligible.
-function _computeInstantPackEligibility(lineItems, predicates) {
+// An order is instant-pack eligible iff:
+//   (Phase 79) workflow === 'ship_to_home' — manager/league/digital are
+//              hand-delivery or download-only, never packed-and-shipped, so
+//              the "instant ship" concept doesn't apply regardless of SKU mix.
+//              Literal allow-list (not `!== 'ship_to_managers' && ...`) so
+//              future workflow values default-deny until explicitly added.
+//   (Phase 60a) ≥1 physical item, AND every physical item's SKU is on the
+//              eligible list. blockingSkus lists the physical SKUs that are
+//              NOT eligible (deduped, in first-seen order) — these are
+//              exactly why an order with a physical item fails, including
+//              specialty / drop-ship SKUs that pass isPhysical but are
+//              default-deny-ineligible.
+function _computeInstantPackEligibility(lineItems, predicates, workflow) {
+  // Phase 79: workflow gate. Default-deny on missing/unknown workflow
+  // matches the SKU default-deny from Phase 60a — same discipline at a
+  // different layer. The SQL counterpart in _buildInstantPackSqlPredicate
+  // composes against _buildWorkflowSqlPredicate('ship_to_home', …) to
+  // enforce the same gate at the SQL layer; the two encodings must agree
+  // (verify-instant-pack-eligible.js asserts it).
+  if (workflow !== 'ship_to_home') {
+    return {
+      eligible: false,
+      physicalCount: 0,
+      blockingSkus: [],
+      reason: 'non_home_workflow',
+    };
+  }
+
   const isDigitalSku = (predicates && predicates.isDigitalSku) || (() => false);
   const isEligibleSku = (predicates && predicates.isEligibleSku) || (() => false);
 
@@ -460,26 +482,42 @@ function _loadInstantPackBlockingAddonOptIds(eligibleSkuList, digitalSkuList) {
 }
 
 // Returns the SQL predicate that an order o.order_id is instant-pack
-// eligible. False (no orders pass) when no eligible SKUs are configured.
-// Composes against _physicalForInstantPackSqlFragment for the strict
-// physical predicate, then asserts:
+// eligible. Returns `{ sql, params }` (Phase 79 — was bare `sql` pre-79).
+// The return-shape change carries the workflow-gate predicate's bound
+// parameters; `_buildWorkflowSqlPredicate('ship_to_home', …)` returns the
+// same shape and is the precedent we follow. The caller in
+// getOrdersByWorkflow pushes both the `sql` into `where` and the `params`
+// into `params` — same composition pattern the workflow filter already uses.
+//
+// FALSE (no orders pass) when no eligible SKUs are configured OR no
+// workflow gate is supplied (default-deny on missing gate, matching the
+// JS-side `workflow !== 'ship_to_home' → ineligible` rule).
+//
+// Composes:
+//   (D) Phase 79 — workflow gate. Order's workflow MUST be 'ship_to_home'.
+//       Manager / league / digital orders are categorically ineligible.
+//       Single source of truth: the same _buildWorkflowSqlPredicate the
+//       URL workflow filter uses, so an instant-ship-filtered list with
+//       URL `workflow=ship_to_managers` returns zero rows correctly
+//       (the two gates conjoin, the manager gate excludes home, the
+//       home gate excludes manager, intersection is empty).
 //   (A) ≥1 PHYSICAL ELIGIBLE cart row exists in either ms_cart or
-//       ms_cart_archive, AND
-//   (B) NO PHYSICAL INELIGIBLE cart row exists in either table, AND
+//       ms_cart_archive (Phase 60a rule).
+//   (B) NO PHYSICAL INELIGIBLE cart row exists in either table (Phase 60a).
 //   (C) NO ms_cart_options row on a physical parent maps to a blocking
-//       product-type addon (Option X: closes the overcount direction).
-// Default-deny: a physical row whose SKU is NOT in the passing list, OR
-// an addon whose mapped SKU is NOT in the passing list, blocks the whole
-// order (mirrors _computeInstantPackEligibility's "blockingSkus.length === 0"
-// rule after both package and addon expansion).
+//       product-type addon (Phase 77 Option X — overcount-direction close).
 function _buildInstantPackSqlPredicate(
   eligibleSkuList,
   digitalSkuList,
-  blockingAddonOptIds = null
+  blockingAddonOptIds = null,
+  workflowGate = null
 ) {
-  if (!eligibleSkuList) {
-    // No eligible SKUs configured at all → predicate matches nothing.
-    return 'FALSE';
+  if (!eligibleSkuList || !workflowGate || !workflowGate.sql) {
+    // No eligible SKUs OR no workflow gate → predicate matches nothing.
+    // Default-deny mirrors the JS-side missing-workflow path
+    // (_computeInstantPackEligibility returns eligible:false when
+    // workflow !== 'ship_to_home', so the SQL counterpart agrees).
+    return { sql: 'FALSE', params: [] };
   }
   const physLive = _physicalForInstantPackSqlFragment('c', digitalSkuList);
   const physArch = _physicalForInstantPackSqlFragment('ca', digitalSkuList);
@@ -506,7 +544,7 @@ function _buildInstantPackSqlPredicate(
       `AND x3.co_download = 0)`
     : '';
 
-  return (
+  const skuPredicate =
     '(' +
     // (A) ≥1 physical eligible row in either table.
     `(EXISTS (SELECT 1 FROM ms_cart c WHERE c.cart_order = o.order_id ` +
@@ -520,8 +558,16 @@ function _buildInstantPackSqlPredicate(
     `AND ${physArch} AND UPPER(ca.cart_sku) NOT IN (${eligibleSkuList}))` +
     // (C) No blocking addon on a physical parent in either table.
     addonClause +
-    ')'
-  );
+    ')';
+
+  // (D) Workflow gate AND-composed at the outermost level so the gate
+  // applies regardless of what the URL `workflow` filter is (e.g. if the
+  // operator selects `workflow=all` + `instantShipOnly=true`, the gate
+  // still narrows to ship_to_home).
+  return {
+    sql: `(${workflowGate.sql} AND ${skuPredicate})`,
+    params: workflowGate.params ? workflowGate.params.slice() : [],
+  };
 }
 
 // JS evaluator mirroring _buildInstantPackSqlPredicate's algorithm for the
@@ -535,7 +581,16 @@ function _buildInstantPackSqlPredicate(
 // Phase 77 Option X: cartOptions + blockingAddonOptIds added so the
 // blocking-side addon check is exercised by the harness in lockstep with
 // the SQL clauses.
+// Phase 79: opts.workflow added so the harness verifies the workflow gate
+// is enforced on the SQL side identically to the JS side
+// (_computeInstantPackEligibility). Default-deny on missing.
 function _evaluateInstantPackSqlAlgorithmFromCartRows(cartRows, opts) {
+  // Phase 79: workflow gate. Mirrors the SQL predicate's (D) clause —
+  // _buildInstantPackSqlPredicate AND-composes against
+  // _buildWorkflowSqlPredicate('ship_to_home', …). Missing/non-home
+  // workflow → ineligible, same default-deny as _computeInstantPackEligibility.
+  if (opts.workflow !== 'ship_to_home') return { eligible: false };
+
   const eligibleSet = new Set((opts.eligibleSkus || []).map((s) => String(s).toUpperCase()));
   const digitalSet = new Set((opts.digitalSkus || []).map((s) => String(s).toUpperCase()));
   const cartOptions = opts.cartOptions || [];
@@ -1482,13 +1537,22 @@ class SytistDbService {
         eligibleSkuList,
         digitalSkuList
       );
-      where.push(
-        _buildInstantPackSqlPredicate(
-          eligibleSkuList,
-          digitalSkuList,
-          blockingAddonOptIds
-        )
+      // Phase 79: workflow gate. Instant-pack only applies to ship_to_home —
+      // manager/league/digital orders never qualify regardless of SKU mix.
+      // Build the ship_to_home predicate via the same helper the URL workflow
+      // filter uses, so a future change to ship_to_home classification flows
+      // through to both gates automatically. _buildInstantPackSqlPredicate
+      // returns {sql, params} so the workflow gate's bound option-name
+      // arrays are carried into the outer query.
+      const wfHome = _buildWorkflowSqlPredicate('ship_to_home', digitalSkuList);
+      const p = _buildInstantPackSqlPredicate(
+        eligibleSkuList,
+        digitalSkuList,
+        blockingAddonOptIds,
+        wfHome
       );
+      where.push(p.sql);
+      params.push(...p.params);
     }
 
     const limitSafe = Math.max(1, Math.min(parseInt(limit, 10) || 50, 1000));
@@ -1871,9 +1935,12 @@ class SytistDbService {
       );
 
       // Phase 60a: instant-pack eligibility over the expanded line items.
+      // Phase 79: workflow gate — pass shipping.workflow so manager/league/
+      // digital orders are correctly ineligible regardless of SKU mix.
       const instantPack = _computeInstantPackEligibility(
         expandedLineItems,
-        instantPackPredicates
+        instantPackPredicates,
+        shipping.workflow
       );
 
       return {
@@ -2449,7 +2516,10 @@ class SytistDbService {
     } catch (e) {
       console.warn(`[SytistDB] instant-pack predicates unavailable (default-deny): ${e.message}`);
     }
-    const instantPack = _computeInstantPackEligibility(expandedLineItems, instantPackPredicates);
+    // Phase 79: workflow gate — pass shipping.workflow so the detail-page
+    // shape matches the orders-list badge under the same rule (gate at
+    // both encodings, no drift).
+    const instantPack = _computeInstantPackEligibility(expandedLineItems, instantPackPredicates, shipping.workflow);
 
     return {
       source: 'sytist',

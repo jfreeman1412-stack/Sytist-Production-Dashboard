@@ -2868,3 +2868,97 @@ The cart-note preview is shorter (80 vs 100) in the "both" case so the order-lev
 - **Operator-facing live verification owed:** open the orders list, find a Queue order with a note, confirm the 💬 badge renders + the tooltip shows the truncated note on hover. Confirm orders WITHOUT notes show no badge. Confirm InstantPack + LastProcess badges still render alongside without visual collision.
 
 **Files:** `server/services/sytistDbService.js`, `client/src/pages/OrdersListPage.js`, `server/scripts/verify-customer-notes-badge.js` (new), `CLAUDE.md`.
+
+## 79. Workflow gate on instant-pack eligibility (badge + filter): `ship_to_home` only
+
+**The pre-audit caught a real operational bug, not pure future-proofing.** Phase 60a's `_computeInstantPackEligibility` (the ⚡ badge) and Phase 77's `_buildInstantPackSqlPredicate` (the "⚡ Instant-Ship Only" filter) checked SKU eligibility only. Neither checked workflow. So a `ship_to_managers` or `ship_to_league` order with all-eligible SKUs was incorrectly marked instant-ship eligible — even though managers/leagues are hand-delivery workflows (coach pickup; league rep pickup), never packed-and-shipped.
+
+**The pre-audit population (instantShipOnly SQL filter, all-status, all-time, before Phase 79):**
+
+| URL workflow filter | SQL says "eligible" |
+|---|---|
+| `ship_to_home` | 6,773 ✓ |
+| `ship_to_managers` | **798 ⚠** (incorrectly included) |
+| `ship_to_league` | **508 ⚠** (incorrectly included) |
+| `digital` | 0 |
+| `all` | **8,079** (= 6,773 + 798 + 508) |
+
+**~16% of currently-SQL-eligible orders were non-home.** Phase 60a/77 had been silently overcounting since their shipdates. The fix is a correction to operator-intended behavior, not just future-proofing.
+
+**The corrected rule, in clause order (fail-fast on the cheapest check):**
+
+1. **(Phase 79)** `workflow === 'ship_to_home'` — literal allow-list. Manager / league / digital workflows categorically ineligible regardless of SKU mix.
+2. **(Phase 60a)** ≥1 physical item. "Physical" = not isPackageHeader, none of `INSTANT_PACK_SKIP_FLAGS`, not digital-by-config.
+3. **(Phase 60a)** Every physical item's SKU is on the eligible list.
+
+**Why a literal allow-list, not a deny-list.** Joey's spec called this out explicitly. `workflow === 'ship_to_home'` defaults to ineligible for any unknown value (a future `'ship_to_custom'`, a misclassified row, an undefined input). A `!== 'ship_to_managers' && !== 'ship_to_league'` shape would silently *include* unknown values — exactly the bug class the audit just surfaced. The harness verifies the discipline with explicit `undefined` and `'ship_to_custom'` cases.
+
+**JS-side change.** `_computeInstantPackEligibility(lineItems, predicates, workflow)` — new third arg. Top of function:
+
+```js
+if (workflow !== 'ship_to_home') {
+  return { eligible: false, physicalCount: 0, blockingSkus: [], reason: 'non_home_workflow' };
+}
+```
+
+Both call sites (`getOrdersByWorkflow:1874` and `getOrderById:2452`) updated to pass `shipping.workflow` — already in scope from the `categorizeShipping(...)` call that runs immediately before eligibility. Two-line change at each site.
+
+**SQL-side change.** `_buildInstantPackSqlPredicate(eligibleSkuList, digitalSkuList, blockingAddonOptIds, workflowGate)` — new fourth arg. Return shape change from bare `sql` to `{sql, params}` so the workflow gate's bound option-name array (from `_buildWorkflowSqlPredicate`'s `mappedNames`/`allMappedNames` arrays) survives into the outer query. The change follows `_buildWorkflowSqlPredicate`'s precedent shape.
+
+```js
+// Default-deny on missing workflow gate, matching the JS-side
+// missing-workflow path.
+if (!eligibleSkuList || !workflowGate || !workflowGate.sql) {
+  return { sql: 'FALSE', params: [] };
+}
+// ... build (A)/(B)/(C) clauses as before ...
+return {
+  sql: `(${workflowGate.sql} AND ${skuPredicate})`,
+  params: workflowGate.params.slice(),
+};
+```
+
+**The gate uses the SAME `_buildWorkflowSqlPredicate` helper as the URL workflow filter.** Critical for single-source-of-truth maintenance: a future change to ship_to_home classification (e.g. new shipping-option names added to `SHIPPING_MAP.ship_to_home` in `shipping-mapping.json`) flows through to *both* gates automatically. Don't reimplement ship_to_home classification inline in `_buildInstantPackSqlPredicate` — that would be a drift surface the next time SHIPPING_MAP changes. CLAUDE.md landmine documents this.
+
+**Call site in `getOrdersByWorkflow`:**
+
+```js
+if (instantShipOnly) {
+  const eligibleSkuList = _loadInstantPackEligibleSkuList();
+  const blockingAddonOptIds = _loadInstantPackBlockingAddonOptIds(eligibleSkuList, digitalSkuList);
+  const wfHome = _buildWorkflowSqlPredicate('ship_to_home', digitalSkuList);
+  const p = _buildInstantPackSqlPredicate(eligibleSkuList, digitalSkuList, blockingAddonOptIds, wfHome);
+  where.push(p.sql);
+  params.push(...p.params);
+}
+```
+
+**Outermost-level AND.** The gate AND-composes at the outermost level of the predicate — so it applies regardless of what the URL `workflow` filter is. If an operator picks `workflow=all` + `instantShipOnly=true`, the SQL still narrows to home. If they pick `workflow=ship_to_managers` + `instantShipOnly=true`, the SQL returns 0 rows (the two gates conjoin: manager gate excludes home, home gate excludes manager, intersection is empty). That's the right answer — instant-ship doesn't apply to managers, so the filter showing nothing matches the rule.
+
+**Verification.**
+
+`server/scripts/verify-instant-pack-eligible.js` **40/40**:
+- 11 existing JS SKU-rule cases (updated to pass `workflow: 'ship_to_home'` so they continue to test SKU logic post-Phase-79)
+- **7 new JS workflow-gate cases**: each non-home workflow (`ship_to_managers`, `ship_to_league`, `digital`) explicitly ineligible; positive `ship_to_home` case; default-deny on `undefined` workflow; default-deny on unknown `'ship_to_custom'` value; combined `ship_to_home` + ineligible SKU (mug) still ineligible (rule 2 still fires under rule 1)
+- 16 existing JS↔SQL parity cases (updated similarly to pass `workflow: 'ship_to_home'` on both sides)
+- **6 new workflow-gate parity cases**: each workflow value tested on BOTH JS and SQL sides for parity (ship_to_home eligible/eligible; managers/league/digital/undefined/unknown all ineligible on both sides)
+
+**Live two-sided verification — done in-session before commit:**
+
+- **Pre-fix vs post-fix SQL counts** (same query, `instantShipOnly=true`):
+
+| URL workflow | Pre-fix | Post-fix | Delta |
+|---|---|---|---|
+| `ship_to_home` | 6,773 | **6,774** | +1 (a new home order between runs; rounding) |
+| `ship_to_managers` | 798 | **0** | -798 |
+| `ship_to_league` | 508 | **0** | -508 |
+| `digital` | 0 | 0 | — |
+| `all` | 8,079 | **6,774** | **-1,305 (= 798 + 508, exact)** |
+
+- **Operational-intuition spot-check on 3 specific affected orders** (per Joey's verification ask — confirm these are unambiguous hand-delivery, not data-integrity surprises):
+  - **73842 Angela Mahrt** (2024-08-31): `ship_to_managers`, "Discounted Group Shipping" $1.00, Memory Mate (SKU 6 eligible). Coach-pickup workflow. Now badge=false ✓
+  - **74178 Sarah Barrett** (2024-09-06): `ship_to_managers`, "Discounted Group Shipping" $1.00, 5x7 Team + 5x7 Individual (both eligible). Same. Now badge=false ✓
+  - **75029 Sue Nelson** (2024-09-20): `ship_to_league`, "Free Shipping to League Representative" $0.00, Memory Mate. The shipping option name explicitly says "to League Representative" — unambiguously hand-delivery. Now badge=false ✓
+- Sample ship_to_home orders (60879 / 73530 / 73552) still badge=true. Home-workflow eligibility unaffected.
+
+**Files:** `server/services/sytistDbService.js`, `server/scripts/verify-instant-pack-eligible.js`, `CLAUDE.md`. **NOT touched:** `processingService.js`, `darkroomService.js`, `schedulerService.js`, `routes/sytist.js`, client code (badge + filter UI consume the eligibility result, which the server now produces correctly; no client change needed).
