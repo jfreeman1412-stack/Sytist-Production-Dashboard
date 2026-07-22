@@ -636,6 +636,21 @@ Format: phase number → short title → what shipped → key files touched.
 
 ---
 
+## Phase 80 — Blocking-package-parent check: close the cart_download=1-hides-package hole in the SQL filter
+
+- **The bug (order 116500 Lacie Herman was the first spotted):** Silver Package (SKU 2) and Gold/Super Star Package (SKU 1) parent rows are ALWAYS marked `cart_download=1` by Sytist because both contain SKU 25 (Digital Download) as a bonus constituent. Phase 77's `_physicalForInstantPackSqlFragment` requires `cart_download=0`, so those package parents are INVISIBLE to the SQL eligibility check — the predicate sees only the standalone eligible SKUs (like a 5x7) and (incorrectly) says "eligible" while the JS side correctly expands the package, sees the ineligible constituent (magnets, mouse pad, buttons, trading cards), and says "ineligible." Root cause is Sytist-side propagation; the dashboard can't change what Sytist writes.
+- **Diagnostic:** pre-fix full SQL-eligible set was **7,044**; 1000-order sample cross-checked against JS badge showed **9 divergent (0.9%)**; root-cause split (with `ms_cart_archive` included) was **9 package-only, 0 addon-only, 0 both, 0 neither** — Phase 77 Option X is doing its addon job correctly; this was a distinct package-parent-visibility class. An earlier "497 addon-only" audit turned out to be a false alarm from running a truncated predicate that omitted Option X's blocking clause.
+- **The fix (Option-X-style — additive, localised):**
+  - New sync loader `_loadInstantPackBlockingPackageParentSkuList()` — reads local SQLite `packages` + `package_items`, returns SKUs of packages whose non-digital constituents include any ineligible SKU. Today: `{1, 2}`. Same read-fresh-each-query contract as `_loadDigitalSkuList` / `_loadInstantPackEligibleSkuList` (operator edits take effect without a restart). Same `[A-Z0-9 _-]+` validation as the other inline-SQL lists.
+  - New SQL clause (E) in `_buildInstantPackSqlPredicate`: two `NOT EXISTS` clauses over `ms_cart × ms_cart_archive` checking `UPPER(cart_sku) IN (blockingList)`. **NO skip-flag conditions — deliberate load-bearing detail.** The whole reason for this clause is `cart_download=1` on the parent; requiring `cart_download=0` here would put us right back in the bug. CLAUDE.md landmine documents this explicitly.
+  - `getOrdersByWorkflow` call site: one extra loader call + one extra positional arg to `_buildInstantPackSqlPredicate`. Additive; existing predicate structure untouched.
+  - JS evaluator (`_evaluateInstantPackSqlAlgorithmFromCartRows`, used by the harness) gets the mirror check: bare `cart_sku` in blocking set → ineligible, no skip-flag conditions. Applied FIRST, before physical filtering — because the SQL clause also runs regardless of physical status.
+- **NOT touched: `_physicalForInstantPackSqlFragment`, Option X's addon clause, JS `_computeInstantPackEligibility`, or any client code.** The JS badge was already correct — the divergence was 100% on the SQL side.
+- **Verification:** `verify-instant-pack-eligible.js` **43/43** (was 40/40; +3 Phase 80 parity cases: BADPKG parent (cart_download=1) + standalone eligible → both ineligible; BADPKG parent alone → both ineligible; SKU 1 all-eligible package + standalone eligible → both eligible = positive control that clause (E) doesn't over-block on all-eligible packages). **Live pre/post:** pre-Phase-80 SQL-eligible `all` = 7,044; post-Phase-80 = **6,855** (**-189 delta**, larger than the "87" estimate from the 2026-05-01→2026-07-21 slice because full historical is bigger). **5 of 5 previously-divergent orders** (116500, 116454, 116286, 116236, 116198) now correctly SQL-excluded + badge=false (JS and SQL agree). **3 of 3 positive home orders** (60879 / 73530 / 73552) still SQL-included + badge=true (no false-block). **Divergence in the 1000-sample post-fix: 0** (was 9 pre-fix — complete elimination of this class).
+- **Files:** `server/services/sytistDbService.js`, `server/scripts/verify-instant-pack-eligible.js`, `CLAUDE.md`. **NOT touched:** `processingService.js`, `darkroomService.js`, `schedulerService.js`, `routes/sytist.js`, client code.
+
+---
+
 ## Reversed / removed
 
 - **Phase 31**: auto-push packaging during adopt — reversed in Phase 33 after it conflicted with the upstream "Sportsline UI" tool's payload

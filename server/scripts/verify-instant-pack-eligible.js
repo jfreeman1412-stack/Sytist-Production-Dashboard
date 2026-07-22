@@ -237,6 +237,14 @@ const digitalSkus = ['25', '5D'];
 // 62 maps to a digital sku (skipped), 71 maps to an eligible sku, 99 is a
 // modifier (no sku, doesn't expand).
 const blockingAddonOptIds = ['70'];
+// Phase 80: the blocking-package-parent SKUs the SQL predicate would
+// receive from _loadInstantPackBlockingPackageParentSkuList against the
+// fixture packages above. Only 'BADPKG' qualifies:
+//   Package '1'  [8, 10]      → all non-digital eligible → NOT blocking (passes)
+//   Package 'GOLD' [8, 25]    → non-digital=[8] eligible → NOT blocking
+//   Package 'BADPKG' [8, 20]  → non-digital=[8, 20], 20 ineligible → BLOCKING
+//   Package 'ALLDIGITAL' [25, 5D] → non-digital=[] → NOT blocking (100% digital)
+const blockingPackageParentSkus = ['BADPKG'];
 
 // Cart row builder — explicit zeros for every skip-flag column so the
 // fixture is unambiguous. The seven columns mirror INSTANT_PACK_SKIP_FLAGS
@@ -441,6 +449,71 @@ const parityCases = [
     [row('downloadParent', { cart_id: 105, cart_download: 1 })],
     [opt(105, '71')],
     false, false, false],
+
+  // ── Phase 80: blocking-package-parent hidden by cart_download=1 ────────
+  //
+  // The production bug that drove Phase 80 (order 116500 Lacie Herman):
+  //   raw ms_cart:
+  //     cart_id=507603 sku='10' (5x7)     cart_download=0  → physical eligible
+  //     cart_id=507609 sku='2'  (Silver)  cart_download=1  → INVISIBLE to
+  //                                                          Phase 77's
+  //                                                          physical predicate
+  // JS: Silver expands to include SKU 15 (magnets, ineligible) → badge=false ✓
+  // SQL pre-Phase-80: cart 507609 is filtered out by cart_download=1 → SQL
+  //                    only sees cart 507603 (eligible) → SQL says eligible ✗
+  //                    (0.9% divergence rate, ~63 orders over 7,044 SQL-eligible)
+  // SQL post-Phase-80: clause (E) checks cart_sku IN blockingPackageParentSkus
+  //                    REGARDLESS of cart_download → catches the Silver
+  //                    parent → SQL says ineligible ✓, agrees with JS.
+  //
+  // Fixture modelled on 116500 with BADPKG standing in for Silver (same
+  // shape: package parent with an ineligible non-digital constituent).
+  ['parity (Phase 80): BADPKG parent (cart_download=1, hidden from Phase 77) + standalone eligible 5x7 → both ineligible',
+    // JS: expanded line items include BADPKG header + magnets constituent (ineligible)
+    [li('BADPKG', { isPackageHeader: true, package: true, download: true }),
+     li('8',  { isPackageItem: true }),
+     li('20', { isPackageItem: true }),  // Mouse Pad — ineligible non-digital → blocks JS
+     li('10', {})],  // standalone 5x7, eligible
+    // SQL: raw parent row (cart_download=1) + standalone 5x7
+    [row('10', { cart_id: 300 }),
+     row('BADPKG', { cart_id: 301, cart_download: 1 })],
+    [],
+    false, false, false],
+
+  // Belt-and-braces: BADPKG parent alone (no standalone) → JS ineligible
+  // (magnets), SQL post-Phase-80 ineligible via clause (E). Pre-Phase-80
+  // this would ALSO have been ineligible via clause A ("≥1 physical
+  // eligible" fails — no physical rows at all, since BADPKG is hidden and
+  // there's nothing else). But clause (E) also fires. Documenting the
+  // redundancy is intentional: two independent paths reach the same
+  // answer for the standalone case, and only clause (E) reaches the
+  // right answer for the with-eligible-standalone case above.
+  ['parity (Phase 80): BADPKG parent alone (cart_download=1) → both ineligible',
+    [li('BADPKG', { isPackageHeader: true, package: true, download: true }),
+     li('8',  { isPackageItem: true }),
+     li('20', { isPackageItem: true })],
+    [row('BADPKG', { cart_id: 302, cart_download: 1 })],
+    [],
+    false, false, false],
+
+  // Positive control: an ELIGIBLE-only package parent (SKU 1, contents
+  // [8, 10] all eligible) with cart_download=1 should still be eligible —
+  // it's not in the blockingPackageParentSkus list, so clause (E) doesn't
+  // fire. Pre-Phase-80 this would be filtered by physical predicate too
+  // and clause A would fail if nothing else was in the cart, so we
+  // ALSO include a standalone eligible SKU so clause A passes. This
+  // proves clause (E) doesn't over-block on all-eligible packages.
+  ['parity (Phase 80): eligible-only package (SKU 1, cart_download=1) + standalone 5x7 → both eligible',
+    // JS: expanded — header + eligible constituents
+    [li('1', { isPackageHeader: true, package: true, download: true }),
+     li('8',  { isPackageItem: true }),
+     li('10', { isPackageItem: true }),
+     li('10', {})],  // standalone 5x7
+    // SQL: raw parent row (cart_download=1) + standalone
+    [row('10', { cart_id: 303 }),
+     row('1', { cart_id: 304, cart_download: 1 })],
+    [],
+    true, true, false],
 ];
 
 let parityPass = 0;
@@ -450,12 +523,15 @@ for (const [name, jsItems, cartRows, cartOptions, wantJs, wantSql, knownDivergen
   // Phase 79: every existing parity case targets SKU-rule parity. Pass
   // workflow='ship_to_home' on both sides so the Phase 79 gate is
   // satisfied; gate-specific parity coverage lives in the new section below.
+  // Phase 80: also pass blockingPackageParentSkus so the SQL evaluator's
+  // new (E) clause has the same fixture as the SQL predicate itself.
   const jsRes = compute(jsItems, predicates, 'ship_to_home');
   const sqlRes = sqlEval(cartRows, {
     eligibleSkus,
     digitalSkus,
     cartOptions,
     blockingAddonOptIds,
+    blockingPackageParentSkus,
     workflow: 'ship_to_home',
   });
   const jsOk = jsRes.eligible === wantJs;
@@ -505,6 +581,7 @@ for (const [name, workflow, wantJs, wantSql] of gateParityCases) {
     digitalSkus,
     cartOptions: [],
     blockingAddonOptIds,
+    blockingPackageParentSkus,
     workflow,
   });
   const jsOk = jsRes.eligible === wantJs;

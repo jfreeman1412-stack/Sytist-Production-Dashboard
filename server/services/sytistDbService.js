@@ -406,6 +406,101 @@ function _loadInstantPackEligibleSkuList() {
   }
 }
 
+// Phase 80: returns an inline SQL list of package parent SKUs that BLOCK
+// instant-pack eligibility on the SQL side — the complement of
+// _loadInstantPackEligibleSkuList's package logic. A package's parent SKU
+// is BLOCKING iff at least one of its non-digital constituents is NOT
+// individually eligible (magnets, mouse pads, coffee mugs, etc.). Today
+// (config as of Phase 80): Silver Package (SKU 2, blocks on 15 magnets),
+// Gold/Super Star Package (SKU 1, blocks on 13/15/16). If a future package
+// includes any ineligible non-digital constituent, it lands on this list
+// automatically at next query.
+//
+// The bug this loader closes (Phase 80 root cause):
+//   Sytist propagates cart_download=1 to package parents that contain a
+//   Digital Download constituent (SKU 25). Silver and Gold both include
+//   SKU 25 as a bonus digital, so their parent rows are ALWAYS marked
+//   cart_download=1. Phase 77's _physicalForInstantPackSqlFragment requires
+//   cart_download=0, so those package parents are INVISIBLE to the
+//   eligibility check — the SQL predicate sees only the standalone
+//   eligible SKUs (like a 5x7) and (incorrectly) says "eligible" while
+//   the JS side correctly expands the package, sees the ineligible
+//   constituent (magnets), and says "ineligible." This was 87 orders in
+//   the 2026-05-01→2026-07-21 window, ~63 divergent in the full 7,044
+//   SQL-eligible set (0.9% divergence rate).
+//
+// The fix is Option-X-style: precompute the blocking list, add a NOT
+// EXISTS clause to _buildInstantPackSqlPredicate that fires REGARDLESS OF
+// cart_download flag. The "regardless of cart_download" is the load-
+// bearing detail — folding this into _physicalForInstantPackSqlFragment
+// would break Phase 77's other consumers (the SKU-eligibility clauses A/B
+// need `cart_download=0` for individual SKUs — see the physical predicate
+// comment block).
+//
+// SQL-safe treatment: same as _loadInstantPackEligibleSkuList — inline
+// list (not bound), validated against [A-Z0-9 _-] since SKUs come from
+// trusted local SQLite config. Returns null when no blocking packages
+// exist; the predicate then omits the clause entirely (no query cost).
+function _loadInstantPackBlockingPackageParentSkuList() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(PACKAGING_CONFIG_PATH, 'utf8'));
+    const weights = cfg.productWeights || {};
+
+    const lookup = (sku) => {
+      if (!sku) return null;
+      const raw = String(sku);
+      const upper = raw.toUpperCase();
+      return weights[upper] || (raw !== upper ? weights[raw] : null) || null;
+    };
+    const isDigital = (sku) => {
+      const def = lookup(sku);
+      return !!(def && def.category === 'digital');
+    };
+    const isEligibleIndividual = (sku) => {
+      const def = lookup(sku);
+      return !!(def && def.instantPackEligible === true);
+    };
+
+    let packageContents = {};
+    try {
+      const databaseService = require('./database');
+      const db = databaseService.getDb();
+      const rows = db
+        .prepare('SELECT package_sku, item_sku FROM package_items')
+        .all();
+      for (const r of rows) {
+        const pSku = String(r.package_sku);
+        const iSku = String(r.item_sku);
+        if (!packageContents[pSku]) packageContents[pSku] = [];
+        packageContents[pSku].push(iSku);
+      }
+    } catch {
+      return null;
+    }
+
+    const blocking = new Set();
+    for (const [pkgSku, constituents] of Object.entries(packageContents)) {
+      // Only NON-digital constituents matter — a digital constituent gets
+      // flags.download=true on the addon synthetic in JS expansion and is
+      // skipped, so it neither contributes eligibility nor blocks it. Same
+      // filter _loadInstantPackEligibleSkuList applies. What differs: we
+      // now flip the test — the package is BLOCKING iff any non-digital
+      // constituent is NOT eligible (the exact complement of "all non-
+      // digital eligible" that puts a package in the passing list).
+      const nonDigital = constituents.filter((s) => !isDigital(s));
+      if (nonDigital.length === 0) continue; // 100%-digital → not blocking
+      if (nonDigital.some((s) => !isEligibleIndividual(s))) {
+        blocking.add(String(pkgSku).toUpperCase());
+      }
+    }
+
+    const validated = [...blocking].filter((s) => /^[A-Z0-9 _-]+$/.test(s));
+    return validated.length ? validated.map((s) => `'${s}'`).join(',') : null;
+  } catch {
+    return null;
+  }
+}
+
 // Returns an inline SQL list of numeric co_opt_ids whose addon mapping
 // would create an INELIGIBLE physical synthetic line item — i.e. product-
 // type mappings (modifiers don't become line items, ignored) whose mapped
@@ -506,11 +601,24 @@ function _loadInstantPackBlockingAddonOptIds(eligibleSkuList, digitalSkuList) {
 //   (B) NO PHYSICAL INELIGIBLE cart row exists in either table (Phase 60a).
 //   (C) NO ms_cart_options row on a physical parent maps to a blocking
 //       product-type addon (Phase 77 Option X — overcount-direction close).
+//   (E) Phase 80 — NO cart row exists (in either table) with a SKU on the
+//       blocking-package-parent list, REGARDLESS OF cart_download. Sytist
+//       propagates cart_download=1 to Silver/Gold package parents because
+//       they contain SKU 25 (Digital Download); those parents are hidden
+//       from (B)'s physical predicate, letting the package's ineligible
+//       constituents (magnets, mouse pad, buttons) slip past the SQL
+//       check. This clause is a bare parent-SKU check that IGNORES all
+//       skip flags — the whole point is to catch package parents Sytist
+//       has flagged as download. Load-bearing detail: do NOT fold this
+//       into _physicalForInstantPackSqlFragment (that would break clauses
+//       A/B for individual SKUs where cart_download=1 legitimately means
+//       "this row is a download, skip it"). Additive, localised clause.
 function _buildInstantPackSqlPredicate(
   eligibleSkuList,
   digitalSkuList,
   blockingAddonOptIds = null,
-  workflowGate = null
+  workflowGate = null,
+  blockingPackageParentSkuList = null
 ) {
   if (!eligibleSkuList || !workflowGate || !workflowGate.sql) {
     // No eligible SKUs OR no workflow gate → predicate matches nothing.
@@ -544,6 +652,21 @@ function _buildInstantPackSqlPredicate(
       `AND x3.co_download = 0)`
     : '';
 
+  // (E) Phase 80 — blocking-package-parent clause. Bare SKU check on both
+  // cart tables, NO skip-flag conditions (the whole reason for this clause
+  // is Sytist's cart_download=1 propagation to package parents; requiring
+  // cart_download=0 would put us right back in the bug). Omit entirely
+  // when the loader returns null (no blocking packages configured →
+  // planner has no extra work).
+  const blockingPkgClause = blockingPackageParentSkuList
+    ? ` AND NOT EXISTS (SELECT 1 FROM ms_cart c4 ` +
+      `WHERE c4.cart_order = o.order_id ` +
+      `AND UPPER(c4.cart_sku) IN (${blockingPackageParentSkuList}))` +
+      ` AND NOT EXISTS (SELECT 1 FROM ms_cart_archive ca4 ` +
+      `WHERE ca4.cart_order = o.order_id ` +
+      `AND UPPER(ca4.cart_sku) IN (${blockingPackageParentSkuList}))`
+    : '';
+
   const skuPredicate =
     '(' +
     // (A) ≥1 physical eligible row in either table.
@@ -558,6 +681,8 @@ function _buildInstantPackSqlPredicate(
     `AND ${physArch} AND UPPER(ca.cart_sku) NOT IN (${eligibleSkuList}))` +
     // (C) No blocking addon on a physical parent in either table.
     addonClause +
+    // (E) Phase 80 — no blocking-package-parent SKU anywhere in cart.
+    blockingPkgClause +
     ')';
 
   // (D) Workflow gate AND-composed at the outermost level so the gate
@@ -595,7 +720,23 @@ function _evaluateInstantPackSqlAlgorithmFromCartRows(cartRows, opts) {
   const digitalSet = new Set((opts.digitalSkus || []).map((s) => String(s).toUpperCase()));
   const cartOptions = opts.cartOptions || [];
   const blockingOptIds = new Set((opts.blockingAddonOptIds || []).map(String));
+  // Phase 80: blocking-package-parent set. Bare cart_sku check regardless of
+  // any skip flags — mirrors the SQL clause (E). If ANY cart row's SKU is
+  // on this list, order is ineligible immediately.
+  const blockingPkgSet = new Set((opts.blockingPackageParentSkus || []).map((s) => String(s).toUpperCase()));
   if (eligibleSet.size === 0) return { eligible: false };
+
+  // Phase 80: bare parent-SKU check FIRST — before physical filtering. The
+  // whole point of this clause is that Sytist marks these parents as
+  // cart_download=1, so a physical-first filter would skip them.
+  if (blockingPkgSet.size > 0) {
+    for (const row of cartRows) {
+      const skuUp = String(row.cart_sku || '').toUpperCase();
+      if (blockingPkgSet.has(skuUp)) {
+        return { eligible: false, blockingPackageParent: row.cart_sku };
+      }
+    }
+  }
 
   const isPhysical = (row) => {
     if ((row.cart_download || 0) !== 0) return false;
@@ -1537,6 +1678,14 @@ class SytistDbService {
         eligibleSkuList,
         digitalSkuList
       );
+      // Phase 80: precompute the blocking-package-parent SKUs. Same shape
+      // as the addon loader — package SKUs whose non-digital constituents
+      // include any ineligible SKU (magnets etc.). Today: {1, 2}. Sytist's
+      // cart_download=1 propagation to those parents was hiding them from
+      // clause B; the new clause (E) checks the parent SKU directly with
+      // no skip-flag conditions.
+      const blockingPackageParentSkuList =
+        _loadInstantPackBlockingPackageParentSkuList();
       // Phase 79: workflow gate. Instant-pack only applies to ship_to_home —
       // manager/league/digital orders never qualify regardless of SKU mix.
       // Build the ship_to_home predicate via the same helper the URL workflow
@@ -1549,7 +1698,8 @@ class SytistDbService {
         eligibleSkuList,
         digitalSkuList,
         blockingAddonOptIds,
-        wfHome
+        wfHome,
+        blockingPackageParentSkuList
       );
       where.push(p.sql);
       params.push(...p.params);
@@ -3519,4 +3669,5 @@ _instance._evaluateInstantPackSqlAlgorithmFromCartRows = _evaluateInstantPackSql
 _instance._buildInstantPackSqlPredicate = _buildInstantPackSqlPredicate;
 _instance._physicalForInstantPackSqlFragment = _physicalForInstantPackSqlFragment;
 _instance._loadInstantPackBlockingAddonOptIds = _loadInstantPackBlockingAddonOptIds;
+_instance._loadInstantPackBlockingPackageParentSkuList = _loadInstantPackBlockingPackageParentSkuList;
 module.exports = _instance;

@@ -2962,3 +2962,84 @@ if (instantShipOnly) {
 - Sample ship_to_home orders (60879 / 73530 / 73552) still badge=true. Home-workflow eligibility unaffected.
 
 **Files:** `server/services/sytistDbService.js`, `server/scripts/verify-instant-pack-eligible.js`, `CLAUDE.md`. **NOT touched:** `processingService.js`, `darkroomService.js`, `schedulerService.js`, `routes/sytist.js`, client code (badge + filter UI consume the eligibility result, which the server now produces correctly; no client change needed).
+
+## 80. Blocking-package-parent SQL clause — close the `cart_download=1`-hides-package hole
+
+**The bug (order 116500 Lacie Herman was the first spotted).** Silver Package (SKU 2) and Gold/Super Star Package (SKU 1) parent rows in `ms_cart` are ALWAYS marked `cart_download=1` by Sytist. Root cause: both packages contain SKU 25 (Digital Download) as a bonus constituent, and Sytist propagates the download flag to the parent row. Phase 77's `_physicalForInstantPackSqlFragment` requires `cart_download=0` (correctly, for individual SKUs — an individual download-flagged row IS a download and should be skipped). But package parents are a different concern: the parent's `cart_download` says nothing about its non-digital constituents.
+
+The consequence: a Silver Package parent with `cart_download=1` is INVISIBLE to Phase 77's physical predicate. The SQL sees only the standalone eligible SKUs alongside it (a 5x7, etc.) and incorrectly classifies the order as instant-ship eligible. The JS side, in contrast, expands the package into its constituents (`_expandPackageLineItems`), sees the ineligible constituent (magnets — SKU 15), and correctly marks the badge false.
+
+**Diagnostic in-session.** Pre-fix full SQL-eligible set (post-Phase-79, all workflows, all statuses): **7,044**. 1000-order sample cross-checked against JS badge: **9 divergent (0.9%)**. Root-cause split (with `ms_cart_archive` included in the check — an earlier audit had a bug that missed archived orders):
+
+| Bucket | Count |
+|---|---|
+| package-only (Silver/Gold parent, cart_download=1, no blocking addon on physical parent) | **9** |
+| addon-only (Option X gap — blocking addon on physical parent, no Silver/Gold) | **0** |
+| both | 0 |
+| neither | 0 |
+
+**Phase 77 Option X is doing its job on addons.** The 9 divergent orders are all pure package-parent cases; no additional gap exists. An earlier "497 addon-only" count was a false alarm — traced to running a truncated predicate that omitted Option X's blocking-addon NOT EXISTS clause. When the full production predicate runs, Option X correctly excludes every genuine addon-only case (verified end-to-end on order 116491 Memory Mate + magnets addon).
+
+**The 116454 disambiguation.** Order 116454 has BOTH a Silver Package parent AND an addon (opt_id=2929 → Photo Button SKU 16, ineligible). Not a bucket confusion — the addon on 116454 doesn't drive the divergence because Silver's parent has `cart_download=1`. Both JS and SQL ignore the addon (JS: addon synthetic inherits `download=true` via `...li.flags` spread → skip-flagged; SQL: Option X's parent-physical guard skips because Silver isn't physical). The Silver's magnets constituent is the sole cause. Same mechanism as 116500.
+
+**The fix — Option-X-style, additive, localised.**
+
+New sync loader `_loadInstantPackBlockingPackageParentSkuList()` mirrors `_loadInstantPackEligibleSkuList`'s shape (`packages` + `package_items` from local SQLite, `productWeights` from `packaging-config.json`, same `[A-Z0-9 _-]+` validation, same "read fresh each query — no restart needed for operator edits" contract). The classification is the complement of the eligible-list logic: a package's parent SKU is BLOCKING iff its non-digital constituents include any SKU that's NOT `instantPackEligible=true`. Today's blocking set: `{1, 2}`. 100%-digital packages are excluded (they have no non-digital constituents to block on, per the passing-list rule's mirror).
+
+New SQL clause (E) in `_buildInstantPackSqlPredicate`:
+
+```sql
+AND NOT EXISTS (SELECT 1 FROM ms_cart c4
+                WHERE c4.cart_order = o.order_id
+                  AND UPPER(c4.cart_sku) IN (blockingList))
+AND NOT EXISTS (SELECT 1 FROM ms_cart_archive ca4
+                WHERE ca4.cart_order = o.order_id
+                  AND UPPER(ca4.cart_sku) IN (blockingList))
+```
+
+**The load-bearing detail** (recorded here and in the CLAUDE.md landmine so a future reader can't miss it): **NO skip-flag conditions on clause (E).** No `cart_download=0`, no gift-cert check, nothing. The bare `UPPER(cart_sku) IN (blockingList)` check is the ENTIRE clause. This is deliberate: the whole reason for the clause is that Sytist sets `cart_download=1` on Silver/Gold parents; requiring `cart_download=0` would put us right back in the bug. Do NOT "fix" the asymmetry by folding this into `_physicalForInstantPackSqlFragment` — that would break clauses A/B for individual SKUs (where `cart_download=1` legitimately means "this row is a download, skip it") and re-open the bug from the other side. Additive, localised clause; the `cart_download` asymmetry is the fix, not a bug in the fix.
+
+**Wire-up in `getOrdersByWorkflow`.** One extra loader call + one extra positional arg to `_buildInstantPackSqlPredicate`:
+
+```js
+if (instantShipOnly) {
+  const eligibleSkuList = _loadInstantPackEligibleSkuList();
+  const blockingAddonOptIds = _loadInstantPackBlockingAddonOptIds(eligibleSkuList, digitalSkuList);
+  const blockingPackageParentSkuList = _loadInstantPackBlockingPackageParentSkuList();
+  const wfHome = _buildWorkflowSqlPredicate('ship_to_home', digitalSkuList);
+  const p = _buildInstantPackSqlPredicate(
+    eligibleSkuList, digitalSkuList, blockingAddonOptIds, wfHome, blockingPackageParentSkuList
+  );
+  where.push(p.sql);
+  params.push(...p.params);
+}
+```
+
+`_buildInstantPackSqlPredicate` gains a fifth positional arg `blockingPackageParentSkuList` (defaults to `null`; when null, clause (E) is omitted entirely — no planner cost). Return shape `{sql, params}` unchanged from Phase 79. `_evaluateInstantPackSqlAlgorithmFromCartRows` (the harness's JS mirror of the SQL predicate) gets the parallel check: `opts.blockingPackageParentSkus` set → any cart row whose SKU is in that set → `eligible:false` immediately, no skip-flag conditions. Applied FIRST, before physical filtering, because the SQL clause runs regardless of physical status.
+
+**Future-proofing.** If a future package is added that (a) includes any Digital Download-flagged constituent AND (b) includes any ineligible non-digital constituent, it inherits this bug pattern automatically — Sytist will set `cart_download=1` on the parent, Phase 77's physical predicate will hide it, and the same divergence class would re-emerge without Phase 80. The `_loadInstantPackBlockingPackageParentSkuList()` loader is dynamic (reads at each query) so any new such package lands on the blocking list at next request; hardcoding `{1, 2}` would need manual maintenance. Same read-fresh contract as `_loadDigitalSkuList` and `_loadInstantPackEligibleSkuList`.
+
+**NOT touched:** `_physicalForInstantPackSqlFragment` (unchanged; the fix is deliberately outside), Option X's addon clause (unchanged; working correctly), JS `_computeInstantPackEligibility` (unchanged; the badge was already correct — divergence was 100% SQL-side), all client code.
+
+**Verification.**
+
+Harness `verify-instant-pack-eligible.js` **43/43** (was 40/40; +3 Phase 80 parity cases):
+
+1. **BADPKG parent (`cart_download=1`) + standalone eligible 5x7 → both ineligible.** The canonical fixture modelled on order 116500. JS expands BADPKG into `[header, 8, 20]`; SKU 20 (Mouse Pad, ineligible) blocks → badge=false. SQL clause (E) fires on `UPPER(cart_sku)='BADPKG'` regardless of `cart_download=1` → SQL says ineligible. **Both agree** — the exact bug pattern from production.
+2. **BADPKG parent alone (`cart_download=1`) → both ineligible.** Belt-and-braces. Pre-Phase-80 this was ALREADY ineligible via clause A (nothing physical eligible), so clause (E)'s independent path is redundant here. Documenting the redundancy — two independent paths reach the same right answer for this case, and only clause (E) reaches the right answer for case #1.
+3. **Positive control: SKU 1 all-eligible package (`cart_download=1`) + standalone 5x7 → both eligible.** Package `1` has constituents `[8, 10]` — both eligible — so `1` is NOT in `blockingPackageParentSkus`. Clause (E) doesn't fire. Clause A passes on the standalone. Order is correctly classified eligible. **Proves clause (E) doesn't over-block on all-eligible packages** — the loader's discrimination logic works.
+
+**Live two-sided verification** (done in-session):
+
+| | Pre-Phase-80 | Post-Phase-80 | Delta |
+|---|---|---|---|
+| SQL-eligible `all` | 7,044 | **6,855** | **-189** |
+| `ship_to_home` | 7,044 | 6,855 | -189 |
+| `ship_to_managers` / `_league` / `digital` | 0 | 0 | — (Phase 79 gate still holds) |
+| Divergence in 1000-sample | 9 (0.9%) | **0** | complete elimination |
+
+**Spot-check on 5 previously-divergent orders:** 116500, 116454, 116286, 116236, 116198 — all now `badge=false, in-filter=false` (JS and SQL agree). **Positive-case spot-check** on 3 home orders: 60879, 73530, 73552 — all still `badge=true, in-filter=true` (no false-block).
+
+The -189 delta is larger than the "87" estimate from the 2026-05-01→2026-07-21 slice because full historical is bigger (7,044 SQL-eligible spans all time; 87 was the 2.5-month recent window). Both numbers are the same-mechanism population; -189 is the authoritative all-time count.
+
+**Files:** `server/services/sytistDbService.js`, `server/scripts/verify-instant-pack-eligible.js`, `CLAUDE.md`. **NOT touched:** `processingService.js`, `darkroomService.js`, `schedulerService.js`, `routes/sytist.js`, client code.
