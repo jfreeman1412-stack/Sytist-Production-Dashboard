@@ -2934,6 +2934,64 @@ class SytistDbService {
   }
 
   /**
+   * NARROW: tracking-only backfill for a previously-shipped order.
+   *
+   * Writes ONLY ms_orders.order_shipped_track. Does NOT touch
+   * order_open_status, order_shipped_date, order_shipped_by,
+   * order_shipped_by_id, or order_ship_cost.
+   *
+   * Why it exists: the shipping-meta reconcile pass (services/
+   * shippingMetaReconcileService) discovers a real tracking number
+   * for an order that was shipped without one — the label scan
+   * caught status=shipped but the tracking hadn't propagated yet
+   * (100% null across the first ~458 shipments while some were
+   * Ground Advantage, which always carries tracking). The fix is a
+   * post-ship UPDATE of just the tracking column; the other four
+   * shipping fields were written correctly at ship time and must
+   * not be re-derived (that would risk clobbering shipCost with a
+   * stale or newly-fetched value, changing shippedDate to today
+   * when the actual ship day was earlier, etc.).
+   *
+   * NEVER use this for the initial ship write. `updateOrderStatus`
+   * with `shippingFields` is the correct call for that path — it
+   * writes all 5 columns as a unit with the status flip. This
+   * method exists for the one specific "we now know tracking, but
+   * nothing else about the ship changed" case.
+   *
+   * Guard: skips the write if trackingNumber is empty/whitespace.
+   * The caller (reconcile) is responsible for the 000-prefix
+   * filter via hasRealTracking-equivalent logic BEFORE calling.
+   *
+   * On the Sytist write allow-list per the write-audit doc:
+   * order_shipped_track is one of the six columns the dashboard is
+   * permitted to write to on ms_orders.
+   *
+   * @param {number|string} orderId
+   * @param {string} trackingNumber
+   * @returns {Promise<{orderId, affectedRows}>}
+   */
+  async backfillTrackingNumber(orderId, trackingNumber) {
+    const id = parseInt(orderId, 10);
+    if (Number.isNaN(id) || id <= 0) {
+      throw new Error('Invalid order ID');
+    }
+    const tracking = trackingNumber == null ? '' : String(trackingNumber).trim();
+    if (tracking === '') {
+      throw new Error('Refusing to backfill an empty tracking number');
+    }
+
+    const pool = this.getPool();
+    console.log(
+      `[SytistDB] backfillTrackingNumber: order ${id} tracking=${tracking}`
+    );
+    const [result] = await pool.query(
+      'UPDATE ms_orders SET order_shipped_track = ? WHERE order_id = ?',
+      [tracking, id]
+    );
+    return { orderId: id, affectedRows: result.affectedRows };
+  }
+
+  /**
    * Returns aggregate counts for the home dashboard cards.
    *
    * Three groupings, all over open + paid orders:

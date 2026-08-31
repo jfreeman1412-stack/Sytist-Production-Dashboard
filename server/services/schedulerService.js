@@ -447,6 +447,27 @@ class SchedulerService {
       this._isPolling = false;
     }
 
+    // Tracking-reconcile tick. Recovers null-tracking rows for
+    // tracking-bearing mail classes (package_code = 'package') by
+    // re-polling ShipStation. Runs at the end of every SS poll
+    // tick, right after the existing per-order processing.
+    // Best-effort — a reconcile failure must not poison the SS
+    // sync summary or subsequent ticks. See
+    // services/shippingMetaReconcileService.js header for the full
+    // design and the queries-first-for-eyeball audit trail.
+    try {
+      const { runReconcileTick } = require('./shippingMetaReconcileService');
+      const rec = await runReconcileTick({ backfill: false });
+      // Only surface the summary counts on the poll summary if there
+      // was any activity — steady-state (nothing to reconcile) shouldn't
+      // clutter the getStatus response.
+      if (rec.candidates > 0 || rec.given_up > 0) {
+        summary.reconcile = rec;
+      }
+    } catch (e) {
+      console.warn(`[Scheduler] shippingMetaReconcile failed (non-fatal): ${e.message}`);
+    }
+
     // Phase 49 v2: opportunistic photo-cache TTL sweep. At most
     // once per 24h, piggybacking on whichever SS poll tick is first
     // past the threshold. Errors swallowed — sweep failures must

@@ -41,6 +41,26 @@ try {
   );
 }
 
+// Exported so the reconcile-queries verify harness can build a
+// throwaway in-memory DB from the SAME schema the production init()
+// uses. Copies-of-schemas-in-tests drift; single-source doesn't.
+const SHIPSTATION_LINKS_CREATE_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS shipstation_links (
+    order_id TEXT PRIMARY KEY,
+    ss_order_id INTEGER NOT NULL,
+    ss_order_number TEXT,
+    ss_order_status TEXT,
+    tracking_number TEXT,
+    carrier_code TEXT,
+    service_code TEXT,
+    package_code TEXT,
+    payload_json TEXT,
+    shipped_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT
+  );
+`;
+
 class ShipStationLinkService {
   constructor() {
     this._db = null;
@@ -68,22 +88,7 @@ class ShipStationLinkService {
     this._db.pragma('journal_mode = WAL');
     this._db.pragma('foreign_keys = ON');
 
-    this._db.exec(`
-      CREATE TABLE IF NOT EXISTS shipstation_links (
-        order_id TEXT PRIMARY KEY,
-        ss_order_id INTEGER NOT NULL,
-        ss_order_number TEXT,
-        ss_order_status TEXT,
-        tracking_number TEXT,
-        carrier_code TEXT,
-        service_code TEXT,
-        package_code TEXT,
-        payload_json TEXT,
-        shipped_at TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT
-      );
-    `);
+    this._db.exec(SHIPSTATION_LINKS_CREATE_TABLE_SQL);
 
     this._stmts = {
       get: this._db.prepare(
@@ -213,6 +218,41 @@ class ShipStationLinkService {
   }
 
   /**
+   * Set tracking_number ONLY IF the current stored value is NULL.
+   * Purpose: the tracking-reconcile pass discovers a real tracking
+   * number after the initial ship-scan wrote NULL. This must never
+   * clobber a tracking number the initial capture happened to catch —
+   * the initial write is trusted; reconcile only fills gaps.
+   *
+   * SQL enforces the guard (`WHERE ... AND tracking_number IS NULL`)
+   * so a concurrent tick can't race us into overwriting.
+   *
+   * @returns {boolean} true if the row was updated, false if the row
+   *   was missing OR already had a non-null tracking number.
+   */
+  setTrackingNumberIfNull(orderId, trackingNumber) {
+    this.init();
+    if (!trackingNumber || String(trackingNumber).trim() === '') {
+      return false;
+    }
+    const now = new Date().toISOString();
+    const result = this._db
+      .prepare(
+        `UPDATE shipstation_links
+            SET tracking_number = @tracking_number,
+                updated_at      = @updated_at
+          WHERE order_id = @order_id
+            AND tracking_number IS NULL`
+      )
+      .run({
+        order_id: String(orderId),
+        tracking_number: String(trackingNumber),
+        updated_at: now,
+      });
+    return result.changes > 0;
+  }
+
+  /**
    * Delete the link. Useful when the operator deletes the SS order
    * (so the dashboard reflects the removal) or when reprocessing
    * needs to clear the old link first.
@@ -242,4 +282,7 @@ class ShipStationLinkService {
   }
 }
 
-module.exports = new ShipStationLinkService();
+const instance = new ShipStationLinkService();
+instance.SHIPSTATION_LINKS_CREATE_TABLE_SQL = SHIPSTATION_LINKS_CREATE_TABLE_SQL;
+module.exports = instance;
+module.exports.SHIPSTATION_LINKS_CREATE_TABLE_SQL = SHIPSTATION_LINKS_CREATE_TABLE_SQL;
