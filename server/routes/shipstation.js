@@ -427,6 +427,38 @@ router.post('/orders/:orderId/mark-shipped', async (req, res) => {
       carrierCode: carrierCode || link.carrier_code,
       shippedAt: shipDate || new Date().toISOString(),
     });
+
+    // Phase 62 (Customer Manager Phase 2): push shipping metadata to
+    // CM. Best-effort; failure MUST NOT block the mark-shipped
+    // response. See services/pushShippingMetaToCM.js.
+    try {
+      const { pushShippingMetaToCM } = require('../services/pushShippingMetaToCM');
+      let weightOz = 0;
+      try {
+        const payload = link.payload_json ? JSON.parse(link.payload_json) : null;
+        if (payload && payload.weight && typeof payload.weight.value === 'number') {
+          weightOz = payload.weight.value;
+        }
+      } catch (_) { /* leave weightOz=0 on parse fail */ }
+      pushShippingMetaToCM({
+        orderId: req.params.orderId,
+        weightOz,
+        serviceCode: link.service_code,
+        packageCode: link.package_code,
+        carrierCode: carrierCode || link.carrier_code,
+        trackingNumber,
+        shippedAt: shipDate || new Date().toISOString(),
+      }).catch((e) => {
+        console.warn(
+          `[shipstation/mark-shipped] pushShippingMetaToCM failed for order ${req.params.orderId}: ${e.message}`
+        );
+      });
+    } catch (e) {
+      console.warn(
+        `[shipstation/mark-shipped] pushShippingMetaToCM load failed for order ${req.params.orderId}: ${e.message}`
+      );
+    }
+
     res.json({ link: _maskLink(updated), shipstation: ssResult });
   } catch (err) {
     res.status(500).json({ error: err.message });

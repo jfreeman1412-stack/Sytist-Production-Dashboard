@@ -280,6 +280,41 @@ class SchedulerService {
               `${carrierCode || 'unknown carrier'} ${trackingNumber || '(no tracking)'}`
           );
 
+          // Phase 62 (Customer Manager Phase 2): push shipping metadata
+          // to CM so the shipped-order email can render the right
+          // variant + delivery estimate. Best-effort — a CM outage
+          // MUST NOT block this scheduler tick. See
+          // services/pushShippingMetaToCM.js for observability.
+          try {
+            const { pushShippingMetaToCM } = require('./pushShippingMetaToCM');
+            let weightOz = 0;
+            try {
+              const payload = link.payload_json ? JSON.parse(link.payload_json) : null;
+              if (payload && payload.weight && typeof payload.weight.value === 'number') {
+                weightOz = payload.weight.value;
+              }
+            } catch (_) { /* leave weightOz=0 on parse fail */ }
+            // Fire-and-forget — don't await; the tick already logged
+            // "marked shipped" and shouldn't block on our HTTP.
+            pushShippingMetaToCM({
+              orderId: link.order_id,
+              weightOz,
+              serviceCode: link.service_code,
+              packageCode: link.package_code,
+              carrierCode,
+              trackingNumber,
+              shippedAt,
+            }).catch((e) => {
+              console.warn(
+                `[Scheduler] pushShippingMetaToCM failed for order ${link.order_id}: ${e.message}`
+              );
+            });
+          } catch (e) {
+            console.warn(
+              `[Scheduler] pushShippingMetaToCM load failed for order ${link.order_id}: ${e.message}`
+            );
+          }
+
           // Phase 32: also push to Sytist. orderStatusService.shipOrder
           // writes ms_orders.order_open_status → shippedStatusId (39)
           // plus the 5 shipping columns (date, tracking, carrier,
