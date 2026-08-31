@@ -373,6 +373,32 @@ class ShipStationService {
     return data;
   }
 
+  /**
+   * GET /shipments — the authoritative source for shipment records.
+   *
+   * WHY IT EXISTS: tracking numbers live on shipments, not orders.
+   * The `/orders/{id}` response has a `shipments[]` array but it
+   * has proven unreliable — the initial ship-detection path
+   * (schedulerService.js:248-251) reads that shape and captured
+   * null tracking on 100% of ~458 shipments over ~30 days,
+   * including for classes that always carry tracking (Ground
+   * Advantage). The tracking-reconcile diagnostic (Sep 2026)
+   * traces why: `/orders/{id}.shipments` may be stale/partial,
+   * whereas `/shipments?orderId=...` returns the shipment records
+   * directly and is what ShipStation's own UI reads.
+   *
+   * Useful params: { orderId, orderNumber, pageSize (max 500),
+   * sortBy: 'CreateDate'|'ShipDate', sortDir: 'DESC'|'ASC' }.
+   * Returns { shipments: [...], total, page, pages }. Each
+   * shipment carries: shipmentId, orderId, orderKey, orderNumber,
+   * trackingNumber, carrierCode, serviceCode, packageCode,
+   * shipDate, shipmentCost, shipmentItems.
+   */
+  async listShipments(params = {}) {
+    const { data } = await this._client().get('/shipments', { params });
+    return data;
+  }
+
   async deleteOrder(orderId) {
     const { data } = await this._client().delete(`/orders/${orderId}`);
     return data;

@@ -39,6 +39,20 @@
 //       The chosen bound is printed in the preview output alongside
 //       the fixed thresholds so it's always visible before writes.
 //
+//   node scripts/reconcile-backfill.js --debug-order=<sytistOrderId>
+//     → DIAGNOSTIC. Looks up the shipstation_links row for the
+//       Sytist orderId, then dumps three raw payloads side-by-side:
+//         (1) the local link row (what identifier we're using)
+//         (2) GET /orders/{ss_order_id}       — the shape reconcile
+//             + scheduler currently read tracking from
+//         (3) GET /shipments?orderId=<ss>     — the authoritative
+//             shipment source; if tracking lives here but not in
+//             (2), the read pattern is wrong (not the timing).
+//       Writes NOTHING. Exits after printing. Meant for the exact
+//       question "SS UI shows tracking but our reconcile can't
+//       find it — is it a wrong-endpoint problem or a wrong-
+//       identifier problem?"
+//
 // The give-up count printed in the preview is what Joey specifically
 // asked to see BEFORE running: the number of ancient rows that will
 // be marked 'gave_up' in the log so they stop matching subsequent
@@ -62,7 +76,10 @@ const readline = require('readline');
 const reconcileService = require('../services/shippingMetaReconcileService');
 
 function parseArgs() {
-  const args = { dryRun: false, yes: false, maxRounds: 200, sinceDays: null };
+  const args = {
+    dryRun: false, yes: false, maxRounds: 200, sinceDays: null,
+    debugOrder: null,
+  };
   for (const arg of process.argv.slice(2)) {
     if (arg === '--dry-run') args.dryRun = true;
     else if (arg === '--yes' || arg === '-y') args.yes = true;
@@ -77,17 +94,26 @@ function parseArgs() {
         process.exit(1);
       }
       args.sinceDays = n;
+    } else if (arg.startsWith('--debug-order=')) {
+      const raw = arg.slice('--debug-order='.length).trim();
+      if (raw === '') {
+        console.error('✗ --debug-order requires a value (Sytist orderId)');
+        process.exit(1);
+      }
+      args.debugOrder = raw;
     } else if (arg === '--help' || arg === '-h') {
       // Trim leading whitespace from the file's header comment for a --help output
       console.log(
         [
           'Usage:',
-          '  node scripts/reconcile-backfill.js --dry-run          Print counts only, no writes.',
-          '  node scripts/reconcile-backfill.js                    Print preview, prompt y/N, run.',
-          '  node scripts/reconcile-backfill.js --yes              Skip prompt.',
-          '  node scripts/reconcile-backfill.js --max-rounds=N     Cap round iterations.',
-          '  node scripts/reconcile-backfill.js --since-days=N     Bound to shipped_at > NOW - N days',
-          '                                                        (opt-in; default unbounded).',
+          '  node scripts/reconcile-backfill.js --dry-run              Print counts only, no writes.',
+          '  node scripts/reconcile-backfill.js                        Print preview, prompt y/N, run.',
+          '  node scripts/reconcile-backfill.js --yes                  Skip prompt.',
+          '  node scripts/reconcile-backfill.js --max-rounds=N         Cap round iterations.',
+          '  node scripts/reconcile-backfill.js --since-days=N         Bound to shipped_at > NOW - N days',
+          '                                                            (opt-in; default unbounded).',
+          '  node scripts/reconcile-backfill.js --debug-order=<id>     Dump SS raw payloads for one order,',
+          '                                                            no writes. Diagnostic tool.',
         ].join('\n')
       );
       process.exit(0);
@@ -108,6 +134,11 @@ function ask(question) {
 
 async function main() {
   const args = parseArgs();
+
+  if (args.debugOrder) {
+    await runDebugOrder(args.debugOrder);
+    process.exit(0);
+  }
 
   console.log('▸ Tracking-reconcile backfill');
   console.log('');
@@ -221,6 +252,173 @@ async function main() {
       "       FROM shipping_meta_reconcile_log \\\n" +
       "      WHERE outcome='recovered' AND shipped_at IS NOT NULL;\""
   );
+}
+
+/**
+ * Diagnostic — dump raw SS payloads for one Sytist order. No writes.
+ *
+ * Purpose: the current read pattern (both scheduler + reconcile)
+ * pulls tracking from `GET /orders/{id}.shipments[N].trackingNumber`.
+ * That pattern has produced 100% nulls over ~30 days AND the first
+ * reconcile backfill run recovered 0/100. ShipStation's UI clearly
+ * shows tracking for the same orders — so the read is wrong (or the
+ * identifier is wrong), not just late. This tool prints three
+ * ground-truth payloads side-by-side so the operator can see:
+ *
+ *   (A) The local `shipstation_links` row — what identifier we're
+ *       actually holding, and its column-by-column state.
+ *
+ *   (B) `GET /orders/{ss_order_id}` — the response the current read
+ *       operates on. Its `shipments[]` array is the source that
+ *       returns null. Dumped in full so we can see whether it's
+ *       missing, empty, populated-without-trackingNumber, or
+ *       populated-with-tracking-that-our-extractor-is-mishandling.
+ *
+ *   (C) `GET /shipments?orderId={ss_order_id}` — the /shipments
+ *       endpoint. Per Joey's follow-up: tracking numbers belong to
+ *       SHIPMENT records, not order records. A label-buy creates a
+ *       shipment. /orders may return a stale/empty shipments[]
+ *       inline while the /shipments query returns the actual
+ *       shipment records with tracking. If (C) has tracking that
+ *       (B) does not, the fix is a new read pattern that calls
+ *       /shipments; if BOTH are empty, the identifier is wrong or
+ *       the SS account is doing something we don't yet understand.
+ *
+ *   (D) `GET /shipments?orderNumber={ss_order_number}` — same
+ *       endpoint keyed on orderNumber instead. If (C) is empty but
+ *       (D) returns a shipment, the identifier column drift
+ *       hypothesis (Joey's Q3) is proven — ss_order_id may hold
+ *       an orderNumber where the SS integer ID belongs.
+ *
+ * Everything caught + printed; no data written; exits 0 regardless.
+ */
+async function runDebugOrder(sytistOrderId) {
+  const shipstationLinkService = require('../services/shipstationLinkService');
+  const shipstationService = require('../services/shipstationService');
+
+  console.log(`▸ SS diagnostic for Sytist order ${sytistOrderId}`);
+  console.log('');
+
+  // ── (A) local link row ─────────────────────────────────────────
+  let link = null;
+  try {
+    link = shipstationLinkService.getByOrderId(sytistOrderId);
+  } catch (err) {
+    console.error(`✗ Failed to read local link row: ${err.message}`);
+    return;
+  }
+  console.log('(A) Local shipstation_links row:');
+  if (!link) {
+    console.log(`    (no row for order_id=${sytistOrderId})`);
+    console.log('    Nothing to look up in SS — stopping.');
+    return;
+  }
+  console.log(JSON.stringify(link, null, 2));
+  console.log('');
+
+  // ── (B) GET /orders/{ss_order_id} ─────────────────────────────
+  console.log(`(B) GET /orders/${link.ss_order_id}`);
+  console.log('    (this is the response the current reconcile + scheduler read)');
+  let orderResp = null;
+  try {
+    orderResp = await shipstationService.getOrder(link.ss_order_id);
+    console.log(JSON.stringify(orderResp, null, 2));
+  } catch (err) {
+    console.log(`    ✗ FAILED: HTTP ${err?.response?.status ?? 'network'} — ${err.message}`);
+    if (err?.response?.data) {
+      console.log('    response body:');
+      console.log(JSON.stringify(err.response.data, null, 2));
+    }
+  }
+  console.log('');
+
+  // Highlight what our extractor would pull, per the current code
+  // path in _reconcileOne + schedulerService line 248-251.
+  if (orderResp) {
+    const shipments = orderResp.shipments || [];
+    const latest = shipments[shipments.length - 1];
+    console.log('    Current extractor read:');
+    console.log(`      shipments.length      = ${shipments.length}`);
+    console.log(`      latest?.trackingNumber = ${JSON.stringify(latest?.trackingNumber)}`);
+    console.log(`      ssOrder.trackingNumber = ${JSON.stringify(orderResp.trackingNumber)}`);
+    console.log(`      → derived tracking     = ${JSON.stringify(latest?.trackingNumber || orderResp.trackingNumber || null)}`);
+    console.log('');
+  }
+
+  // ── (C) GET /shipments?orderId={ss_order_id} ──────────────────
+  console.log(`(C) GET /shipments?orderId=${link.ss_order_id}`);
+  console.log('    (the authoritative source — tracking lives on shipment records)');
+  try {
+    const shResp = await shipstationService.listShipments({
+      orderId: link.ss_order_id,
+      pageSize: 500,
+      sortBy: 'CreateDate',
+      sortDir: 'DESC',
+    });
+    console.log(JSON.stringify(shResp, null, 2));
+    const shipments = shResp?.shipments || [];
+    console.log('');
+    console.log('    Trackings visible on /shipments (all rows):');
+    if (shipments.length === 0) {
+      console.log('      (no shipments returned for this ss_order_id)');
+    } else {
+      for (const s of shipments) {
+        console.log(
+          `      shipmentId=${s.shipmentId} orderId=${s.orderId} orderNumber=${s.orderNumber} ` +
+            `trackingNumber=${JSON.stringify(s.trackingNumber)} carrierCode=${s.carrierCode} ` +
+            `voided=${s.voided}`
+        );
+      }
+    }
+  } catch (err) {
+    console.log(`    ✗ FAILED: HTTP ${err?.response?.status ?? 'network'} — ${err.message}`);
+    if (err?.response?.data) {
+      console.log('    response body:');
+      console.log(JSON.stringify(err.response.data, null, 2));
+    }
+  }
+  console.log('');
+
+  // ── (D) GET /shipments?orderNumber={ss_order_number} ──────────
+  // Only runs if we have an orderNumber to try — this is the
+  // identifier-drift check per Joey's Q3.
+  if (link.ss_order_number) {
+    console.log(`(D) GET /shipments?orderNumber=${link.ss_order_number}`);
+    console.log('    (identifier-drift check: same query keyed on orderNumber)');
+    try {
+      const shResp2 = await shipstationService.listShipments({
+        orderNumber: link.ss_order_number,
+        pageSize: 500,
+        sortBy: 'CreateDate',
+        sortDir: 'DESC',
+      });
+      console.log(JSON.stringify(shResp2, null, 2));
+      const shipments2 = shResp2?.shipments || [];
+      console.log('');
+      console.log('    Trackings visible via orderNumber lookup:');
+      if (shipments2.length === 0) {
+        console.log('      (no shipments returned for this ss_order_number)');
+      } else {
+        for (const s of shipments2) {
+          console.log(
+            `      shipmentId=${s.shipmentId} orderId=${s.orderId} orderNumber=${s.orderNumber} ` +
+              `trackingNumber=${JSON.stringify(s.trackingNumber)} carrierCode=${s.carrierCode} ` +
+              `voided=${s.voided}`
+          );
+        }
+      }
+    } catch (err) {
+      console.log(`    ✗ FAILED: HTTP ${err?.response?.status ?? 'network'} — ${err.message}`);
+      if (err?.response?.data) {
+        console.log('    response body:');
+        console.log(JSON.stringify(err.response.data, null, 2));
+      }
+    }
+  } else {
+    console.log('(D) SKIPPED — link row has no ss_order_number to try');
+  }
+  console.log('');
+  console.log('✓ Diagnostic complete. No writes.');
 }
 
 main().catch((err) => {
