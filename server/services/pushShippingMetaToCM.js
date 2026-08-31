@@ -43,29 +43,67 @@ try {
   );
 }
 
-// Config comes from app-settings.json (unencrypted, but the secret
-// is treated as sensitive — never logged in full). Two fields:
+// Config comes from appSettings (the dashboard's canonical settings
+// store — SAME pattern as shipstationService.js, s3Sytist.js, and
+// composedThumbnailService.js). Two fields registered in
+// config/appSettings.js FIELD_DEFINITIONS:
 //   dashboardPushToCmUrl:    full URL to CM's endpoint, e.g.
 //                             "https://campaigns.sportslinephotography.com/api/sytist/shipping-meta"
 //   dashboardPushToCmSecret: the shared secret paired with CM's
-//                             SETTINGS_dashboard_push_secret.
-// Both undefined = push disabled (dev / not-yet-configured); the
-// service no-ops and doesn't log every skip.
+//                             SETTINGS_dashboard_push_secret. Masked
+//                             in the UI (SECRET_FIELDS).
+//
+// Both empty = push disabled (dev / not-yet-configured); the service
+// no-ops per call, but logStartupState() below emits ONE line at
+// server startup so a config typo can't silently disable the whole
+// feature. Earlier Phase 62 version read `settings.<key>` directly
+// from the JSON, at the wrong nesting level (root instead of
+// `.settings`), and disabled itself silently — the reason this
+// logging exists.
+
+const appSettings = require('../config/appSettings');
 
 function loadConfig() {
+  const url = (appSettings.getRawValueSync('dashboardPushToCmUrl') || '').trim();
+  const secret = (appSettings.getRawValueSync('dashboardPushToCmSecret') || '').trim();
+  if (!url || !secret) return null;
+  return { url, secret };
+}
+
+/**
+ * Called from server/index.js at startup. Emits ONE line describing
+ * the push config state — configured with URL, or disabled with the
+ * specific reason. Never throws.
+ *
+ * Silent no-ops are a production anti-pattern: a config typo means
+ * the whole feature vanishes with nothing in the logs. The only
+ * detection channel would be a CM-side counter that never
+ * increments — which is exactly how the initial Phase 62 ship
+ * disabled itself for hours.
+ */
+function logStartupState() {
   try {
-    const fs = require('fs');
-    const settingsPath = path.join(__dirname, '..', 'config', 'app-settings.json');
-    if (!fs.existsSync(settingsPath)) return null;
-    const raw = fs.readFileSync(settingsPath, 'utf-8');
-    const settings = JSON.parse(raw);
-    const url = settings.dashboardPushToCmUrl || null;
-    const secret = settings.dashboardPushToCmSecret || null;
-    if (!url || !secret) return null;
-    return { url, secret };
+    const url = (appSettings.getRawValueSync('dashboardPushToCmUrl') || '').trim();
+    const secret = (appSettings.getRawValueSync('dashboardPushToCmSecret') || '').trim();
+    if (url && secret) {
+      // Log the URL so the operator can see WHICH CM instance is
+      // being pushed to (staging vs prod is easy to typo). The
+      // secret is never logged, just its presence.
+      console.log(
+        `[pushShippingMetaToCM] enabled → target=${url} (secret: ${secret.length}-char value configured)`
+      );
+      return;
+    }
+    const missing = [];
+    if (!url) missing.push('dashboardPushToCmUrl');
+    if (!secret) missing.push('dashboardPushToCmSecret');
+    console.warn(
+      `[pushShippingMetaToCM] DISABLED — missing appSettings: ${missing.join(', ')}. ` +
+        `Set via Settings UI or edit server/config/app-settings.json under the "settings" key. ` +
+        `Shipped-order emails on Customer Manager will fall back to the range wording for every shipment until this is fixed.`
+    );
   } catch (e) {
-    console.warn('[pushShippingMetaToCM] loadConfig failed:', e.message);
-    return null;
+    console.warn('[pushShippingMetaToCM] logStartupState failed:', e.message);
   }
 }
 
@@ -210,4 +248,4 @@ async function pushShippingMetaToCM(args) {
   }
 }
 
-module.exports = { pushShippingMetaToCM };
+module.exports = { pushShippingMetaToCM, logStartupState };

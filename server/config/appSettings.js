@@ -52,6 +52,11 @@ const SECRET_FIELDS = [
   'shipstationApiKey',
   'shipstationApiSecret',
   'awsSecretAccessKey',
+  // Phase 62 — shared secret paired with Customer Manager's
+  // dashboard_push_secret setting. Masks in the UI + omitted from
+  // Settings API responses; only getRawValueSync returns the real
+  // value to services/pushShippingMetaToCM.js.
+  'dashboardPushToCmSecret',
 ];
 
 // Field definitions. Adding a new configurable value: append here,
@@ -227,6 +232,33 @@ const FIELD_DEFINITIONS = [
     default: 'skip',
     secret: false,
     hint: 'skip = no green-screen thumbnails in SS. s3-sytist = upload to S3.',
+  },
+
+  // Phase 62 — push shipping metadata to Customer Manager on ship.
+  // See server/services/pushShippingMetaToCM.js. Registered here (in
+  // FIELD_DEFINITIONS) rather than read directly from the JSON so
+  // the values (a) show in the Settings UI, (b) mask the secret,
+  // (c) are read via getRawValueSync() the same way every other
+  // dashboard service reads its config. Reading raw file paths at
+  // ad-hoc nesting levels drifts silently — this is exactly the
+  // bug that shipped Phase 62 as a silent no-op.
+  {
+    key: 'dashboardPushToCmUrl',
+    envKey: 'DASHBOARD_PUSH_TO_CM_URL',
+    label: 'Customer Manager shipping-meta URL',
+    section: 'customer_manager',
+    default: '',
+    secret: false,
+    hint: 'e.g. https://campaigns.sportslinephotography.com/api/sytist/shipping-meta. Blank disables the push.',
+  },
+  {
+    key: 'dashboardPushToCmSecret',
+    envKey: 'DASHBOARD_PUSH_TO_CM_SECRET',
+    label: 'Customer Manager X-Dashboard-Secret',
+    section: 'customer_manager',
+    default: '',
+    secret: true,
+    hint: 'Paired with CM\'s dashboard_push_secret setting. 64 hex chars from `openssl rand -hex 32`.',
   },
 ];
 

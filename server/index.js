@@ -129,6 +129,16 @@ app.listen(PORT, () => {
   } catch (err) {
     console.warn(`[startup] Scheduler did not start: ${err.message}`);
   }
+
+  // Phase 62: log Customer Manager push config state. One line at
+  // startup so a config typo can't silently disable the whole
+  // feature. See services/pushShippingMetaToCM.js header for the
+  // reason this logging exists (initial ship was a silent no-op).
+  try {
+    require('./services/pushShippingMetaToCM').logStartupState();
+  } catch (err) {
+    console.warn(`[startup] pushShippingMetaToCM startup log failed: ${err.message}`);
+  }
 });
 
 // ─── Graceful shutdown ─────────────────────────────────────
