@@ -29,6 +29,16 @@
 //       at 50/round) — practical ceiling to catch runaway conditions;
 //       real runs on ~500 historical rows finish in <20 rounds.
 //
+//   node scripts/reconcile-backfill.js --since-days=N
+//     → bound backfill to rows shipped in the last N days. OPT-IN,
+//       defaults to unbounded. Useful when the backlog is large and
+//       older tracking has no operator value (a customer isn't
+//       clicking a tracked-email link for an order that arrived
+//       months ago). Compose with the other flags freely, e.g.
+//       `--dry-run --since-days=30` to preview only.
+//       The chosen bound is printed in the preview output alongside
+//       the fixed thresholds so it's always visible before writes.
+//
 // The give-up count printed in the preview is what Joey specifically
 // asked to see BEFORE running: the number of ancient rows that will
 // be marked 'gave_up' in the log so they stop matching subsequent
@@ -52,22 +62,32 @@ const readline = require('readline');
 const reconcileService = require('../services/shippingMetaReconcileService');
 
 function parseArgs() {
-  const args = { dryRun: false, yes: false, maxRounds: 200 };
+  const args = { dryRun: false, yes: false, maxRounds: 200, sinceDays: null };
   for (const arg of process.argv.slice(2)) {
     if (arg === '--dry-run') args.dryRun = true;
     else if (arg === '--yes' || arg === '-y') args.yes = true;
     else if (arg.startsWith('--max-rounds=')) {
       const n = parseInt(arg.slice('--max-rounds='.length), 10);
       if (Number.isFinite(n) && n > 0) args.maxRounds = n;
+    } else if (arg.startsWith('--since-days=')) {
+      const raw = arg.slice('--since-days='.length);
+      const n = parseInt(raw, 10);
+      if (!Number.isFinite(n) || n <= 0) {
+        console.error(`✗ Invalid --since-days value: "${raw}" (must be a positive integer)`);
+        process.exit(1);
+      }
+      args.sinceDays = n;
     } else if (arg === '--help' || arg === '-h') {
       // Trim leading whitespace from the file's header comment for a --help output
       console.log(
         [
           'Usage:',
-          '  node scripts/reconcile-backfill.js --dry-run   Print counts only, no writes.',
-          '  node scripts/reconcile-backfill.js             Print preview, prompt y/N, run.',
-          '  node scripts/reconcile-backfill.js --yes       Skip prompt.',
-          '  node scripts/reconcile-backfill.js --max-rounds=N   Cap round iterations.',
+          '  node scripts/reconcile-backfill.js --dry-run          Print counts only, no writes.',
+          '  node scripts/reconcile-backfill.js                    Print preview, prompt y/N, run.',
+          '  node scripts/reconcile-backfill.js --yes              Skip prompt.',
+          '  node scripts/reconcile-backfill.js --max-rounds=N     Cap round iterations.',
+          '  node scripts/reconcile-backfill.js --since-days=N     Bound to shipped_at > NOW - N days',
+          '                                                        (opt-in; default unbounded).',
         ].join('\n')
       );
       process.exit(0);
@@ -92,7 +112,10 @@ async function main() {
   console.log('▸ Tracking-reconcile backfill');
   console.log('');
 
-  const preview = reconcileService.previewCounts({ backfill: true });
+  const preview = reconcileService.previewCounts({
+    backfill: true,
+    sinceDays: args.sinceDays,
+  });
   if (!preview.available) {
     console.error('✗ Reconcile DB unavailable (better-sqlite3 not loadable).');
     process.exit(1);
@@ -104,6 +127,13 @@ async function main() {
   console.log(`    • give-up ceiling         ${preview.thresholds.giveUpHours} h`);
   console.log(`    • batch size              ${preview.thresholds.batchSize} per round`);
   console.log(`    • tracking-bearing class  package_code = '${preview.thresholds.trackingBearingPackageCode}'`);
+  console.log(
+    `    • since-days bound        ${
+      preview.thresholds.sinceDays == null
+        ? 'unbounded (default)'
+        : `${preview.thresholds.sinceDays} days (--since-days=${preview.thresholds.sinceDays})`
+    }`
+  );
   console.log('');
   console.log('  Preview:');
   console.log(`    • Candidates for retry              ${preview.candidatesForRetry}`);
@@ -149,6 +179,7 @@ async function main() {
     const summary = await reconcileService.runReconcileTick({
       backfill: true,
       runGiveUp: false,
+      sinceDays: args.sinceDays,
     });
     totals.recovered += summary.recovered;
     totals.still_missing += summary.still_missing;

@@ -356,6 +356,71 @@ console.log('▸ Give-up sweep (marks ancient package rows only)');
   });
 }
 
+// ─── Case 4b: --since-days bound (opt-in, backfill only) ────────
+
+console.log('▸ --since-days bound');
+{
+  const db = freshDb();
+
+  // 12 hours = safely inside the ongoing window (5min < 12h < 24h).
+  // Using exactly '-1 days' lands on the give-up-ceiling boundary
+  // and the strict > excludes it non-deterministically.
+  insertLink(db, { order_id: 'RECENT', ss_order_id: 401, ago: '-12 hours' });
+  insertLink(db, { order_id: 'D_20', ss_order_id: 402, ago: '-20 days' });
+  insertLink(db, { order_id: 'D_45', ss_order_id: 403, ago: '-45 days' });
+  insertLink(db, { order_id: 'D_400', ss_order_id: 404, ago: '-400 days' });
+
+  const idsAt = (opts) => {
+    const q = buildCandidateQuery({ backfill: true, limit: 999, ...opts });
+    return db.prepare(q.sql).all(q.params).map(r => r.order_id).sort();
+  };
+
+  check('unbounded (no sinceDays): catches everything', () => {
+    assert.deepStrictEqual(
+      idsAt({}),
+      ['D_20', 'D_400', 'D_45', 'RECENT']
+    );
+  });
+
+  check('sinceDays=30: excludes rows older than 30 days', () => {
+    assert.deepStrictEqual(idsAt({ sinceDays: 30 }), ['D_20', 'RECENT']);
+  });
+
+  check('sinceDays=90: catches everything within 90 days', () => {
+    assert.deepStrictEqual(
+      idsAt({ sinceDays: 90 }),
+      ['D_20', 'D_45', 'RECENT']
+    );
+  });
+
+  check('sinceDays=null == unbounded', () => {
+    assert.deepStrictEqual(idsAt({ sinceDays: null }), idsAt({}));
+  });
+
+  check('sinceDays=0 is treated as unbounded (guard against footgun)', () => {
+    assert.deepStrictEqual(idsAt({ sinceDays: 0 }), idsAt({}));
+  });
+
+  check('preview count matches candidate query under sinceDays', () => {
+    const q = buildPreviewCandidateCountQuery({ backfill: true, sinceDays: 30 });
+    const n = db.prepare(q.sql).get(q.params).n;
+    assert.strictEqual(n, idsAt({ sinceDays: 30 }).length);
+  });
+
+  check('ongoing mode ignores sinceDays without breaking (24h ceiling wins)', () => {
+    // Ongoing candidate query has grace + give-up ceiling regardless.
+    // Passing sinceDays there is harmless (never enlarges the set,
+    // and 24h < any positive sinceDays value).
+    const q = buildCandidateQuery({ backfill: false, limit: 999, sinceDays: 30 });
+    const rows = db.prepare(q.sql).all(q.params).map(r => r.order_id).sort();
+    // Only RECENT is within the 24h ongoing window AND past the 5min
+    // grace — but RECENT is exactly 1 day old which is past both
+    // gates so it should show up. D_20/D_45/D_400 are all past the
+    // 24h ceiling.
+    assert.deepStrictEqual(rows, ['RECENT'], `got: ${JSON.stringify(rows)}`);
+  });
+}
+
 // ─── Case 5: give-up sweep GUARD — no blind sweep on fresh deploy ─
 //
 // Regression test for the Aug 31 2026 incident: the sweep marked

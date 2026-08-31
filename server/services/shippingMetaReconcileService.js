@@ -207,10 +207,17 @@ function _log(row) {
  *                     ceiling (<24h old) so ancient rows drain into
  *                     the give-up sweep instead of being retried.
  *
+ * Optional `sinceDays` (opt-in via backfill CLI `--since-days=N`):
+ * additionally constrains candidates to `shipped_at > NOW - N days`.
+ * Used to bound the SS API cost when the backlog is large and older
+ * rows carry no operator value — a tracked-email link for an order
+ * that arrived months ago is not something a customer will follow.
+ * Zero/null/undefined = unbounded (default).
+ *
  * Returns { sql, params } — params object for better-sqlite3 named
  * binding.
  */
-function buildCandidateQuery({ backfill, limit }) {
+function buildCandidateQuery({ backfill, limit, sinceDays }) {
   const clauses = [
     `sl.tracking_number IS NULL`,
     `sl.package_code = @package_code`,
@@ -240,6 +247,10 @@ function buildCandidateQuery({ backfill, limit }) {
     params.grace = `-${GRACE_PERIOD_MINUTES} minutes`;
     params.give_up_ceiling = `-${GIVE_UP_HOURS} hours`;
   }
+  if (sinceDays != null && Number.isFinite(sinceDays) && sinceDays > 0) {
+    clauses.push(`sl.shipped_at > datetime('now', @since_days)`);
+    params.since_days = `-${sinceDays} days`;
+  }
   const sql = `
     SELECT sl.order_id, sl.ss_order_id, sl.ss_order_number,
            sl.carrier_code, sl.service_code, sl.package_code,
@@ -257,8 +268,8 @@ function buildCandidateQuery({ backfill, limit }) {
  * Three builders: candidate count, would-be-given-up count, existing
  * gave_up count. Each returns { sql, params }.
  */
-function buildPreviewCandidateCountQuery({ backfill }) {
-  const { sql, params } = buildCandidateQuery({ backfill, limit: 1000000 });
+function buildPreviewCandidateCountQuery({ backfill, sinceDays } = {}) {
+  const { sql, params } = buildCandidateQuery({ backfill, limit: 1000000, sinceDays });
   return {
     sql: `SELECT COUNT(*) AS n FROM (${sql}) t`,
     params,
@@ -385,11 +396,16 @@ function buildGiveUpSweepQuery() {
  * Preview the row counts. Never writes. Called by the CLI before it
  * commits to running.
  */
-function previewCounts({ backfill }) {
+function previewCounts({ backfill, sinceDays } = {}) {
   initReconcileDb();
   if (!_db) return { available: false };
 
-  const cand = buildPreviewCandidateCountQuery({ backfill });
+  const cand = buildPreviewCandidateCountQuery({ backfill, sinceDays });
+  // Give-up preview intentionally NOT gated on sinceDays: sweep is
+  // guarded by EXISTS(prior log entry), so only rows this run (or a
+  // previous run) actually reconciled will show up. Bounding the
+  // preview by sinceDays would show fewer rows than the sweep will
+  // touch if a prior wider run left log entries on older rows.
   const give = buildPreviewGiveUpCountQuery();
   const already = buildPreviewAlreadyGaveUpQuery();
 
@@ -408,6 +424,10 @@ function previewCounts({ backfill }) {
       giveUpHours: GIVE_UP_HOURS,
       batchSize: BATCH_SIZE,
       trackingBearingPackageCode: TRACKING_BEARING_PACKAGE_CODE,
+      // null/undefined = unbounded; a positive number = the operator
+      // opt-in cap. Surfaced in the CLI preview alongside the fixed
+      // thresholds so it's always visible before writes happen.
+      sinceDays: sinceDays != null && sinceDays > 0 ? sinceDays : null,
     },
   };
 }
@@ -591,6 +611,11 @@ async function _reconcileOne(candidate, deps) {
  * @param {boolean} [opts.backfill=false]
  * @param {number}  [opts.limit=BATCH_SIZE]
  * @param {boolean} [opts.runGiveUp=!backfill]
+ * @param {number}  [opts.sinceDays]  — opt-in bound. Constrains
+ *   candidates to shipped_at > NOW - N days. Undefined/null/0 =
+ *   unbounded. Passed through to buildCandidateQuery. Used by the
+ *   backfill CLI's --since-days=N flag to cap SS API cost when the
+ *   backlog is large and older rows carry no operator value.
  * @returns {Promise<{
  *   candidates: number,
  *   recovered: number,
@@ -603,6 +628,7 @@ async function runReconcileTick({
   backfill = false,
   limit = BATCH_SIZE,
   runGiveUp,
+  sinceDays,
 } = {}) {
   const doGiveUp = runGiveUp === undefined ? !backfill : !!runGiveUp;
   const summary = {
@@ -625,7 +651,7 @@ async function runReconcileTick({
   const sytistDb = require('./sytistDbService');
   const deps = { shipstationService, shipstationLinkService, sytistDb };
 
-  const q = buildCandidateQuery({ backfill, limit });
+  const q = buildCandidateQuery({ backfill, limit, sinceDays });
   const candidates = _db.prepare(q.sql).all(q.params);
   summary.candidates = candidates.length;
   if (candidates.length === 0) {
