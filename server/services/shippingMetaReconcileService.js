@@ -266,6 +266,10 @@ function buildPreviewCandidateCountQuery({ backfill }) {
 }
 
 function buildPreviewGiveUpCountQuery() {
+  // Guard MUST match buildGiveUpSweepQuery — otherwise preview lies
+  // about what the sweep will actually do. Both require an EXISTS
+  // prior-log-entry check; see buildGiveUpSweepQuery docstring for
+  // the Aug 31 2026 incident this defends against.
   return {
     sql: `
       SELECT COUNT(*) AS n
@@ -278,6 +282,10 @@ function buildPreviewGiveUpCountQuery() {
            SELECT 1 FROM shipping_meta_reconcile_log l
             WHERE l.order_id = sl.order_id
               AND l.outcome  = 'gave_up'
+         )
+         AND EXISTS (
+           SELECT 1 FROM shipping_meta_reconcile_log l
+            WHERE l.order_id = sl.order_id
          )
     `,
     params: {
@@ -299,17 +307,44 @@ function buildPreviewAlreadyGaveUpQuery() {
 }
 
 /**
- * Give-up sweep — INSERT ... SELECT that marks all rows > 24h old
- * with no tracking as 'gave_up' in the log. Idempotent (the NOT
- * EXISTS keeps it from double-logging the same row). Runs as a
- * single statement so a mid-run crash never leaves partial state.
+ * Give-up sweep — marks rows as 'gave_up' when they're past the 24h
+ * ceiling AND have been reconciled at least once.
  *
- * Reason it uses positional params (not named): better-sqlite3
- * doesn't accept an object with mixed positional and named bindings
- * in an INSERT ... SELECT with '?' markers, and the sweep predates
- * this file's convention of named binds. Two params: give_up_hours
- * (numeric literal, embedded in message text), package_code (=
- * whitelist), age cutoff.
+ * LOAD-BEARING GUARD: the `EXISTS (prior log entry)` clause is
+ * what stops this sweep from blind-marking historical rows on a
+ * fresh deploy. Without it, ongoing mode (which runs on every 5-min
+ * scheduler tick) would sweep the entire backlog of ancient
+ * null-tracking package rows in ONE unbounded INSERT ... SELECT
+ * the first time it fires — no SS lookup, no chance to recover
+ * anything. That happened on Aug 31 2026: pushing the reconcile
+ * service to prod triggered a 1,585-row blind sweep on the next
+ * scheduler tick before backfill CLI had ever run. The guard
+ * requires that we've LOGGED something for this order previously
+ * — either 'recovered', 'still_missing', or 'ss_error' — proving
+ * a real reconcile attempt happened first.
+ *
+ * How the two paths satisfy the guard:
+ *   - BACKFILL CLI: each round reconciles up to BATCH_SIZE rows,
+ *     each writing 'recovered'/'still_missing'/'ss_error' to the
+ *     log per attempt. After the round loop drains, the CLI calls
+ *     runGiveUpSweep() explicitly — every candidate now has ≥1
+ *     prior log entry, so it qualifies for give-up.
+ *   - ONGOING scheduler: age-windowed candidate query only touches
+ *     rows in [5min, 24h) old. Those rows accumulate 'still_missing'
+ *     entries every tick until they age past 24h — the give-up
+ *     sweep then marks them. Pre-deploy rows with no log entries
+ *     stay INVISIBLE to ongoing mode (candidate query excludes
+ *     them via the 24h ceiling, sweep excludes them via this
+ *     EXISTS clause). The ONLY way pre-deploy rows get reconciled
+ *     is via the backfill CLI. That is the deliberate design after
+ *     the Aug 31 2026 incident: ongoing mode is a bad place for
+ *     "sweep everything the operator hasn't gotten to."
+ *
+ * Positional params: better-sqlite3's INSERT ... SELECT with '?'
+ * markers doesn't mix well with named-binding objects, and the
+ * sweep predates this file's named-bind convention. Three params:
+ * give_up_hours literal (embedded in message text), package_code
+ * (whitelist), age cutoff.
  */
 function buildGiveUpSweepQuery() {
   return {
@@ -327,6 +362,13 @@ function buildGiveUpSweepQuery() {
            SELECT 1 FROM shipping_meta_reconcile_log l
             WHERE l.order_id = sl.order_id
               AND l.outcome  = 'gave_up'
+         )
+         AND EXISTS (
+           -- Load-bearing: proves a real reconcile attempt happened
+           -- first. See docstring above for the incident this
+           -- guards against.
+           SELECT 1 FROM shipping_meta_reconcile_log l
+            WHERE l.order_id = sl.order_id
          )
     `,
     params: [

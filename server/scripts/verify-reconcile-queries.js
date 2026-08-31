@@ -281,8 +281,14 @@ console.log('▸ Give-up sweep (marks ancient package rows only)');
 {
   const db = freshDb();
 
+  // Both ancient rows carry a prior 'still_missing' log entry —
+  // that's the normal state after backfill has tried them once.
+  // Without prior log entries the guard added post-incident would
+  // exclude them from the sweep; Case 5 covers that path.
   insertLink(db, { order_id: 'ANCIENT_PKG_1', ss_order_id: 201, ago: '-25 hours' });
+  insertLogRow(db, { order_id: 'ANCIENT_PKG_1', outcome: 'still_missing', minsAgo: 60 });
   insertLink(db, { order_id: 'ANCIENT_PKG_2', ss_order_id: 202, ago: '-72 hours' });
+  insertLogRow(db, { order_id: 'ANCIENT_PKG_2', outcome: 'still_missing', minsAgo: 60 });
   insertLink(db, { order_id: 'MIDAGE_PKG', ss_order_id: 203, ago: '-30 minutes' });
   insertLink(db, {
     order_id: 'ANCIENT_FLAT', ss_order_id: 204,
@@ -350,7 +356,75 @@ console.log('▸ Give-up sweep (marks ancient package rows only)');
   });
 }
 
-// ─── Case 5: constants sanity ────────────────────────────────────
+// ─── Case 5: give-up sweep GUARD — no blind sweep on fresh deploy ─
+//
+// Regression test for the Aug 31 2026 incident: the sweep marked
+// 1,585 pre-existing ancient rows as gave_up on the first ongoing
+// scheduler tick, before backfill CLI had ever run. The guard is
+// EXISTS(prior log entry) — see buildGiveUpSweepQuery docstring.
+
+console.log('▸ Give-up sweep guard (no blind sweep without prior reconcile attempt)');
+{
+  const db = freshDb();
+
+  // ANCIENT_NEVER_TOUCHED: >24h old, null tracking, package_code
+  // = 'package'. No log entries. Simulates a pre-existing row on
+  // fresh deploy. Sweep MUST NOT mark it gave_up.
+  insertLink(db, { order_id: 'ANCIENT_NEVER_TOUCHED', ss_order_id: 301, ago: '-72 hours' });
+
+  // ANCIENT_WITH_STILL_MISSING: same age + null tracking, but has
+  // a prior 'still_missing' log entry proving we tried. Sweep MUST
+  // mark it gave_up.
+  insertLink(db, { order_id: 'ANCIENT_WITH_STILL_MISSING', ss_order_id: 302, ago: '-72 hours' });
+  insertLogRow(db, { order_id: 'ANCIENT_WITH_STILL_MISSING', outcome: 'still_missing', minsAgo: 30 });
+
+  // ANCIENT_WITH_SS_ERROR: same shape, prior ss_error log entry.
+  // Any prior log qualifies — that's the design.
+  insertLink(db, { order_id: 'ANCIENT_WITH_SS_ERROR', ss_order_id: 303, ago: '-72 hours' });
+  insertLogRow(db, { order_id: 'ANCIENT_WITH_SS_ERROR', outcome: 'ss_error', minsAgo: 30 });
+
+  const runSweep = () => {
+    const q = buildGiveUpSweepQuery();
+    return db.prepare(q.sql).run(...q.params).changes;
+  };
+
+  check('preview count reports only rows with prior log entry', () => {
+    const q = buildPreviewGiveUpCountQuery();
+    const n = db.prepare(q.sql).get(q.params).n;
+    // Only the two with prior log entries. ANCIENT_NEVER_TOUCHED
+    // is invisible to sweep.
+    assert.strictEqual(n, 2, `preview=${n} (expected 2 — the never-touched row must be excluded)`);
+  });
+
+  check('sweep marks only the two with prior log entries', () => {
+    const marked = runSweep();
+    assert.strictEqual(marked, 2, `marked=${marked} (expected 2 — never-touched row must NOT be swept)`);
+    const gaveUp = db.prepare(
+      `SELECT DISTINCT order_id FROM shipping_meta_reconcile_log
+        WHERE outcome='gave_up' ORDER BY order_id`
+    ).all().map(r => r.order_id);
+    assert.deepStrictEqual(
+      gaveUp,
+      ['ANCIENT_WITH_SS_ERROR', 'ANCIENT_WITH_STILL_MISSING'],
+      `got: ${JSON.stringify(gaveUp)}`
+    );
+  });
+
+  check('never-touched row remains reconcilable via backfill CLI', () => {
+    // Explicit assertion of the design: after the sweep, the
+    // never-touched row is STILL a candidate for backfill (backfill
+    // has no age ceiling). Backfill logs 'still_missing' → next
+    // sweep marks it gave_up. That's the correct sequence.
+    const q = buildCandidateQuery({ backfill: true, limit: 999 });
+    const rows = db.prepare(q.sql).all(q.params).map(r => r.order_id);
+    assert(
+      rows.includes('ANCIENT_NEVER_TOUCHED'),
+      `never-touched row must remain a backfill candidate; got: ${JSON.stringify(rows)}`
+    );
+  });
+}
+
+// ─── Case 6: constants sanity ────────────────────────────────────
 
 console.log('▸ Constants match Joey-approved values');
 {
