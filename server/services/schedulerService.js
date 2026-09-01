@@ -242,17 +242,45 @@ class SchedulerService {
         }
         if (!ssOrder) continue;
 
-        // Found a shipped match. Extract tracking from the last
-        // shipment record if available, falling back to top-level
-        // fields. ShipStation isn't always consistent here.
-        const shipments = ssOrder.shipments || [];
-        const latest = shipments[shipments.length - 1];
-        const trackingNumber =
-          latest?.trackingNumber || ssOrder.trackingNumber || null;
+        // Found a shipped match. Fetch the REAL shipment record via
+        // /shipments — the /orders response's shipments[] is empty
+        // in practice (Sep 2026 diagnostic on order 117452 confirmed:
+        // `shipments.length=0`, no trackingNumber field). The old
+        // read from `ssOrder.shipments[...].trackingNumber` fell
+        // through to null on 100% of shipments since Phase 13e.
+        // See shipstationService.listShipments docstring.
+        let shipmentFields = null;
+        try {
+          shipmentFields = await shipstationService.getBestShipmentForOrder(ssOrder.orderId);
+        } catch (err) {
+          console.warn(
+            `[Scheduler] order ${link.order_id}: getBestShipmentForOrder failed (will retry next tick): ${err.message}`
+          );
+          continue;
+        }
+
+        // If SS has no non-voided shipment yet, don't mark the local
+        // link shipped — leave it as pending so the next tick tries
+        // again. The scheduler is the source of the initial ship
+        // detection; jumping the gun here would leave tracking null
+        // and hand the row to the reconcile pass with no way to know
+        // whether the null was real or a timing artifact.
+        if (!shipmentFields || !shipmentFields.trackingNumber) {
+          console.log(
+            `[Scheduler] order ${link.order_id}: /shipments has ${
+              shipmentFields ? 'a shipment but no tracking yet' : 'no non-voided shipment yet'
+            } — leaving pending, will re-check next tick`
+          );
+          continue;
+        }
+
+        const trackingNumber = shipmentFields.trackingNumber;
         const carrierCode =
-          latest?.carrierCode || ssOrder.carrierCode || link.carrier_code || null;
+          shipmentFields.carrierCode || link.carrier_code || null;
+        // Use shipment.shipDate (label-purchase time) as the
+        // authoritative shipped_at. Fallback chain preserved.
         const shippedAt =
-          latest?.shipDate || latest?.createDate || new Date().toISOString();
+          shipmentFields.shipDate || new Date().toISOString();
 
         try {
           // Snapshot of the link's previous state so we can roll

@@ -453,16 +453,24 @@ function runGiveUpSweep() {
 }
 
 /**
- * Reconcile one candidate row: pull the SS order, extract tracking,
- * write through to shipstation_links + ms_orders + CM if found. All
- * errors caught + logged; returns the outcome string.
+ * Reconcile one candidate row: pull the SS shipment (NOT the order),
+ * extract tracking + cost + shipDate, write through to
+ * shipstation_links + ms_orders + CM if found. All errors caught +
+ * logged; returns the outcome string.
+ *
+ * Read pattern (fixed Sep 2026): calls `/shipments?orderId=…` via
+ * shipstationService.getBestShipmentForOrder. Do NOT read tracking
+ * from `/orders/{id}.shipments[]` — that endpoint's shipments array
+ * is empty in practice and drove the 0/100 recovery rate on the
+ * first backfill attempt. See the shipstationService docstring on
+ * `listShipments` for the diagnostic trail.
  */
 async function _reconcileOne(candidate, deps) {
   const { shipstationService, shipstationLinkService, sytistDb } = deps;
 
-  let ssOrder = null;
+  let shipment = null;
   try {
-    ssOrder = await shipstationService.getOrder(candidate.ss_order_id);
+    shipment = await shipstationService.getBestShipmentForOrder(candidate.ss_order_id);
   } catch (err) {
     const httpStatus = err?.response?.status ?? null;
     _log({
@@ -474,38 +482,29 @@ async function _reconcileOne(candidate, deps) {
       error_message: (err.message || String(err)).slice(0, 500),
     });
     console.warn(
-      `[shippingMetaReconcile] order ${candidate.order_id}: SS getOrder failed (${httpStatus ?? 'network'}): ${err.message}`
+      `[shippingMetaReconcile] order ${candidate.order_id}: SS getBestShipmentForOrder failed (${httpStatus ?? 'network'}): ${err.message}`
     );
     return 'ss_error';
   }
 
-  // Extract tracking — same shape as scheduler line 248-251.
-  const shipments = ssOrder?.shipments || [];
-  const latest = shipments[shipments.length - 1];
-  const rawTracking = latest?.trackingNumber || ssOrder?.trackingNumber || null;
-  const carrierCode =
-    latest?.carrierCode || ssOrder?.carrierCode || candidate.carrier_code || null;
-
-  // hasRealTracking-equivalent: reject empty / whitespace / 000-prefix.
-  // Mirrors pushShippingMetaToCM's trackingPresent test — the CM side
-  // filters 000-prefix reference numbers before rendering (they're
-  // USPS flat "tracking" that isn't real).
-  const tracking =
-    rawTracking &&
-    String(rawTracking).trim() !== '' &&
-    !/^0{3,}/.test(String(rawTracking).trim())
-      ? String(rawTracking).trim()
-      : null;
-
-  if (!tracking) {
+  // No non-voided shipment for this order → nothing to recover on
+  // this tick. Log still_missing; next tick retries per the
+  // retry-recency floor.
+  if (!shipment || !shipment.trackingNumber) {
     _log({
       order_id: candidate.order_id,
       ss_order_id: candidate.ss_order_id,
       outcome: 'still_missing',
       shipped_at: candidate.shipped_at,
+      error_message: !shipment
+        ? 'no non-voided shipment exists for this SS order'
+        : 'shipment exists but trackingNumber is empty/0000-prefix',
     });
     return 'still_missing';
   }
+
+  const tracking = shipment.trackingNumber;
+  const carrierCode = shipment.carrierCode || candidate.carrier_code || null;
 
   // Found real tracking. Fan out the writes. Each in its own try
   // block so a partial-failure state is captured accurately in the
@@ -537,6 +536,22 @@ async function _reconcileOne(candidate, deps) {
     return 'still_missing';
   }
 
+  // Also update the local link's shipped_at + carrier_code from
+  // shipment data. shipped_at from the shipment record is
+  // authoritative (label-purchase time); the value we wrote at
+  // ship-detection time is approximate. shipstationLinkService.update
+  // uses COALESCE — passing non-null overwrites.
+  try {
+    shipstationLinkService.update(candidate.order_id, {
+      shippedAt: shipment.shipDate || null,
+      carrierCode: shipment.carrierCode || null,
+    });
+  } catch (err) {
+    console.warn(
+      `[shippingMetaReconcile] order ${candidate.order_id}: link shipDate/carrier update failed (non-fatal): ${err.message}`
+    );
+  }
+
   // Log recovered NOW — before the ms_orders and CM writes — because
   // that's when we accepted the tracking as canonical. If ms_orders
   // or CM fails, we retry the SIDE-EFFECTS next tick without
@@ -550,9 +565,19 @@ async function _reconcileOne(candidate, deps) {
     shipped_at: candidate.shipped_at,
   });
 
-  // ms_orders write — narrow single-column backfill.
+  // ms_orders backfill — write tracking + cost + date in one UPDATE.
+  // shippedDate must be YYYY-MM-DD for Sytist's DATE column (see
+  // backfillShipping guard).
   try {
-    await sytistDb.backfillTrackingNumber(candidate.order_id, tracking);
+    const shippedDateYmd =
+      shipment.shipDate
+        ? new Date(shipment.shipDate).toISOString().slice(0, 10)
+        : null;
+    await sytistDb.backfillShipping(candidate.order_id, {
+      trackingNumber: tracking,
+      shipCost: shipment.shipmentCost, // null → skipped
+      shippedDate: shippedDateYmd,     // null → skipped
+    });
   } catch (err) {
     console.warn(
       `[shippingMetaReconcile] order ${candidate.order_id}: ms_orders backfill failed (tracking still recovered in link): ${err.message}`
@@ -576,11 +601,11 @@ async function _reconcileOne(candidate, deps) {
     await pushShippingMetaToCM({
       orderId: candidate.order_id,
       weightOz,
-      serviceCode: candidate.service_code,
-      packageCode: candidate.package_code,
+      serviceCode: shipment.serviceCode || candidate.service_code,
+      packageCode: shipment.packageCode || candidate.package_code,
       carrierCode,
       trackingNumber: tracking,
-      shippedAt: candidate.shipped_at,
+      shippedAt: shipment.shipDate || candidate.shipped_at,
     });
   } catch (err) {
     console.warn(
@@ -589,7 +614,7 @@ async function _reconcileOne(candidate, deps) {
   }
 
   console.log(
-    `[shippingMetaReconcile] order ${candidate.order_id}: RECOVERED tracking=${tracking} carrier=${carrierCode || 'unknown'}`
+    `[shippingMetaReconcile] order ${candidate.order_id}: RECOVERED tracking=${tracking} carrier=${carrierCode || 'unknown'} cost=${shipment.shipmentCost} shipDate=${shipment.shipDate}`
   );
   return 'recovered';
 }

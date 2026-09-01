@@ -2934,61 +2934,114 @@ class SytistDbService {
   }
 
   /**
-   * NARROW: tracking-only backfill for a previously-shipped order.
+   * NARROW: post-ship backfill of shipping columns for a
+   * previously-shipped order.
    *
-   * Writes ONLY ms_orders.order_shipped_track. Does NOT touch
-   * order_open_status, order_shipped_date, order_shipped_by,
-   * order_shipped_by_id, or order_ship_cost.
+   * Writes ONLY the subset of these columns the caller passes:
+   *   - order_shipped_track  (from fields.trackingNumber)
+   *   - order_ship_cost      (from fields.shipCost)
+   *   - order_shipped_date   (from fields.shippedDate — YYYY-MM-DD)
+   *
+   * Does NOT touch order_open_status, order_shipped_by, or
+   * order_shipped_by_id. All three writable columns are on the
+   * Sytist write allow-list per the write-audit doc; nothing new
+   * added by this method, just a narrower call site than the
+   * full-ship path.
    *
    * Why it exists: the shipping-meta reconcile pass (services/
-   * shippingMetaReconcileService) discovers a real tracking number
-   * for an order that was shipped without one — the label scan
-   * caught status=shipped but the tracking hadn't propagated yet
-   * (100% null across the first ~458 shipments while some were
-   * Ground Advantage, which always carries tracking). The fix is a
-   * post-ship UPDATE of just the tracking column; the other four
-   * shipping fields were written correctly at ship time and must
-   * not be re-derived (that would risk clobbering shipCost with a
-   * stale or newly-fetched value, changing shippedDate to today
-   * when the actual ship day was earlier, etc.).
+   * shippingMetaReconcileService) discovers real shipment data
+   * (tracking, cost, ship date) for an order that was previously
+   * marked shipped but had none of it — the initial scheduler read
+   * from `/orders/{id}.shipments[]` returned empty (see the Sep
+   * 2026 `/shipments` diagnostic; the read was against the wrong
+   * endpoint since Phase 13e). Reconcile now fetches the real
+   * shipment via `/shipments?orderId=…` and backfills whatever
+   * fields SS actually gives us — never overwriting a column the
+   * shipment record didn't populate.
    *
    * NEVER use this for the initial ship write. `updateOrderStatus`
    * with `shippingFields` is the correct call for that path — it
-   * writes all 5 columns as a unit with the status flip. This
-   * method exists for the one specific "we now know tracking, but
-   * nothing else about the ship changed" case.
+   * writes the status flip + all 5 shipping columns as a unit.
+   * This method exists specifically for "we already flipped
+   * status; now we know the ship data that was missing at flip
+   * time."
    *
-   * Guard: skips the write if trackingNumber is empty/whitespace.
-   * The caller (reconcile) is responsible for the 000-prefix
-   * filter via hasRealTracking-equivalent logic BEFORE calling.
-   *
-   * On the Sytist write allow-list per the write-audit doc:
-   * order_shipped_track is one of the six columns the dashboard is
-   * permitted to write to on ms_orders.
+   * Guards:
+   *   - trackingNumber, if provided, must be a non-empty string
+   *     (caller is responsible for the 000-prefix / voided-shipment
+   *     filter BEFORE calling — see shipstationService
+   *     _extractShipmentFields + reconcile's _reconcileOne).
+   *   - shipCost, if provided, must be a finite non-negative number.
+   *   - shippedDate, if provided, must be a YYYY-MM-DD string
+   *     (validated by regex — Sytist runs strict sql_mode and will
+   *     reject anything a DATE column can't parse).
+   *   - If NO fields are provided (all null/undefined), returns
+   *     without hitting the DB.
    *
    * @param {number|string} orderId
-   * @param {string} trackingNumber
-   * @returns {Promise<{orderId, affectedRows}>}
+   * @param {object} fields
+   * @param {string} [fields.trackingNumber]
+   * @param {number} [fields.shipCost]
+   * @param {string} [fields.shippedDate]  YYYY-MM-DD
+   * @returns {Promise<{orderId, affectedRows, wroteColumns}>}
    */
-  async backfillTrackingNumber(orderId, trackingNumber) {
+  async backfillShipping(orderId, fields = {}) {
     const id = parseInt(orderId, 10);
     if (Number.isNaN(id) || id <= 0) {
       throw new Error('Invalid order ID');
     }
-    const tracking = trackingNumber == null ? '' : String(trackingNumber).trim();
-    if (tracking === '') {
-      throw new Error('Refusing to backfill an empty tracking number');
+
+    const sets = [];
+    const params = [];
+    const wroteColumns = [];
+
+    if (fields.trackingNumber != null) {
+      const t = String(fields.trackingNumber).trim();
+      if (t === '') throw new Error('Refusing to backfill an empty tracking number');
+      sets.push('order_shipped_track = ?');
+      params.push(t);
+      wroteColumns.push('order_shipped_track');
     }
 
+    if (fields.shipCost != null) {
+      const c = typeof fields.shipCost === 'number'
+        ? fields.shipCost
+        : parseFloat(fields.shipCost);
+      if (!Number.isFinite(c) || c < 0) {
+        throw new Error(`Refusing to backfill invalid shipCost: ${fields.shipCost}`);
+      }
+      sets.push('order_ship_cost = ?');
+      params.push(c);
+      wroteColumns.push('order_ship_cost');
+    }
+
+    if (fields.shippedDate != null) {
+      const d = String(fields.shippedDate).trim();
+      // YYYY-MM-DD only — Sytist's DATE column + strict sql_mode
+      // rejects anything else. If SS gave us a datetime, the
+      // caller must slice(0, 10) first.
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) {
+        throw new Error(`Refusing to backfill invalid shippedDate: ${d} (must be YYYY-MM-DD)`);
+      }
+      sets.push('order_shipped_date = ?');
+      params.push(d);
+      wroteColumns.push('order_shipped_date');
+    }
+
+    if (sets.length === 0) {
+      return { orderId: id, affectedRows: 0, wroteColumns: [] };
+    }
+
+    params.push(id);
     const pool = this.getPool();
     console.log(
-      `[SytistDB] backfillTrackingNumber: order ${id} tracking=${tracking}`
+      `[SytistDB] backfillShipping: order ${id} cols=[${wroteColumns.join(', ')}]`
     );
     const [result] = await pool.query(
-      'UPDATE ms_orders SET order_shipped_track = ? WHERE order_id = ?',
-      [tracking, id]
+      `UPDATE ms_orders SET ${sets.join(', ')} WHERE order_id = ?`,
+      params
     );
-    return { orderId: id, affectedRows: result.affectedRows };
+    return { orderId: id, affectedRows: result.affectedRows, wroteColumns };
   }
 
   /**

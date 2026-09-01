@@ -200,26 +200,27 @@ async function buildShippingFieldsForShip(orderId) {
   if (link.tracking_number) fields.trackingNumber = String(link.tracking_number);
   if (link.carrier_code) fields.carrier = mapCarrierCode(link.carrier_code);
 
-  // Fetch cost from ShipStation API. The /orders/{id} response
-  // includes a shipmentCost field on shipped orders. We bound this
-  // with a short timeout (handled by the shipstationService axios
-  // client) so a slow API doesn't stall the ship action — failure
-  // is non-fatal, we just leave cost at 0.
+  // Fetch cost from ShipStation. The Sep 2026 diagnostic proved
+  // that /orders/{id} does NOT reliably carry shipmentCost — the
+  // authoritative source is the /shipments record for the label
+  // that was purchased. getBestShipmentForOrder returns the most
+  // recent non-voided shipment with tracking + cost + shipDate
+  // already normalized. Pre-fix, this method called
+  // ssService.getOrder(link.ss_order_id) and read ssOrder.shipmentCost
+  // — that fell through to 0 on ~100% of shipments since Phase 30
+  // (same silent-fallback bug class as the tracking read the
+  // scheduler had). Never call getOrder here.
   if (link.ss_order_id) {
     const ssService = _getShipstationService();
-    if (ssService && typeof ssService.getOrder === 'function') {
+    if (ssService && typeof ssService.getBestShipmentForOrder === 'function') {
       try {
-        const ssOrder = await ssService.getOrder(link.ss_order_id);
-        const cost = ssOrder?.shipmentCost;
-        if (typeof cost === 'number' && Number.isFinite(cost) && cost >= 0) {
-          fields.shipCost = cost;
-        } else if (typeof cost === 'string') {
-          const parsed = parseFloat(cost);
-          if (Number.isFinite(parsed) && parsed >= 0) fields.shipCost = parsed;
+        const shipment = await ssService.getBestShipmentForOrder(link.ss_order_id);
+        if (shipment && shipment.shipmentCost != null) {
+          fields.shipCost = shipment.shipmentCost;
         }
       } catch (err) {
         console.warn(
-          `[orderStatusService] SS cost fetch failed for order ${orderId} (SS#${link.ss_order_id}): ${err.message}`
+          `[orderStatusService] SS shipment fetch failed for order ${orderId} (SS#${link.ss_order_id}): ${err.message}`
         );
       }
     }

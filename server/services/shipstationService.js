@@ -378,25 +378,149 @@ class ShipStationService {
    *
    * WHY IT EXISTS: tracking numbers live on shipments, not orders.
    * The `/orders/{id}` response has a `shipments[]` array but it
-   * has proven unreliable — the initial ship-detection path
-   * (schedulerService.js:248-251) reads that shape and captured
-   * null tracking on 100% of ~458 shipments over ~30 days,
-   * including for classes that always carry tracking (Ground
-   * Advantage). The tracking-reconcile diagnostic (Sep 2026)
-   * traces why: `/orders/{id}.shipments` may be stale/partial,
-   * whereas `/shipments?orderId=...` returns the shipment records
-   * directly and is what ShipStation's own UI reads.
+   * is empty in practice (confirmed by the Sep 2026 diagnostic on
+   * order 117452: `/orders/554343421` returned `shipments.length=0`
+   * and no `trackingNumber` field anywhere; `/shipments?orderId=
+   * 554343421` returned the real tracking). Since Phase 13e, the
+   * scheduler's `shipments[shipments.length-1].trackingNumber ||
+   * ssOrder.trackingNumber || null` read has fallen through to
+   * `null` on 100% of ~458 shipments — a silent-fallback bug that
+   * masked the actual failure ("we're reading the wrong endpoint")
+   * as "SS returned nothing." Do not read tracking from `/orders`
+   * anywhere; use `getBestShipmentForOrder` below.
    *
    * Useful params: { orderId, orderNumber, pageSize (max 500),
    * sortBy: 'CreateDate'|'ShipDate', sortDir: 'DESC'|'ASC' }.
    * Returns { shipments: [...], total, page, pages }. Each
    * shipment carries: shipmentId, orderId, orderKey, orderNumber,
    * trackingNumber, carrierCode, serviceCode, packageCode,
-   * shipDate, shipmentCost, shipmentItems.
+   * shipDate, createDate, shipmentCost, voided, shipmentItems.
    */
   async listShipments(params = {}) {
     const { data } = await this._client().get('/shipments', { params });
     return data;
+  }
+
+  /**
+   * Fetch ALL shipments for an SS order, following pagination.
+   * Bounded to 10 pages of 500 (=5000 shipments/order) as a
+   * runaway guard — one order having thousands of shipments would
+   * be a data-modeling problem worth investigating rather than
+   * silently paging through.
+   */
+  async _fetchAllShipmentsForOrder(ssOrderId) {
+    const out = [];
+    let page = 1;
+    const HARD_PAGE_LIMIT = 10;
+    for (;;) {
+      const resp = await this.listShipments({
+        orderId: ssOrderId,
+        pageSize: 500,
+        page,
+        sortBy: 'CreateDate',
+        sortDir: 'DESC',
+      });
+      const shipments = resp?.shipments || [];
+      out.push(...shipments);
+      const pages = resp?.pages || 1;
+      if (page >= pages) break;
+      if (page >= HARD_PAGE_LIMIT) {
+        console.warn(
+          `[shipstationService] order ${ssOrderId} has >${HARD_PAGE_LIMIT} pages of shipments; stopping paging (collected ${out.length})`
+        );
+        break;
+      }
+      page += 1;
+    }
+    return out;
+  }
+
+  /**
+   * Pick the "best" shipment from a list — most recent non-voided.
+   *
+   * PURE FUNCTION. Extracted so verify-shipment-extraction.js can
+   * exercise it without hitting SS. Do not add I/O here.
+   *
+   * Sort: we re-sort in JS by shipDate DESC (falling back to
+   * createDate, then 0) even though the API call requests
+   * sortDir=DESC. Rationale: API sort is best-effort — the API
+   * decides the sort key, we don't control it after the request,
+   * and a future API change to a different default could silently
+   * flip which shipment we pick. Sorting locally on the fields we
+   * care about is the invariant we control.
+   *
+   * Voided filter: strict `=== true`. Any other value (undefined,
+   * null, "false", 0) is treated as non-voided — SS returns
+   * `voided: false` as JSON boolean today, but the strict check
+   * defends against future serialization changes making all
+   * shipments look voided.
+   */
+  _pickBestShipment(shipments) {
+    if (!Array.isArray(shipments) || shipments.length === 0) return null;
+    const nonVoided = shipments.filter((s) => s && s.voided !== true);
+    if (nonVoided.length === 0) return null;
+    const sorted = [...nonVoided].sort((a, b) => {
+      const da = Date.parse(a.shipDate || a.createDate || '') || 0;
+      const db = Date.parse(b.shipDate || b.createDate || '') || 0;
+      return db - da;
+    });
+    return sorted[0];
+  }
+
+  /**
+   * Extract the fields we actually use from a shipment record.
+   *
+   * PURE FUNCTION. Normalizes:
+   *   - trackingNumber: trim + reject empty + reject 000-prefix
+   *     ('000...' is USPS flat "reference number", not real
+   *     tracking — see CM's hasRealTracking in shippingMeta.ts).
+   *   - shipmentCost: coerce number/numeric-string to number,
+   *     reject negative + non-finite.
+   *   - shipDate: fall back to createDate. Return raw ISO string;
+   *     callers slice to YYYY-MM-DD for Sytist's DATE column.
+   *   - carrierCode / serviceCode: pass through, null if missing.
+   *   - voided: mirrored for the caller's logs.
+   */
+  _extractShipmentFields(shipment) {
+    if (!shipment) return null;
+    const rawTracking = shipment.trackingNumber;
+    const trackingStr = rawTracking != null ? String(rawTracking).trim() : '';
+    const trackingNumber =
+      trackingStr !== '' && !/^0{3,}/.test(trackingStr) ? trackingStr : null;
+
+    let shipmentCost = null;
+    const rawCost = shipment.shipmentCost;
+    if (typeof rawCost === 'number' && Number.isFinite(rawCost) && rawCost >= 0) {
+      shipmentCost = rawCost;
+    } else if (typeof rawCost === 'string' && rawCost.trim() !== '') {
+      const parsed = parseFloat(rawCost);
+      if (Number.isFinite(parsed) && parsed >= 0) shipmentCost = parsed;
+    }
+
+    return {
+      shipmentId: shipment.shipmentId ?? null,
+      trackingNumber,
+      carrierCode: shipment.carrierCode || null,
+      serviceCode: shipment.serviceCode || null,
+      packageCode: shipment.packageCode || null,
+      shipmentCost,
+      shipDate: shipment.shipDate || shipment.createDate || null,
+      voided: shipment.voided === true,
+    };
+  }
+
+  /**
+   * The one-stop lookup: fetch all shipments for an SS order,
+   * filter voided, pick the most recent by shipDate, and return
+   * the extracted fields. Returns null if no non-voided shipment
+   * exists. Callers should treat null as "the order genuinely has
+   * no live shipment yet" vs. "SS is broken" — SS/network errors
+   * throw and are the caller's responsibility to catch.
+   */
+  async getBestShipmentForOrder(ssOrderId) {
+    const shipments = await this._fetchAllShipmentsForOrder(ssOrderId);
+    const best = this._pickBestShipment(shipments);
+    return this._extractShipmentFields(best);
   }
 
   async deleteOrder(orderId) {
