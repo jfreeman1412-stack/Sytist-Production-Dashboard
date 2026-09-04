@@ -177,6 +177,7 @@ console.log('▸ Every column referenced actually exists');
     for (const name of [
       'order_id', 'ss_order_id', 'ss_order_number', 'ss_order_status',
       'tracking_number', 'carrier_code', 'service_code', 'package_code',
+      'shipment_id',
       'payload_json', 'shipped_at', 'created_at', 'updated_at',
     ]) {
       assert(cols.has(name), `missing column ${name}`);

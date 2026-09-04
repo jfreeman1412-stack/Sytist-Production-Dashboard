@@ -19,6 +19,13 @@
 //     carrier_code TEXT
 //     service_code TEXT
 //     package_code TEXT
+//     shipment_id TEXT                 -- V1 shipmentId (works as V2 label
+//                                          {id} path segment). Populated
+//                                          at ship-detection time or by
+//                                          shipment-id backfill. Nullable
+//                                          because pre-Ship-2 rows and
+//                                          rows that haven't shipped yet
+//                                          have no shipment record.
 //     payload_json TEXT                -- the payload sent to SS, for
 //                                          troubleshooting + re-create
 //     shipped_at TEXT                  -- when SS reported shipped
@@ -54,12 +61,35 @@ const SHIPSTATION_LINKS_CREATE_TABLE_SQL = `
     carrier_code TEXT,
     service_code TEXT,
     package_code TEXT,
+    shipment_id TEXT,
     payload_json TEXT,
     shipped_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT
   );
 `;
+
+// SQLite lacks IF NOT EXISTS on ALTER TABLE. This helper runs the
+// ALTER, swallowing the "duplicate column" error that indicates the
+// column already exists (steady-state path after first boot post-
+// upgrade). Any OTHER error re-throws — a schema-corruption or
+// permissions problem shouldn't be silently swallowed.
+//
+// Kept out of the CREATE TABLE statement above because CREATE TABLE
+// IF NOT EXISTS is a no-op on tables with the OLD column set —
+// existing installs need the ALTER to actually gain the column.
+// Fresh installs execute the CREATE and skip the ALTER (via the
+// duplicate-column swallow).
+function _addColumnIfMissing(db, tableName, columnName, columnType) {
+  try {
+    db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnType}`);
+  } catch (err) {
+    if (err && /duplicate column name/i.test(err.message || '')) {
+      return; // already there — fresh install path OR steady-state
+    }
+    throw err;
+  }
+}
 
 class ShipStationLinkService {
   constructor() {
@@ -89,6 +119,7 @@ class ShipStationLinkService {
     this._db.pragma('foreign_keys = ON');
 
     this._db.exec(SHIPSTATION_LINKS_CREATE_TABLE_SQL);
+    _addColumnIfMissing(this._db, 'shipstation_links', 'shipment_id', 'TEXT');
 
     this._stmts = {
       get: this._db.prepare(
@@ -104,11 +135,11 @@ class ShipStationLinkService {
         INSERT INTO shipstation_links (
           order_id, ss_order_id, ss_order_number, ss_order_status,
           tracking_number, carrier_code, service_code, package_code,
-          payload_json, shipped_at, created_at, updated_at
+          shipment_id, payload_json, shipped_at, created_at, updated_at
         ) VALUES (
           @order_id, @ss_order_id, @ss_order_number, @ss_order_status,
           @tracking_number, @carrier_code, @service_code, @package_code,
-          @payload_json, @shipped_at, @created_at, @updated_at
+          @shipment_id, @payload_json, @shipped_at, @created_at, @updated_at
         )
       `),
       // Updates only the columns provided; COALESCE keeps existing values
@@ -123,6 +154,7 @@ class ShipStationLinkService {
           carrier_code = COALESCE(@carrier_code, carrier_code),
           service_code = COALESCE(@service_code, service_code),
           package_code = COALESCE(@package_code, package_code),
+          shipment_id = COALESCE(@shipment_id, shipment_id),
           payload_json = COALESCE(@payload_json, payload_json),
           shipped_at = COALESCE(@shipped_at, shipped_at),
           updated_at = @updated_at
@@ -172,6 +204,7 @@ class ShipStationLinkService {
     carrierCode = null,
     serviceCode = null,
     packageCode = null,
+    shipmentId = null,
     payload = null,
   }) {
     this.init();
@@ -185,6 +218,7 @@ class ShipStationLinkService {
       carrier_code: carrierCode,
       service_code: serviceCode,
       package_code: packageCode,
+      shipment_id: shipmentId,
       payload_json: payload ? JSON.stringify(payload) : null,
       shipped_at: null,
       created_at: now,
@@ -209,6 +243,7 @@ class ShipStationLinkService {
       carrier_code: fields.carrierCode || null,
       service_code: fields.serviceCode || null,
       package_code: fields.packageCode || null,
+      shipment_id: fields.shipmentId != null ? String(fields.shipmentId) : null,
       payload_json: fields.payload ? JSON.stringify(fields.payload) : null,
       shipped_at: fields.shippedAt || null,
       updated_at: new Date().toISOString(),

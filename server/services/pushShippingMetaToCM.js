@@ -168,6 +168,10 @@ function recordLog(row) {
  * @param {string}        args.packageCode   — ShipStation package code.
  * @param {string|null}   args.carrierCode   — carrier code (e.g. 'stamps_com').
  * @param {string|null}   args.trackingNumber — real tracking number or null.
+ * @param {string|null}   args.shipmentId    — V1 shipmentId (doubles as V2
+ *   /v2/labels/{id}/track path segment on the CM side). Nullable — pre-Ship-2
+ *   rows and rows lacking a shipment record push null. COALESCE-protected on
+ *   CM so a later push with the real value fills the column without clobber.
  * @param {string}        args.shippedAt     — ISO 8601 timestamp.
  * @returns {Promise<void>}  Always resolves; errors are logged, not thrown.
  */
@@ -189,6 +193,7 @@ async function pushShippingMetaToCM(args) {
     packageCode: args.packageCode,
     carrierCode: args.carrierCode ?? null,
     trackingNumber: args.trackingNumber ?? null,
+    shipmentId: args.shipmentId ?? null,
     shippedAt: args.shippedAt,
   };
 

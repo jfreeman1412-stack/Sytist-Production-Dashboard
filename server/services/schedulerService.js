@@ -296,16 +296,28 @@ class SchedulerService {
             shippedAt: link.shipped_at,
           };
 
+          // shipmentId comes from getBestShipmentForOrder above (line
+          // ~254). Same value SS gives via /shipments; doubles as the
+          // V2 /v2/labels/{id}/track path segment on the CM side for
+          // delivery-detection polling. Null-tolerated: if the SS
+          // response has no shipmentId (shouldn't happen for a real
+          // shipment record but the extract is defensive), the local
+          // link column stays null and CM's poller skips this order —
+          // no delivery-confirm email, tracked-shipped email is
+          // unaffected.
+          const shipmentId = shipmentFields.shipmentId || null;
           shipstationLinkService.update(link.order_id, {
             ssOrderStatus: 'shipped',
             trackingNumber,
             carrierCode,
+            shipmentId,
             shippedAt,
           });
           matched += 1;
           console.log(
             `[Scheduler] Order ${link.order_id} marked shipped: ` +
-              `${carrierCode || 'unknown carrier'} ${trackingNumber || '(no tracking)'}`
+              `${carrierCode || 'unknown carrier'} ${trackingNumber || '(no tracking)'}` +
+              (shipmentId ? ` shipment=${shipmentId}` : ' (no shipmentId)')
           );
 
           // Phase 62 (Customer Manager Phase 2): push shipping metadata
@@ -331,6 +343,7 @@ class SchedulerService {
               packageCode: link.package_code,
               carrierCode,
               trackingNumber,
+              shipmentId,
               shippedAt,
             }).catch((e) => {
               console.warn(

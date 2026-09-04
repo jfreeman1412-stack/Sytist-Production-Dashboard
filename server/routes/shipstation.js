@@ -421,10 +421,32 @@ router.post('/orders/:orderId/mark-shipped', async (req, res) => {
       shipDate: shipDate || new Date().toISOString(),
       notifyCustomer: notifyCustomer === undefined ? true : !!notifyCustomer,
     });
+
+    // After a manual mark-shipped, SS records a shipment record
+    // server-side. POST /orders/markasshipped does NOT return
+    // shipmentId in its response, so we call /shipments to fetch it.
+    // Needed for CM's delivery-detection poller (V2
+    // /v2/labels/{id}/track requires the V1 shipmentId as path).
+    // Best-effort: a failure here doesn't block the mark-shipped
+    // response — leaves shipment_id null; the shipment-id backfill
+    // CLI picks it up on next run. Same reader
+    // (getBestShipmentForOrder) the scheduler uses — single source
+    // of truth for "the shipment record for this order."
+    let shipmentId = null;
+    try {
+      const sh = await shipstationService.getBestShipmentForOrder(link.ss_order_id);
+      shipmentId = sh?.shipmentId || null;
+    } catch (e) {
+      console.warn(
+        `[shipstation/mark-shipped] getBestShipmentForOrder failed for order ${req.params.orderId} (leaving shipment_id null; backfill will pick up): ${e.message}`
+      );
+    }
+
     const updated = shipstationLinkService.update(req.params.orderId, {
       ssOrderStatus: 'shipped',
       trackingNumber,
       carrierCode: carrierCode || link.carrier_code,
+      shipmentId,
       shippedAt: shipDate || new Date().toISOString(),
     });
 
@@ -447,6 +469,7 @@ router.post('/orders/:orderId/mark-shipped', async (req, res) => {
         packageCode: link.package_code,
         carrierCode: carrierCode || link.carrier_code,
         trackingNumber,
+        shipmentId,
         shippedAt: shipDate || new Date().toISOString(),
       }).catch((e) => {
         console.warn(

@@ -536,19 +536,24 @@ async function _reconcileOne(candidate, deps) {
     return 'still_missing';
   }
 
-  // Also update the local link's shipped_at + carrier_code from
-  // shipment data. shipped_at from the shipment record is
-  // authoritative (label-purchase time); the value we wrote at
-  // ship-detection time is approximate. shipstationLinkService.update
-  // uses COALESCE — passing non-null overwrites.
+  // Also update the local link's shipped_at + carrier_code +
+  // shipment_id from shipment data. shipped_at from the shipment
+  // record is authoritative (label-purchase time); the value we
+  // wrote at ship-detection time is approximate.
+  // shipstationLinkService.update uses COALESCE — passing non-null
+  // overwrites. shipment_id here backfills the delivery-detection
+  // path segment for rows that were shipped before Ship 2 (when the
+  // column didn't exist) OR before the ss/orders read pattern was
+  // fixed — same reason we backfill tracking here.
   try {
     shipstationLinkService.update(candidate.order_id, {
       shippedAt: shipment.shipDate || null,
       carrierCode: shipment.carrierCode || null,
+      shipmentId: shipment.shipmentId || null,
     });
   } catch (err) {
     console.warn(
-      `[shippingMetaReconcile] order ${candidate.order_id}: link shipDate/carrier update failed (non-fatal): ${err.message}`
+      `[shippingMetaReconcile] order ${candidate.order_id}: link shipDate/carrier/shipment_id update failed (non-fatal): ${err.message}`
     );
   }
 
@@ -605,6 +610,7 @@ async function _reconcileOne(candidate, deps) {
       packageCode: shipment.packageCode || candidate.package_code,
       carrierCode,
       trackingNumber: tracking,
+      shipmentId: shipment.shipmentId || null,
       shippedAt: shipment.shipDate || candidate.shipped_at,
     });
   } catch (err) {
