@@ -28,6 +28,45 @@
 const axios = require('axios');
 const appSettings = require('../config/appSettings');
 
+// Distinct error class for HTTP 429 from ShipStation. Landed with
+// Ship 2 followup 2026-09-04 after the shipment-id backfill's
+// infinite-loop incident (36 rounds × 5 orders ~= 180 SS V1 calls
+// in 72s, ~2.5 req/s sustained against V1's 40-per-40s ceiling —
+// SS returned valid empty responses that time, so no 429 fired,
+// but the calls were well within striking distance).
+//
+// Prior state: 429 was logged in the response interceptor and
+// re-thrown as a generic axios error — indistinguishable from
+// real failures. Callers couldn't tell "SS temporarily said
+// slow down" from "SS is broken" or "order not found."
+//
+// Post-fix contract:
+//   1. Interceptor auto-retries ONCE on 429 honoring Retry-After
+//      (capped at 60s so a bad SS header can't stall the caller).
+//   2. If the retry also 429s, THROW ShipStationRateLimitedError
+//      so callers can catch it distinctly. Callers that don't care
+//      still see it as an Error and reject the same way.
+//
+// See the CM-side V2 client (apps/api/src/services/shipstation/
+// shipstationClient.ts) for the same pattern; kept in mirror for
+// consistency across the two client codebases.
+class ShipStationRateLimitedError extends Error {
+  constructor(message, retryAfterSec) {
+    super(message);
+    this.name = 'ShipStationRateLimitedError';
+    this.retryAfterSec = retryAfterSec;
+    this.isRateLimited = true;
+  }
+}
+
+function isShipStationRateLimitedError(e) {
+  return e && e.name === 'ShipStationRateLimitedError';
+}
+
+// Cap the Retry-After honor at this many seconds. Prevents a
+// server-side misconfiguration from stalling the poller loop.
+const MAX_RETRY_AFTER_SECONDS = 60;
+
 // Phase 58 hotfix 2: weights are sent to ShipStation in OUNCES with
 // integer values — order-level AND per-item. The previous design
 // converted whole-oz to grams (OZ_TO_G = 28.3495) and let SS reverse
@@ -236,16 +275,46 @@ class ShipStationService {
     });
     client.interceptors.response.use(
       (response) => response,
-      (error) => {
+      async (error) => {
         const status = error.response?.status;
         const message = error.response?.data?.Message || error.message;
-        console.error(`[ShipStation] ${status}: ${message}`);
+
+        // 429 rate-limit path (Ship 2 followup 2026-09-04). Auto-
+        // retry ONCE honoring Retry-After (capped). If the retry
+        // also 429s, throw ShipStationRateLimitedError so callers
+        // can catch distinctly. See class docstring at file top.
         if (status === 429) {
-          const retryAfter = error.response.headers['retry-after'] || 30;
-          console.warn(
-            `[ShipStation] Rate limited. Retry after ${retryAfter}s`
+          const rawRetryAfter = Number(error.response.headers['retry-after']);
+          const retryAfterSec = Number.isFinite(rawRetryAfter) && rawRetryAfter > 0
+            ? Math.min(MAX_RETRY_AFTER_SECONDS, rawRetryAfter)
+            : 30; // default when header missing / malformed
+          // First-hit: sleep + retry once. Marker on error.config
+          // prevents infinite recursion — the retry goes back through
+          // THIS SAME client (so interceptors run again), and if the
+          // retry also 429s, the marker sends it to the "give up +
+          // throw the distinct class" branch below. Using
+          // `client.request(error.config)` (not raw `axios(...)`) is
+          // load-bearing: raw axios has no interceptors, so a wrapped
+          // error would never fire and callers wouldn't see the class.
+          if (error.config && !error.config._ssRateLimitRetried) {
+            console.warn(
+              `[ShipStation] 429 rate-limited — sleeping ${retryAfterSec}s then retrying once`
+            );
+            await new Promise((r) => setTimeout(r, retryAfterSec * 1000));
+            error.config._ssRateLimitRetried = true;
+            return client.request(error.config);
+          }
+          // Second-hit: give up. Wrap in the distinct class.
+          console.error(
+            `[ShipStation] 429 rate-limited on retry as well — giving up (retryAfter was ${retryAfterSec}s)`
+          );
+          throw new ShipStationRateLimitedError(
+            `ShipStation rate-limited: ${message}`,
+            retryAfterSec
           );
         }
+
+        console.error(`[ShipStation] ${status}: ${message}`);
         throw error;
       }
     );
@@ -1049,3 +1118,8 @@ module.exports = new ShipStationService();
 // distribution.js). Singleton stays the default export; this is a
 // named attach in the same pattern as compositeService's LAYOUTS_PATH.
 module.exports.distributeIntegerOzAcrossLines = distributeIntegerOzAcrossLines;
+// Ship 2 followup (2026-09-04): expose the 429 error class + guard
+// so callers (reconcile, backfill CLI) can catch rate-limit distinctly
+// from other axios errors. See class docstring at file top.
+module.exports.ShipStationRateLimitedError = ShipStationRateLimitedError;
+module.exports.isShipStationRateLimitedError = isShipStationRateLimitedError;

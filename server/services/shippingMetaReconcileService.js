@@ -472,19 +472,32 @@ async function _reconcileOne(candidate, deps) {
   try {
     shipment = await shipstationService.getBestShipmentForOrder(candidate.ss_order_id);
   } catch (err) {
+    // Ship 2 followup (2026-09-04): distinguish 429 rate-limit from
+    // other SS failures. Rate-limit is transient (SS says slow down);
+    // logging distinctly lets the operator see "we're hitting the
+    // ceiling" separately from "SS is genuinely broken." Also useful
+    // in the reconcile log for tuning cadence — a rise in
+    // 'ss_rate_limited' rows means the reconcile is running too hot.
     const httpStatus = err?.response?.status ?? null;
+    const isRateLimit = shipstationService.isShipStationRateLimitedError(err);
     _log({
       order_id: candidate.order_id,
       ss_order_id: candidate.ss_order_id,
-      outcome: 'ss_error',
+      outcome: isRateLimit ? 'ss_rate_limited' : 'ss_error',
       shipped_at: candidate.shipped_at,
-      http_status: httpStatus,
+      http_status: isRateLimit ? 429 : httpStatus,
       error_message: (err.message || String(err)).slice(0, 500),
     });
-    console.warn(
-      `[shippingMetaReconcile] order ${candidate.order_id}: SS getBestShipmentForOrder failed (${httpStatus ?? 'network'}): ${err.message}`
-    );
-    return 'ss_error';
+    if (isRateLimit) {
+      console.warn(
+        `[shippingMetaReconcile] order ${candidate.order_id}: SS RATE LIMITED (auto-retry already exhausted); giving up this row this tick, next tick will retry: ${err.message}`
+      );
+    } else {
+      console.warn(
+        `[shippingMetaReconcile] order ${candidate.order_id}: SS getBestShipmentForOrder failed (${httpStatus ?? 'network'}): ${err.message}`
+      );
+    }
+    return isRateLimit ? 'ss_rate_limited' : 'ss_error';
   }
 
   // No non-voided shipment for this order → nothing to recover on

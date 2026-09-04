@@ -301,6 +301,17 @@ async function processRow(row) {
   try {
     shipment = await shipstationService.getBestShipmentForOrder(row.ss_order_id);
   } catch (err) {
+    // Ship 2 followup (2026-09-04): distinguish rate-limit from
+    // other errors. See ShipStationRateLimitedError in
+    // shipstationService.js. Rate-limited rows are transient —
+    // NOT marked shipment_id_giveup_at (they might resolve on a
+    // future backfill run once traffic subsides).
+    if (shipstationService.isShipStationRateLimitedError(err)) {
+      console.warn(
+        `[backfill-shipment-id] order ${row.order_id}: SS RATE LIMITED (auto-retry already exhausted); leaving as candidate for future run — ${err.message}`
+      );
+      return 'ss_rate_limited';
+    }
     console.warn(
       `[backfill-shipment-id] order ${row.order_id}: SS getBestShipmentForOrder failed — ${err.message}`
     );
@@ -438,6 +449,7 @@ async function main() {
     rounds: 0,
     recovered: 0,
     gave_up_no_shipment: 0,
+    ss_rate_limited: 0,
     ss_errors: 0,
     local_errors: 0,
     dedup_skips: 0, // rows the query returned but the in-run set had already tried
@@ -472,6 +484,7 @@ async function main() {
       const outcome = await processRow(row);
       if (outcome === 'recovered') totals.recovered += 1;
       else if (outcome === 'gave_up_no_shipment') totals.gave_up_no_shipment += 1;
+      else if (outcome === 'ss_rate_limited') totals.ss_rate_limited += 1;
       else if (outcome === 'ss_error') totals.ss_errors += 1;
       else if (outcome === 'local_error') totals.local_errors += 1;
     }
@@ -482,6 +495,7 @@ async function main() {
   console.log(`  Rounds:                    ${totals.rounds}`);
   console.log(`  Recovered:                 ${totals.recovered}`);
   console.log(`  Gave up (no SS shipment):  ${totals.gave_up_no_shipment}`);
+  console.log(`  SS rate-limited (retry):   ${totals.ss_rate_limited}`);
   console.log(`  SS errors:                 ${totals.ss_errors}`);
   console.log(`  Local errors:              ${totals.local_errors}`);
   if (totals.dedup_skips > 0) {
