@@ -71,10 +71,12 @@ function parseArgs() {
     yes: false,
     maxRounds: 200,
     sinceDays: DEFAULT_SINCE_DAYS,
+    repushOnly: false,
   };
   for (const arg of process.argv.slice(2)) {
     if (arg === '--dry-run') args.dryRun = true;
     else if (arg === '--yes' || arg === '-y') args.yes = true;
+    else if (arg === '--repush-only') args.repushOnly = true;
     else if (arg.startsWith('--max-rounds=')) {
       const n = parseInt(arg.slice('--max-rounds='.length), 10);
       if (Number.isFinite(n) && n > 0) args.maxRounds = n;
@@ -96,6 +98,12 @@ function parseArgs() {
           '  node scripts/backfill-shipment-id.js --max-rounds=N         Cap round iterations (default 200).',
           '  node scripts/backfill-shipment-id.js --since-days=N         Bound to shipped_at > NOW - N days',
           '                                                              (default 30; 0 = unbounded).',
+          '  node scripts/backfill-shipment-id.js --repush-only          Skip SS lookup — just re-push already-',
+          '                                                              locally-populated rows to CM. For the',
+          '                                                              type-mismatch incident 2026-09-04: rows',
+          '                                                              where local SQLite has shipment_id but',
+          '                                                              CM 400d because dashboard sent a number.',
+          '                                                              Compose with --since-days=N to bound.',
         ].join('\n')
       );
       process.exit(0);
@@ -159,6 +167,101 @@ function buildPreviewCountQuery(sinceDays) {
     sql: `SELECT COUNT(*) AS n FROM shipstation_links WHERE ${clauses.join(' AND ')}`,
     params,
   };
+}
+
+// --repush-only mode: rows that already HAVE shipment_id locally.
+// Used to recover from the 2026-09-04 type-mismatch incident where
+// local writes succeeded but CM's pushes 400'd because dashboard
+// sent shipmentId as a number. CM's route is COALESCE-protected on
+// every field, so a re-push is idempotent.
+//
+// Filter: shipment_id IS NOT NULL AND tracking_number IS NOT NULL
+// (tracking is required for the poll path; a row with shipment_id
+// but no tracking isn't useful to CM's delivery poller anyway).
+function buildRepushCandidateQuery(sinceDays) {
+  const clauses = [
+    `shipment_id IS NOT NULL`,
+    `tracking_number IS NOT NULL`,
+    `ss_order_id IS NOT NULL`,
+    `shipped_at IS NOT NULL`,
+  ];
+  const params = {};
+  if (sinceDays > 0) {
+    clauses.push(`shipped_at > datetime('now', @since_days)`);
+    params.since_days = `-${sinceDays} days`;
+  }
+  // No LIMIT: repush is a one-off recovery, --since-days bound keeps
+  // the row count small (~50 with default 30). Streaming all rows in
+  // one pass avoids the "same row keeps matching each round" trap
+  // that the tracking-recovery mode dodges naturally (candidates
+  // drop out of the WHERE clause once shipment_id is written).
+  return {
+    sql: `
+      SELECT order_id, ss_order_id, shipment_id, tracking_number, carrier_code,
+             service_code, package_code, payload_json, shipped_at
+        FROM shipstation_links
+       WHERE ${clauses.join('\n         AND ')}
+       ORDER BY shipped_at DESC
+    `,
+    params,
+  };
+}
+
+function buildRepushCountQuery(sinceDays) {
+  const clauses = [
+    `shipment_id IS NOT NULL`,
+    `tracking_number IS NOT NULL`,
+    `ss_order_id IS NOT NULL`,
+    `shipped_at IS NOT NULL`,
+  ];
+  const params = {};
+  if (sinceDays > 0) {
+    clauses.push(`shipped_at > datetime('now', @since_days)`);
+    params.since_days = `-${sinceDays} days`;
+  }
+  return {
+    sql: `SELECT COUNT(*) AS n FROM shipstation_links WHERE ${clauses.join(' AND ')}`,
+    params,
+  };
+}
+
+/**
+ * Re-push one row. Skips SS entirely — the shipment_id is already
+ * captured locally; we just need CM to accept it. CM's upsert is
+ * COALESCE-protected on every field, so a re-push doesn't clobber
+ * unrelated columns.
+ */
+async function repushRow(row) {
+  try {
+    let weightOz = 0;
+    try {
+      const payload = row.payload_json ? JSON.parse(row.payload_json) : null;
+      if (payload?.weight?.value && typeof payload.weight.value === 'number') {
+        weightOz = payload.weight.value;
+      }
+    } catch (_) { /* leave weightOz=0 on parse fail */ }
+    await pushShippingMetaToCM({
+      orderId: row.order_id,
+      weightOz,
+      serviceCode: row.service_code,
+      packageCode: row.package_code,
+      carrierCode: row.carrier_code,
+      trackingNumber: row.tracking_number,
+      // Coerced to string at the push boundary in pushShippingMetaToCM
+      // — passing a number here is safe now.
+      shipmentId: row.shipment_id,
+      shippedAt: row.shipped_at,
+    });
+    console.log(
+      `[backfill-shipment-id] repush order ${row.order_id}: shipment_id=${row.shipment_id} pushed`
+    );
+    return 'repushed';
+  } catch (err) {
+    console.warn(
+      `[backfill-shipment-id] repush order ${row.order_id}: push failed — ${err.message}`
+    );
+    return 'push_error';
+  }
 }
 
 async function processRow(row) {
@@ -236,12 +339,17 @@ async function processRow(row) {
 async function main() {
   const args = parseArgs();
 
-  console.log('▸ shipment_id backfill');
-  console.log('');
-
   const dbPath = path.join(__dirname, '..', 'config', 'sytist-dashboard.db');
   const db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
+
+  if (args.repushOnly) {
+    await runRepushOnly(db, args);
+    return;
+  }
+
+  console.log('▸ shipment_id backfill');
+  console.log('');
 
   // Preview.
   const previewQ = buildPreviewCountQuery(args.sinceDays);
@@ -310,6 +418,66 @@ async function main() {
   console.log(`  Skipped (no shipment):  ${totals.skipped_no_shipment_id}`);
   console.log(`  SS errors:              ${totals.ss_errors}`);
   console.log(`  Local errors:           ${totals.local_errors}`);
+
+  db.close();
+}
+
+// --repush-only branch. Reconciles the 2026-09-04 type-mismatch
+// incident: local shipstation_links.shipment_id populated, CM has
+// null because the initial push 400d on the numeric-shipmentId bug.
+// After the coercion fix in pushShippingMetaToCM.js this run should
+// succeed for every row (CM's upsert is COALESCE-protected).
+async function runRepushOnly(db, args) {
+  console.log('▸ shipment_id backfill — --repush-only mode');
+  console.log('');
+
+  const previewQ = buildRepushCountQuery(args.sinceDays);
+  const candidateCount = db.prepare(previewQ.sql).get(previewQ.params).n;
+  console.log('  Thresholds:');
+  console.log(
+    `    • since-days bound        ${
+      args.sinceDays > 0 ? `${args.sinceDays} days (default 30)` : 'unbounded (--since-days=0)'
+    }`
+  );
+  console.log('');
+  console.log('  Preview:');
+  console.log(`    • Rows locally-populated shipment_id  ${candidateCount}`);
+  console.log('    (SS not called; CM upserted with COALESCE.)');
+  console.log('');
+
+  if (args.dryRun) {
+    console.log('✓ Dry run — no writes performed.');
+    db.close();
+    process.exit(0);
+  }
+  if (candidateCount === 0) {
+    console.log('✓ Nothing to do.');
+    db.close();
+    process.exit(0);
+  }
+  if (!args.yes) {
+    const answer = await ask('Proceed with re-push? [y/N] ');
+    if (answer !== 'y' && answer !== 'yes') {
+      console.log('✗ Cancelled — no writes performed.');
+      db.close();
+      process.exit(1);
+    }
+    console.log('');
+  }
+
+  const candQ = buildRepushCandidateQuery(args.sinceDays);
+  const candidates = db.prepare(candQ.sql).all(candQ.params);
+  const totals = { repushed: 0, push_errors: 0 };
+  for (const row of candidates) {
+    const outcome = await repushRow(row);
+    if (outcome === 'repushed') totals.repushed += 1;
+    else if (outcome === 'push_error') totals.push_errors += 1;
+  }
+
+  console.log('');
+  console.log('✓ Re-push complete.');
+  console.log(`  Re-pushed:   ${totals.repushed}`);
+  console.log(`  Push errors: ${totals.push_errors}`);
 
   db.close();
 }

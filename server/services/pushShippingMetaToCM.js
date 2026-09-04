@@ -168,10 +168,13 @@ function recordLog(row) {
  * @param {string}        args.packageCode   — ShipStation package code.
  * @param {string|null}   args.carrierCode   — carrier code (e.g. 'stamps_com').
  * @param {string|null}   args.trackingNumber — real tracking number or null.
- * @param {string|null}   args.shipmentId    — V1 shipmentId (doubles as V2
- *   /v2/labels/{id}/track path segment on the CM side). Nullable — pre-Ship-2
- *   rows and rows lacking a shipment record push null. COALESCE-protected on
- *   CM so a later push with the real value fills the column without clobber.
+ * @param {string|number|null} args.shipmentId — V1 shipmentId (doubles
+ *   as V2 /v2/labels/{id}/track path segment on the CM side). Accepts
+ *   number OR string — SS returns it as a number, coerced to string at
+ *   the push boundary here so CM's TEXT column receives a consistent
+ *   type. Nullable — pre-Ship-2 rows and rows lacking a shipment record
+ *   push null. COALESCE-protected on CM so a later push with the real
+ *   value fills the column without clobber.
  * @param {string}        args.shippedAt     — ISO 8601 timestamp.
  * @returns {Promise<void>}  Always resolves; errors are logged, not thrown.
  */
@@ -186,6 +189,25 @@ async function pushShippingMetaToCM(args) {
     !/^0{3,}/.test(String(args.trackingNumber).trim())
   );
 
+  // shipmentId type-coercion at the push boundary (2026-09-04 hotfix
+  // after production 400s on ~15 orders). ShipStation returns
+  // shipmentId as a NUMBER (verified against shipment 337010194 in
+  // the probe output on 2026-09-04); CM's route validates as
+  // non-empty string. Callers pass whatever SS gave them.
+  //
+  // Coerce here — the single push boundary — so all four callers
+  // (schedulerService, mark-shipped route, reconcile, backfill CLI)
+  // are safe by default, and any future 5th push site inherits the
+  // fix. Do NOT try to fix this in each caller; a caller that
+  // forgets is silent-failure-until-CM-strict-rejects, which is the
+  // exact incident this is fixing.
+  //
+  // Local shipstation_links.shipment_id is already TEXT-safe via
+  // shipstationLinkService.update's own String() coercion — that's
+  // why local SQLite writes succeeded even while CM pushes 400'd.
+  const coercedShipmentId =
+    args.shipmentId != null ? String(args.shipmentId) : null;
+
   const payload = {
     orderId: parseInt(orderId, 10),
     weightOz: parseInt(args.weightOz, 10),
@@ -193,7 +215,7 @@ async function pushShippingMetaToCM(args) {
     packageCode: args.packageCode,
     carrierCode: args.carrierCode ?? null,
     trackingNumber: args.trackingNumber ?? null,
-    shipmentId: args.shipmentId ?? null,
+    shipmentId: coercedShipmentId,
     shippedAt: args.shippedAt,
   };
 
