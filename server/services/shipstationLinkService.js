@@ -26,6 +26,18 @@
 //                                          because pre-Ship-2 rows and
 //                                          rows that haven't shipped yet
 //                                          have no shipment record.
+//     shipment_id_giveup_at TEXT       -- ISO timestamp. Set when the
+//                                          shipment-id backfill CLI
+//                                          confirms SS has NO non-voided
+//                                          shipment for this ss_order_id
+//                                          (probably voided or never
+//                                          labeled). Terminal sentinel:
+//                                          the backfill query filters
+//                                          `shipment_id_giveup_at IS NULL`
+//                                          so given-up rows are permanently
+//                                          excluded. Prevents the infinite-
+//                                          loop failure mode where every
+//                                          round re-selected the same rows.
 //     payload_json TEXT                -- the payload sent to SS, for
 //                                          troubleshooting + re-create
 //     shipped_at TEXT                  -- when SS reported shipped
@@ -62,6 +74,7 @@ const SHIPSTATION_LINKS_CREATE_TABLE_SQL = `
     service_code TEXT,
     package_code TEXT,
     shipment_id TEXT,
+    shipment_id_giveup_at TEXT,
     payload_json TEXT,
     shipped_at TEXT,
     created_at TEXT NOT NULL,
@@ -120,6 +133,7 @@ class ShipStationLinkService {
 
     this._db.exec(SHIPSTATION_LINKS_CREATE_TABLE_SQL);
     _addColumnIfMissing(this._db, 'shipstation_links', 'shipment_id', 'TEXT');
+    _addColumnIfMissing(this._db, 'shipstation_links', 'shipment_id_giveup_at', 'TEXT');
 
     this._stmts = {
       get: this._db.prepare(
@@ -283,6 +297,41 @@ class ShipStationLinkService {
         order_id: String(orderId),
         tracking_number: String(trackingNumber),
         updated_at: now,
+      });
+    return result.changes > 0;
+  }
+
+  /**
+   * Mark this order as PERMANENTLY without a ShipStation shipment
+   * record. Written ONLY by the shipment-id backfill CLI when SS's
+   * /shipments endpoint returns zero non-voided shipments for the
+   * ss_order_id — those orders will never resolve (voided label,
+   * never actually labeled, deleted upstream). Backfill's candidate
+   * query filters `shipment_id_giveup_at IS NULL` so any subsequent
+   * run permanently skips them.
+   *
+   * Guard: `AND shipment_id_giveup_at IS NULL` prevents double-writes
+   * from clobbering the original giveup timestamp on re-invocation.
+   *
+   * Idempotent — safe to call for already-given-up rows.
+   *
+   * @returns {boolean} true iff a row was newly marked (0-changes for
+   *   already-given-up rows or missing rows).
+   */
+  markShipmentIdGiveUp(orderId) {
+    this.init();
+    const now = new Date().toISOString();
+    const result = this._db
+      .prepare(
+        `UPDATE shipstation_links
+            SET shipment_id_giveup_at = @now,
+                updated_at            = @now
+          WHERE order_id = @order_id
+            AND shipment_id_giveup_at IS NULL`
+      )
+      .run({
+        order_id: String(orderId),
+        now,
       });
     return result.changes > 0;
   }

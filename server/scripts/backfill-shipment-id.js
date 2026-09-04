@@ -123,13 +123,23 @@ function ask(question) {
 }
 
 // Candidate query — rows lacking shipment_id, with a real ss_order_id
-// (needed for the SS lookup), optionally bounded by shipped_at.
+// (needed for the SS lookup), NOT already given up, optionally bounded
+// by shipped_at.
+//
+// The `shipment_id_giveup_at IS NULL` clause is LOAD-BEARING per the
+// 2026-09-04 infinite-loop incident: without it, orders where SS
+// returns no shipment (voided / never-labeled) get re-selected every
+// round forever, wasting SS V1 rate-limit budget. See markShipmentIdGiveUp
+// in shipstationLinkService.js and the terminal branch in processRow
+// below.
+//
 // Ordered newest-first so the most operator-relevant orders (recent
 // shipments a customer might still ask about) are covered even if
 // the round loop hits --max-rounds.
 function buildCandidateQuery(sinceDays) {
   const clauses = [
     `shipment_id IS NULL`,
+    `shipment_id_giveup_at IS NULL`,
     `ss_order_id IS NOT NULL`,
     `shipped_at IS NOT NULL`,
   ];
@@ -155,6 +165,28 @@ function buildCandidateQuery(sinceDays) {
 function buildPreviewCountQuery(sinceDays) {
   const clauses = [
     `shipment_id IS NULL`,
+    `shipment_id_giveup_at IS NULL`,
+    `ss_order_id IS NOT NULL`,
+    `shipped_at IS NOT NULL`,
+  ];
+  const params = {};
+  if (sinceDays > 0) {
+    clauses.push(`shipped_at > datetime('now', @since_days)`);
+    params.since_days = `-${sinceDays} days`;
+  }
+  return {
+    sql: `SELECT COUNT(*) AS n FROM shipstation_links WHERE ${clauses.join(' AND ')}`,
+    params,
+  };
+}
+
+// Additional preview: rows already marked given-up (informational —
+// shown so operators can see how many orders have been permanently
+// excluded and re-run with confidence).
+function buildAlreadyGivenUpCountQuery(sinceDays) {
+  const clauses = [
+    `shipment_id IS NULL`,
+    `shipment_id_giveup_at IS NOT NULL`,
     `ss_order_id IS NOT NULL`,
     `shipped_at IS NOT NULL`,
   ];
@@ -276,16 +308,28 @@ async function processRow(row) {
   }
   if (!shipment || !shipment.shipmentId) {
     // SS knows no non-voided shipment for this SS order, or the
-    // shipment exists but has no shipmentId. Not much to do here;
-    // the shipment truly has no ID we can hand to V2 tracking, and
-    // CM's poller will just skip this row forever. Log distinctly
-    // so an unusual spike is visible.
+    // shipment exists but has no shipmentId. These orders will
+    // NEVER produce a shipmentId (voided label, never labeled,
+    // deleted upstream), so mark them terminal to prevent the
+    // infinite-loop failure mode where every round re-selects them.
+    //
+    // Before the giveup sentinel (2026-09-04): 5 such orders looped
+    // for 36 rounds burning 180 SS V1 calls in ~72s before Joey
+    // stopped the run. The sentinel column is checked in the
+    // candidate query so future runs skip these permanently.
+    try {
+      shipstationLinkService.markShipmentIdGiveUp(row.order_id);
+    } catch (err) {
+      console.warn(
+        `[backfill-shipment-id] order ${row.order_id}: giveup mark failed (non-fatal, but row may be re-tried next run) — ${err.message}`
+      );
+    }
     console.log(
       `[backfill-shipment-id] order ${row.order_id}: SS returned ${
         shipment ? 'shipment without shipmentId' : 'no shipment'
-      } — skipping (CM will not poll this order for delivery)`
+      } — GAVE UP (marked shipment_id_giveup_at; CM will not poll this order for delivery)`
     );
-    return 'skipped_no_shipment_id';
+    return 'gave_up_no_shipment';
   }
 
   const shipmentId = shipment.shipmentId;
@@ -354,6 +398,8 @@ async function main() {
   // Preview.
   const previewQ = buildPreviewCountQuery(args.sinceDays);
   const candidateCount = db.prepare(previewQ.sql).get(previewQ.params).n;
+  const givenUpQ = buildAlreadyGivenUpCountQuery(args.sinceDays);
+  const givenUpCount = db.prepare(givenUpQ.sql).get(givenUpQ.params).n;
 
   console.log('  Thresholds:');
   console.log(`    • batch size              ${BATCH_SIZE} per round`);
@@ -364,7 +410,8 @@ async function main() {
   );
   console.log('');
   console.log('  Preview:');
-  console.log(`    • Candidates for shipmentId backfill  ${candidateCount}`);
+  console.log(`    • Candidates for shipmentId backfill    ${candidateCount}`);
+  console.log(`    • Rows already given up (excluded)      ${givenUpCount}`);
   console.log('');
 
   if (args.dryRun) {
@@ -390,22 +437,41 @@ async function main() {
   const totals = {
     rounds: 0,
     recovered: 0,
-    skipped_no_shipment_id: 0,
+    gave_up_no_shipment: 0,
     ss_errors: 0,
     local_errors: 0,
+    dedup_skips: 0, // rows the query returned but the in-run set had already tried
   };
+
+  // In-run dedup — defense-in-depth against ANY future bug that lets
+  // the candidate query re-select the same row. Even with the giveup
+  // sentinel column in place, a bug (misplaced clause, forgot to
+  // ALTER, transaction not committed, etc.) could let a row match
+  // twice in one run. Bounds the loop regardless of cause per Joey's
+  // 2026-09-04 ask.
+  const attemptedOrderIds = new Set();
 
   for (let round = 1; round <= args.maxRounds; round++) {
     totals.rounds = round;
     const candQ = buildCandidateQuery(args.sinceDays);
     const candidates = db.prepare(candQ.sql).all(candQ.params);
-    if (candidates.length === 0) break;
+    // Filter out anything we've already tried this run.
+    const fresh = candidates.filter((c) => !attemptedOrderIds.has(String(c.order_id)));
+    const dedupedThisRound = candidates.length - fresh.length;
+    totals.dedup_skips += dedupedThisRound;
+    if (dedupedThisRound > 0) {
+      console.log(
+        `[backfill-shipment-id] round ${round}: query returned ${candidates.length}, ${dedupedThisRound} already tried this run (in-run dedup)`
+      );
+    }
+    if (fresh.length === 0) break;
 
-    console.log(`─── round ${round} (${candidates.length} candidates) ───`);
-    for (const row of candidates) {
+    console.log(`─── round ${round} (${fresh.length} fresh candidates) ───`);
+    for (const row of fresh) {
+      attemptedOrderIds.add(String(row.order_id));
       const outcome = await processRow(row);
       if (outcome === 'recovered') totals.recovered += 1;
-      else if (outcome === 'skipped_no_shipment_id') totals.skipped_no_shipment_id += 1;
+      else if (outcome === 'gave_up_no_shipment') totals.gave_up_no_shipment += 1;
       else if (outcome === 'ss_error') totals.ss_errors += 1;
       else if (outcome === 'local_error') totals.local_errors += 1;
     }
@@ -413,11 +479,14 @@ async function main() {
 
   console.log('');
   console.log('✓ Backfill complete.');
-  console.log(`  Rounds:                 ${totals.rounds}`);
-  console.log(`  Recovered:              ${totals.recovered}`);
-  console.log(`  Skipped (no shipment):  ${totals.skipped_no_shipment_id}`);
-  console.log(`  SS errors:              ${totals.ss_errors}`);
-  console.log(`  Local errors:           ${totals.local_errors}`);
+  console.log(`  Rounds:                    ${totals.rounds}`);
+  console.log(`  Recovered:                 ${totals.recovered}`);
+  console.log(`  Gave up (no SS shipment):  ${totals.gave_up_no_shipment}`);
+  console.log(`  SS errors:                 ${totals.ss_errors}`);
+  console.log(`  Local errors:              ${totals.local_errors}`);
+  if (totals.dedup_skips > 0) {
+    console.log(`  In-run dedup skips:        ${totals.dedup_skips} (query returned a row we'd already tried; investigate)`);
+  }
 
   db.close();
 }
